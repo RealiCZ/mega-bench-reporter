@@ -197,15 +197,16 @@ pub fn render_compare_table(path: &Path, title: &str, table: &CompareTable) -> a
     if table.rows.is_empty() {
         anyhow::bail!("no rows to render a comparison table for");
     }
+    // Lower clamp fits the fixed header caption, not just the item names.
     let item_col_w: i32 = (table.rows.iter().map(|r| r.item.len()).max().unwrap_or(10) as i32 * 8
         + 24)
-        .clamp(180, 420);
+        .clamp(340, 420);
     let subj_col_w: i32 = 106;
     let ratio_col_w: i32 = 96;
     let row_h: i32 = 30;
     let header_h: i32 = 36;
     let title_h: i32 = 40;
-    let legend_h: i32 = 34;
+    let legend_h: i32 = 56;
     let margin: i32 = 12;
 
     let width =
@@ -321,9 +322,10 @@ pub fn render_compare_table(path: &Path, title: &str, table: &CompareTable) -> a
         ))
         .map_err(map_err)?;
     }
+    // Second legend line so the explanation always fits the canvas.
     root.draw(&Text::new(
         format!("{} time ratio vs revm_pinned (lower is better)", table.headline_label),
-        (margin + 3 * 130, legend_y + 2),
+        (margin, legend_y + 22),
         ("sans-serif", 13).into_font().color(&BLACK),
     ))
     .map_err(map_err)?;
@@ -370,14 +372,17 @@ pub fn render_speed_bars(path: &Path, title: &str, items: &[SpeedBarItem]) -> an
 
     let band = legend_subjects.len().max(1) as f64 + 1.0; // bars + gap per item
     let total = items.len() as f64 * band - 1.0;
-    // Reserve empty bands below the last item so the legend box never overlaps
-    // a bar; scale the x range so >100% bars keep room for their value labels.
-    let legend_space = legend_subjects.len() as f64 + 1.2;
     let max_percent =
         items.iter().flat_map(|i| i.bars.iter().map(|(_, p)| *p)).fold(100.0_f64, f64::max);
     let x_max = (max_percent * 1.15).max(118.0);
     let height =
         (170 + (items.len() + 1) * (legend_subjects.len() * 22 + 14)).clamp(300, 2200) as u32;
+    // Reserve room below the last item for the legend box, in *data units*
+    // derived from its pixel size — stays correct when the height clamp above
+    // shrinks the pixels-per-band.
+    let legend_px = 22.0 * legend_subjects.len() as f64 + 18.0;
+    let plot_px = (height as f64 - 130.0).max(100.0);
+    let legend_space = (legend_px * (total + 1.0) / (plot_px - legend_px).max(100.0)).max(1.2);
     let root = BitMapBackend::new(path, (1100, height)).into_drawing_area();
     root.fill(&WHITE).map_err(map_err)?;
 
@@ -400,7 +405,7 @@ pub fn render_speed_bars(path: &Path, title: &str, items: &[SpeedBarItem]) -> an
         .disable_y_mesh()
         .light_line_style(TRANSPARENT)
         .bold_line_style(BLACK.mix(0.12))
-        .y_labels(((total + legend_space) as usize) * 2 + 3)
+        .y_labels(((total + legend_space) as usize) * 4 + 5)
         .y_label_formatter(&|v: &f64| {
             for (i, label) in labels.iter().enumerate() {
                 if (v - band_center(i)).abs() <= 0.26 {

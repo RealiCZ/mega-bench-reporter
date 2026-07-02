@@ -50,7 +50,7 @@ mega-bench-reporter flamegraph \
 
 Checks out the tracked branch's current HEAD, builds the bench binary once (`cargo bench --no-run --profile profiling`), profiles each configured workload (criterion `--profile-time` mode, `--exact` id matching) with the platform profiler — `perf record` on Linux, the built-in `sample` tool on macOS (1 ms interval, no root) — folds, demangles, and renders SVGs plus one differential SVG per baseline/feature pair via `inferno`, writes `flame/<YYYYMMDD>/`, prunes days past retention, and renders a flamegraph card.
 
-For development, `run --skip-bench` re-renders charts and records from the checkout's existing criterion tree without re-benching.
+For development, `run --skip-bench` re-renders charts and records from the checkout's existing criterion tree without re-benching (only for the last processed sha — the tree's provenance is unknown for anything else).
 
 ### GitHub access
 

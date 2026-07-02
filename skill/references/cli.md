@@ -13,7 +13,7 @@ What it does: clone/fetch the repo into `<work-root>/<repo>` (default `<data-roo
 
 - A failing bench target is recorded in `failed_targets` and skipped; the run only fails when every target fails.
 - Re-running the sha in `last_seen_sha` refreshes artifacts without touching regression state (retry-safe).
-- `--skip-bench` reuses the checkout's existing criterion tree — for re-rendering charts after a template/chart change, not for production runs.
+- `--skip-bench` reuses the checkout's existing criterion tree — for re-rendering charts after a template/chart change, not for production runs. It only accepts the last processed sha (`state.json`'s `last_seen_sha`); anything else is rejected because the tree's provenance is unknown.
 
 ## Nightly flamegraph
 

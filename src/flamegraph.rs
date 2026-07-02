@@ -346,7 +346,14 @@ fn profile_with_sample(
         let _ = sample_child.wait();
         copied?;
     }
-    let bench_status = bench_child.wait()?;
+    let bench_status = match bench_child.wait() {
+        Ok(status) => status,
+        Err(e) => {
+            let _ = sample_child.kill();
+            let _ = sample_child.wait();
+            return Err(e.into());
+        }
+    };
     let sample_status = sample_child.wait()?;
     if !bench_status.success() {
         anyhow::bail!("bench run failed for '{benchmark_id}' ({bench_status})");

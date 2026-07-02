@@ -83,7 +83,7 @@ fn test_synthetic_ten_commit_run_with_regression_and_recovery() {
     let data_root = tmp.path().join("data");
     let cfg = Config::parse(CONFIG).unwrap();
     let repo = cfg.repo("mega-evm").unwrap();
-    let settings = cfg.settings(repo);
+    let settings = cfg.settings(repo).unwrap();
     let store = RepoStore::new(&data_root, "mega-evm");
 
     let scratch = tmp.path().join("criterion");
@@ -199,7 +199,7 @@ fn test_rerunning_same_sha_does_not_double_count() {
     let data_root = tmp.path().join("data");
     let cfg = Config::parse(CONFIG).unwrap();
     let repo = cfg.repo("mega-evm").unwrap();
-    let settings = cfg.settings(repo);
+    let settings = cfg.settings(repo).unwrap();
     let store = RepoStore::new(&data_root, "mega-evm");
 
     let scratch = tmp.path().join("criterion");
@@ -226,7 +226,7 @@ fn test_failed_targets_are_marked_not_silently_dropped() {
     let data_root = tmp.path().join("data");
     let cfg = Config::parse(CONFIG).unwrap();
     let repo = cfg.repo("mega-evm").unwrap();
-    let settings = cfg.settings(repo);
+    let settings = cfg.settings(repo).unwrap();
     let store = RepoStore::new(&data_root, "mega-evm");
 
     let scratch = tmp.path().join("criterion");

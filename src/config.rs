@@ -58,8 +58,8 @@ pub struct Settings {
 }
 
 impl Settings {
-    fn resolve(repo: &Tuning, defaults: &Tuning) -> Self {
-        Self {
+    fn resolve(repo: &Tuning, defaults: &Tuning) -> anyhow::Result<Self> {
+        let settings = Self {
             regression_threshold_pct: repo
                 .regression_threshold_pct
                 .or(defaults.regression_threshold_pct)
@@ -73,7 +73,19 @@ impl Settings {
                 .or(defaults.digest_batch_size)
                 .unwrap_or(crate::state::DIGEST_BATCH_SIZE),
             bench_profile: repo.bench_profile.clone().or_else(|| defaults.bench_profile.clone()),
+        };
+        // Nonsense values would silently disable alerting (window 0 makes
+        // every run FirstRun) or spam it (threshold <= 0) — reject loudly.
+        if settings.regression_threshold_pct <= 0.0 {
+            anyhow::bail!("regression_threshold_pct must be > 0");
         }
+        if settings.rolling_window == 0 {
+            anyhow::bail!("rolling_window must be >= 1");
+        }
+        if settings.digest_batch_size == 0 {
+            anyhow::bail!("digest_batch_size must be >= 1");
+        }
+        Ok(settings)
     }
 }
 
@@ -142,8 +154,8 @@ impl Config {
     }
 
     /// Resolved settings for a repo: per-repo overrides over `[defaults]`
-    /// over built-ins.
-    pub fn settings(&self, repo: &RepoConfig) -> Settings {
+    /// over built-ins. Errors on out-of-range values.
+    pub fn settings(&self, repo: &RepoConfig) -> anyhow::Result<Settings> {
         Settings::resolve(&repo.tuning, &self.defaults)
     }
 }
@@ -200,11 +212,24 @@ headline_spec = "rex5"
     #[test]
     fn test_settings_built_in_defaults_when_nothing_configured() {
         let cfg = Config::parse(SAMPLE).expect("parses");
-        let settings = cfg.settings(cfg.repo("mega-evm").unwrap());
+        let settings = cfg.settings(cfg.repo("mega-evm").unwrap()).unwrap();
         assert_eq!(settings.regression_threshold_pct, crate::state::REGRESSION_THRESHOLD_PCT);
         assert_eq!(settings.rolling_window, crate::state::ROLLING_WINDOW);
         assert_eq!(settings.digest_batch_size, crate::state::DIGEST_BATCH_SIZE);
         assert_eq!(settings.bench_profile, None);
+    }
+
+    #[test]
+    fn test_settings_rejects_out_of_range_values() {
+        for bad in
+            ["rolling_window = 0", "digest_batch_size = 0", "regression_threshold_pct = -5.0"]
+        {
+            let cfg = Config::parse(&format!("{SAMPLE}\n{bad}\n")).expect("parses");
+            assert!(
+                cfg.settings(cfg.repo("mega-evm").unwrap()).is_err(),
+                "'{bad}' should be rejected"
+            );
+        }
     }
 
     #[test]
@@ -215,7 +240,7 @@ headline_spec = "rex5"
              digest_batch_size = 5\n"
         );
         let cfg = Config::parse(&text).expect("parses");
-        let settings = cfg.settings(cfg.repo("mega-evm").unwrap());
+        let settings = cfg.settings(cfg.repo("mega-evm").unwrap()).unwrap();
         // Per-repo override wins.
         assert_eq!(settings.regression_threshold_pct, 5.0);
         assert_eq!(settings.digest_batch_size, 5);

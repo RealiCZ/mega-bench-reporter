@@ -457,13 +457,32 @@ pub fn run_commit_pipeline(
     let criterion_dir = criterion_results::criterion_dir_for(&checkout);
     let mut failed_targets = Vec::new();
     if skip_bench {
-        // Dev/regen mode: reuse whatever criterion tree the checkout already
-        // has (e.g. re-render charts without re-benching).
+        // Dev/regen mode: reuse the checkout's criterion tree to re-render
+        // charts/records. The tree's provenance is only known for the last
+        // processed sha — anything else would silently record another
+        // commit's numbers under this sha and pollute the rolling medians.
         if !criterion_dir.is_dir() {
             anyhow::bail!(
                 "--skip-bench: no existing criterion tree at {}",
                 criterion_dir.display()
             );
+        }
+        let state = State::load(&store.state_path())?;
+        if state.last_seen_sha.as_deref() != Some(sha) {
+            anyhow::bail!(
+                "--skip-bench only re-renders the last processed sha ({}); the existing                  criterion tree was not produced by {sha}",
+                state.last_seen_sha.as_deref().unwrap_or("<none>")
+            );
+        }
+        // Preserve the original run's failed-target markers instead of
+        // silently erasing them from the regenerated record.
+        let record = CommitRecord::new(sha.to_string(), meta.date.clone(), meta.rustc.clone());
+        if let Ok(dir) = store.commit_dir(&record) {
+            if let Ok(text) = std::fs::read_to_string(dir.join("raw.json")) {
+                if let Ok(existing) = serde_json::from_str::<CommitRecord>(&text) {
+                    failed_targets = existing.failed_targets;
+                }
+            }
         }
     } else {
         // Stale results from a previous commit's run must not leak into this one.

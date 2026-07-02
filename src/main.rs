@@ -93,7 +93,7 @@ fn run() -> anyhow::Result<()> {
         Command::Run { repo, sha, skip_bench, config, data_root, work_root } => {
             let cfg = Config::load(&config)?;
             let repo_cfg = cfg.repo(&repo)?;
-            let settings = cfg.settings(repo_cfg);
+            let settings = cfg.settings(repo_cfg)?;
             let data_root = canonical_data_root(data_root)?;
             let work_root = work_root.unwrap_or_else(|| data_root.join("_checkouts"));
             let outcome = pipeline::run_commit_pipeline(
