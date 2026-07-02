@@ -66,7 +66,7 @@ Everything is under `<data-root>/<repo>/` (repo = `mega-evm`):
 | `flame/<YYYYMMDD>/<workload>_diff.svg` | Differential flame graph, feature vs baseline (red = grew, blue = shrank). |
 | `state.json` | Rolling medians, regression latches, digest counter, `last_seen_sha`. |
 
-Do not hand-edit `state.json`; deleting it resets all baselines to "first run" (no alerts until history rebuilds).
+Do not hand-edit `state.json`; deleting it resets every row to "first run" (no alert on the first post-reset run; the rolling window then rebuilds over the next 20 runs).
 
 ## What the numbers mean
 
@@ -92,12 +92,14 @@ Headline rows drive alerts, the compare chart, and digests; everything else is r
 
 The tool decides this itself; you only relay. The rules it applies:
 
-- A **headline-family row** whose ratio rises **more than 10% above its own rolling median** (median of its last 20 runs) → `regression_alert` card, the same run it happens.
+- A **headline-family row** whose ratio rises **more than 10% above its own rolling median** (median of its last 20 healthy runs) → `regression_alert` card, the same run it happens.
 - The alert is **latched**: no repeat cards while the row stays regressed; one `recovery` card when it drops back under.
+- The baseline is **frozen while a row is regressed** — regressed values never enter the rolling window, so a sustained regression stays latched against the pre-regression baseline instead of silently becoming the new normal. To deliberately accept a new performance level, delete that row's entry from `state.json` (it re-baselines on the next run).
+- Re-running the sha recorded as `last_seen_sha` refreshes artifacts but does not touch the window or the digest counter (retry-safe).
 - First run ever (no history) establishes the baseline and never alerts.
-- Every 10th commit → `trend_digest` card regardless of regressions.
+- Every 10th commit → `trend_digest` card (possibly alongside an alert card in the same run's `cards[]`). If the digest build fails — e.g. the window has no headline rows yet — the counter is not reset and the digest retries on the next commit.
 
-If you need to sanity-check a claimed regression by hand: take the row's `ratios` history from the recent `commits/*/raw.json`, compute the median of the last 20 values before the flagged run, and check `current > median * 1.10`.
+If you need to sanity-check a claimed regression by hand: the authoritative window is `state.json → rows.<row_key>.recent_ratios` (regressed-era values are excluded from it); check `current > median(recent_ratios) * 1.10`.
 Thresholds live in `src/state.rs` (`REGRESSION_THRESHOLD_PCT`, `ROLLING_WINDOW`, `DIGEST_BATCH_SIZE`) — changing them is a code change in this repo, not a config knob.
 
 ## Card templates

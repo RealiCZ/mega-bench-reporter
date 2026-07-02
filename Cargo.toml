@@ -2,7 +2,7 @@
 name = "mega-bench-reporter"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.86"
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 description = "Continuous mega-evm vs revm comparison pipeline: bench, chart, and render Lark cards. Triggered externally (e.g. by BB9); never calls the Lark API itself."
 publish = false

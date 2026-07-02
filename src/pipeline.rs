@@ -75,10 +75,17 @@ fn git_credential_args(clone_url: &str) -> Vec<String> {
 
 /// Clones (first run) or reuses the tracked repo's checkout under
 /// `<work_root>/<repo name>`. Submodules included — mega-evm needs them.
+/// A leftover directory without `.git` (an interrupted first clone) is
+/// removed and re-cloned instead of wedging every subsequent run — the
+/// checkout dir is fully machine-managed scratch.
 pub fn ensure_checkout(work_root: &Path, repo: &RepoConfig) -> anyhow::Result<PathBuf> {
     let checkout = work_root.join(&repo.name);
     if checkout.join(".git").exists() {
         return Ok(checkout);
+    }
+    if checkout.exists() {
+        eprintln!("removing broken checkout {} (no .git) and re-cloning", checkout.display());
+        std::fs::remove_dir_all(&checkout)?;
     }
     std::fs::create_dir_all(work_root)?;
     let mut cmd = Command::new("git");
@@ -89,18 +96,20 @@ pub fn ensure_checkout(work_root: &Path, repo: &RepoConfig) -> anyhow::Result<Pa
 }
 
 /// Fetches the tracked branch and checks out `sha` (detached), updating
-/// submodules. Falls back to fetching the sha directly if the branch fetch
-/// didn't make it reachable (e.g. a force-pushed branch).
+/// submodules. `--force` so tracked files rewritten by a previous bench run
+/// (classic: a regenerated `Cargo.lock`) can't wedge the checkout. Falls back
+/// to fetching the sha directly if the branch fetch didn't make it reachable
+/// (e.g. a force-pushed branch).
 pub fn checkout_commit(checkout: &Path, repo: &RepoConfig, sha: &str) -> anyhow::Result<()> {
     let cred = git_credential_args(&repo.clone_url);
     let cred_refs: Vec<&str> = cred.iter().map(String::as_str).collect();
 
     let fetch_branch: Vec<&str> = [&cred_refs[..], &["fetch", "origin", &repo.branch]].concat();
     git(checkout, &fetch_branch, "git fetch")?;
-    if git(checkout, &["checkout", "--detach", sha], "git checkout").is_err() {
+    if git(checkout, &["checkout", "--force", "--detach", sha], "git checkout").is_err() {
         let fetch_sha: Vec<&str> = [&cred_refs[..], &["fetch", "origin", sha]].concat();
         git(checkout, &fetch_sha, "git fetch <sha>")?;
-        git(checkout, &["checkout", "--detach", sha], "git checkout")?;
+        git(checkout, &["checkout", "--force", "--detach", sha], "git checkout")?;
     }
     let update_subs: Vec<&str> =
         [&cred_refs[..], &["submodule", "update", "--init", "--recursive"]].concat();
@@ -116,7 +125,7 @@ pub fn checkout_branch_head(checkout: &Path, repo: &RepoConfig) -> anyhow::Resul
     let cred_refs: Vec<&str> = cred.iter().map(String::as_str).collect();
     let fetch: Vec<&str> = [&cred_refs[..], &["fetch", "origin", &repo.branch]].concat();
     git(checkout, &fetch, "git fetch")?;
-    git(checkout, &["checkout", "--detach", "FETCH_HEAD"], "git checkout FETCH_HEAD")?;
+    git(checkout, &["checkout", "--force", "--detach", "FETCH_HEAD"], "git checkout FETCH_HEAD")?;
     let update_subs: Vec<&str> =
         [&cred_refs[..], &["submodule", "update", "--init", "--recursive"]].concat();
     git(checkout, &update_subs, "git submodule update")?;
@@ -144,15 +153,26 @@ pub fn commit_meta(checkout: &Path, sha: &str) -> anyhow::Result<CommitMeta> {
 /// the data we parse is criterion's `target/criterion` tree, written as a side
 /// effect of any bench run.
 pub fn bench_target(checkout: &Path, repo: &RepoConfig, target: &str) -> anyhow::Result<()> {
-    let status = Command::new("cargo")
+    let mut child = Command::new("cargo")
         .current_dir(checkout)
         .args(["bench", "-p", repo.package(), "--bench", target, "--profile", "profiling", "--"])
         .arg("--output-format")
         .arg("bencher")
-        .stdout(std::process::Stdio::inherit())
+        // Our own stdout carries exactly one JSON document per invocation, so
+        // the bencher lines are streamed to stderr instead of inherited.
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
-        .status()
+        .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn cargo bench --bench {target}: {e}"))?;
+    let mut child_stdout = child.stdout.take().expect("stdout piped");
+    let copied = std::io::copy(&mut child_stdout, &mut std::io::stderr());
+    if copied.is_err() {
+        // Don't leave a running bench behind if the stdout drain broke.
+        let _ = child.kill();
+        let _ = child.wait();
+        copied?;
+    }
+    let status = child.wait()?;
     if !status.success() {
         anyhow::bail!("cargo bench --bench {target} failed ({status})");
     }
@@ -174,18 +194,22 @@ pub fn dist_file_name(group: &str, workload: &str) -> String {
 }
 
 /// Splits a full row key (`group/subject[/workload…]`, as stored in
-/// `state.json`) back into its parts using the known group prefix.
+/// `state.json`) back into its parts using the known group prefix. The
+/// LONGEST matching group wins — group ids may themselves contain `/`, so a
+/// shorter group must not shadow a longer one (`a` vs `a/b`).
 fn split_row_key<'a>(
     row_key: &'a str,
     groups: &BTreeMap<String, Vec<&Row>>,
 ) -> Option<(&'a str, &'a str, &'a str)> {
-    for group in groups.keys() {
-        if let Some(rest) = row_key.strip_prefix(&format!("{group}/")) {
+    groups
+        .keys()
+        .filter(|group| row_key.starts_with(&format!("{group}/")))
+        .max_by_key(|group| group.len())
+        .map(|group| {
+            let rest = &row_key[group.len() + 1..];
             let (subject, workload) = rest.split_once('/').unwrap_or((rest, ""));
-            return Some((&row_key[..group.len()], subject, workload));
-        }
-    }
-    None
+            (&row_key[..group.len()], subject, workload)
+        })
 }
 
 /// The whole post-bench stage for one commit:
@@ -199,6 +223,20 @@ pub fn process_results(
 ) -> anyhow::Result<RunOutcome> {
     let rows = criterion_results::scan(criterion_dir)?;
     let ratios = criterion_results::compute_ratios(&rows);
+
+    // Idempotence guard: a retried run of the sha we just processed (e.g. the
+    // relaying agent re-invoking after a downstream delivery failure) must not
+    // fold the same ratios into the rolling window twice or double-bump the
+    // digest counter. The record and charts are still refreshed.
+    let mut state = State::load(&store.state_path())?;
+    let is_rerun = state.last_seen_sha.as_deref() == Some(meta.sha.as_str());
+    if is_rerun {
+        eprintln!(
+            "sha {} was already processed last run — refreshing artifacts without touching \
+             regression state",
+            meta.sha
+        );
+    }
 
     // 1. raw.json — the structured record is written before anything that can
     //    fail cosmetically (charts), so the data survives a rendering bug.
@@ -218,11 +256,16 @@ pub fn process_results(
         .collect();
     let bars = charts::compare_bars(&ratios, &headline_subjects);
     if !bars.is_empty() {
-        charts::render_compare_bar(
+        // Charts are derived artifacts: a rendering failure is logged, not
+        // fatal — raw.json is already on disk and the state update below must
+        // still happen.
+        if let Err(e) = charts::render_compare_bar(
             &commit_dir.join("compare.png"),
             &format!("{} vs revm_pinned @ {}", repo.name, record.short_sha()),
             &bars,
-        )?;
+        ) {
+            eprintln!("compare chart failed (continuing): {e:#}");
+        }
     }
 
     // Violin per (group, workload) that has anything to compare (≥ 2 subjects).
@@ -237,34 +280,38 @@ pub fn process_results(
         // Baseline first (stable color), then the rest alphabetically.
         wl_rows.sort_by_key(|r| (r.subject != "revm_pinned", r.subject.clone()));
         let title = if workload.is_empty() { group.clone() } else { format!("{group}/{workload}") };
-        charts::render_violin(
+        if let Err(e) = charts::render_violin(
             &commit_dir.join(dist_file_name(&group, &workload)),
             &format!("{title} — per-call distribution"),
             &wl_rows,
-        )?;
+        ) {
+            eprintln!("violin chart for {title} failed (continuing): {e:#}");
+        }
     }
 
     // 3. Regression check against the rolling median. Every row with a ratio
     //    is recorded (history is cheap); only headline-family rows alert.
-    let mut state = State::load(&store.state_path())?;
+    //    Skipped entirely on a re-run of the same sha (see guard above).
     let mut regressed = Vec::new();
     let mut recovered = Vec::new();
-    for wl in &ratios {
-        for ratio_row in &wl.rows {
-            let Some(ratio) = ratio_row.ratio_vs_revm_pinned else { continue };
-            let key = criterion_results::row_key(&wl.group, &ratio_row.subject, &wl.workload);
-            let verdict = state.check_and_record(&key, ratio);
-            if !digest::is_headline_subject(&ratio_row.subject, &repo.headline_spec) {
-                continue;
-            }
-            match verdict {
-                Verdict::NewRegression { median, current, .. } => {
-                    regressed.push(AlertRow { row_key: key, median, current });
+    if !is_rerun {
+        for wl in &ratios {
+            for ratio_row in &wl.rows {
+                let Some(ratio) = ratio_row.ratio_vs_revm_pinned else { continue };
+                let key = criterion_results::row_key(&wl.group, &ratio_row.subject, &wl.workload);
+                let verdict = state.check_and_record(&key, ratio);
+                if !digest::is_headline_subject(&ratio_row.subject, &repo.headline_spec) {
+                    continue;
                 }
-                Verdict::Recovered { median, current } => {
-                    recovered.push(AlertRow { row_key: key, median, current });
+                match verdict {
+                    Verdict::NewRegression { median, current, .. } => {
+                        regressed.push(AlertRow { row_key: key, median, current });
+                    }
+                    Verdict::Recovered { median, current } => {
+                        recovered.push(AlertRow { row_key: key, median, current });
+                    }
+                    Verdict::FirstRun | Verdict::Ok | Verdict::StillRegressed => {}
                 }
-                Verdict::FirstRun | Verdict::Ok | Verdict::StillRegressed => {}
             }
         }
     }
@@ -305,7 +352,7 @@ pub fn process_results(
     // 4. Digest batching: every DIGEST_BATCH_SIZE commits, roll up a trend
     //    card. A failed digest build is reported on stderr but doesn't fail
     //    the run — the counter is left un-reset so the next commit retries.
-    if state.bump_digest_counter() {
+    if !is_rerun && state.bump_digest_counter() {
         let records: Vec<CommitRecord> = store
             .load_recent_commit_records(DIGEST_BATCH_SIZE as usize)?
             .into_iter()
@@ -341,6 +388,9 @@ pub fn run_commit_pipeline(
     work_root: &Path,
 ) -> anyhow::Result<RunOutcome> {
     let store = RepoStore::new(data_root, &repo.name);
+    // Held for the whole run: concurrent invocations share the checkout, the
+    // criterion tree, and state.json.
+    let _lock = store.acquire_lock()?;
     let checkout = ensure_checkout(work_root, repo)?;
     checkout_commit(&checkout, repo, sha)?;
     let meta = commit_meta(&checkout, sha)?;

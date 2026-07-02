@@ -64,7 +64,7 @@ struct CliOutput {
     /// Directory the run's artifacts were written to (commit dir or flame dir).
     output_dir: PathBuf,
     /// Bench targets that failed this run (already marked in raw.json).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Always present — a stable shape is easier on the relaying agent.
     failed_targets: Vec<String>,
     cards: Vec<RenderedCard>,
 }
@@ -76,12 +76,20 @@ fn main() {
     }
 }
 
+/// Attachment paths in the output JSON must survive the relaying agent's cwd
+/// being different from ours — canonicalize the data root up front.
+fn canonical_data_root(data_root: PathBuf) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(&data_root)?;
+    Ok(data_root.canonicalize()?)
+}
+
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let output = match cli.command {
         Command::Run { repo, sha, config, data_root, work_root } => {
             let cfg = Config::load(&config)?;
             let repo_cfg = cfg.repo(&repo)?;
+            let data_root = canonical_data_root(data_root)?;
             let work_root = work_root.unwrap_or_else(|| data_root.join("_checkouts"));
             let outcome = pipeline::run_commit_pipeline(repo_cfg, &sha, &data_root, &work_root)?;
             CliOutput {
@@ -95,16 +103,15 @@ fn run() -> anyhow::Result<()> {
         Command::Flamegraph { repo, config, data_root, work_root } => {
             let cfg = Config::load(&config)?;
             let repo_cfg = cfg.repo(&repo)?;
+            let data_root = canonical_data_root(data_root)?;
             let work_root = work_root.unwrap_or_else(|| data_root.join("_checkouts"));
             let outcome = flamegraph::run_flamegraph_pipeline(repo_cfg, &data_root, &work_root)?;
             for day in &outcome.pruned {
                 eprintln!("pruned flame/{day} (past retention)");
             }
-            let checkout = work_root.join(&repo_cfg.name);
-            let sha = pipeline::head_sha(&checkout).unwrap_or_default();
             CliOutput {
                 repo,
-                sha,
+                sha: outcome.sha,
                 output_dir: outcome.flame_dir,
                 failed_targets: Vec::new(),
                 cards: vec![outcome.card],

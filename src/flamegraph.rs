@@ -12,6 +12,7 @@ use crate::cards::{self, FlamegraphCardParams, RenderedCard};
 use crate::config::{FlameWorkloadPair, RepoConfig};
 use crate::pipeline::{commit_meta, ensure_checkout};
 use crate::storage::RepoStore;
+use std::collections::BTreeMap;
 use std::io::{BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -19,6 +20,8 @@ use std::process::{Command, Stdio};
 /// Everything a `flamegraph` invocation produced.
 #[derive(Debug)]
 pub struct FlamegraphOutcome {
+    /// The sha that was actually profiled (branch HEAD at checkout time).
+    pub sha: String,
     pub flame_dir: PathBuf,
     pub card: RenderedCard,
     /// `flame/<day>` directories removed by retention pruning.
@@ -145,6 +148,14 @@ fn verify_benchmark_id(bench_bin: &Path, benchmark_id: &str) -> anyhow::Result<(
         .args(["--bench", "--list"])
         .output()
         .map_err(|e| anyhow::anyhow!("failed to run {} --list: {e}", bench_bin.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "{} --list failed ({}):\n{}",
+            bench_bin.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     let listing = String::from_utf8_lossy(&output.stdout);
     // criterion lists ids as `<id>: benchmark` lines.
     if !listing.lines().any(|l| l.trim_end_matches(": benchmark").trim() == benchmark_id) {
@@ -167,7 +178,7 @@ fn profile_workload(
     scratch: &Path,
 ) -> anyhow::Result<Vec<u8>> {
     let perf_data = scratch.join(format!("{}.perf.data", workload_file_stem(benchmark_id)));
-    let status = Command::new("perf")
+    let mut record_child = Command::new("perf")
         .arg("record")
         .args(["-g", "--call-graph", "dwarf,16384"])
         .arg("-o")
@@ -177,8 +188,20 @@ fn profile_workload(
         .args(["--bench", "--exact", "--profile-time"])
         .arg(profile_secs.to_string())
         .arg(benchmark_id)
-        .status()
+        // The profiled bench prints its own progress on stdout; our stdout is
+        // reserved for the final JSON document, so drain it to stderr.
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn perf record (Linux only): {e}"))?;
+    let mut record_stdout = record_child.stdout.take().expect("stdout piped");
+    let copied = std::io::copy(&mut record_stdout, &mut std::io::stderr());
+    if copied.is_err() {
+        let _ = record_child.kill();
+        let _ = record_child.wait();
+        copied?;
+    }
+    let status = record_child.wait()?;
     if !status.success() {
         anyhow::bail!("perf record failed for '{benchmark_id}' ({status})");
     }
@@ -191,7 +214,15 @@ fn profile_workload(
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn perf script: {e}"))?;
     let stdout = child.stdout.take().expect("stdout piped");
-    let folded = collapse_perf_script(BufReader::new(stdout))?;
+    let folded = match collapse_perf_script(BufReader::new(stdout)) {
+        Ok(folded) => folded,
+        Err(e) => {
+            // Don't leave a running perf script behind if folding broke.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
     let status = child.wait()?;
     if !status.success() {
         anyhow::bail!("perf script failed for '{benchmark_id}' ({status})");
@@ -220,12 +251,26 @@ pub fn run_flamegraph_pipeline(
         anyhow::bail!("repo '{}' has an empty flamegraph workload list", repo.name);
     }
     let store = RepoStore::new(data_root, &repo.name);
+    // Same exclusive lock as the per-commit pipeline: both share the checkout.
+    let _lock = store.acquire_lock()?;
     let checkout = ensure_checkout(work_root, repo)?;
 
     // Nightly profiles the tracked branch's current HEAD (not a specific sha).
     crate::pipeline::checkout_branch_head(&checkout, repo)?;
     let sha = crate::pipeline::head_sha(&checkout)?;
     let meta = commit_meta(&checkout, &sha)?;
+
+    // A feature id appearing in two pairs would overwrite its own `_diff.svg`
+    // with a different comparison — reject the config outright.
+    let mut seen_features = std::collections::BTreeSet::new();
+    for pair in &flame_cfg.workloads {
+        if !seen_features.insert(&pair.feature) {
+            anyhow::bail!(
+                "flamegraph workload feature '{}' appears in more than one pair",
+                pair.feature
+            );
+        }
+    }
 
     let bench_bin = build_bench_binary(&checkout, repo, &flame_cfg.bench_target)?;
     for pair in &flame_cfg.workloads {
@@ -239,27 +284,37 @@ pub fn run_flamegraph_pipeline(
     std::fs::create_dir_all(&flame_dir)?;
     let scratch = tempfile::tempdir()?;
 
-    let mut card_workloads = Vec::new();
+    // Profile and render each unique id exactly once — a baseline shared by
+    // several pairs is not re-profiled per pair.
+    let mut folded: BTreeMap<&String, Vec<u8>> = BTreeMap::new();
+    let mut svgs: BTreeMap<&String, PathBuf> = BTreeMap::new();
     for FlameWorkloadPair { baseline, feature } in &flame_cfg.workloads {
-        let baseline_folded =
-            profile_workload(&bench_bin, baseline, flame_cfg.profile_secs, scratch.path())?;
-        let feature_folded =
-            profile_workload(&bench_bin, feature, flame_cfg.profile_secs, scratch.path())?;
+        for id in [baseline, feature] {
+            if folded.contains_key(id) {
+                continue;
+            }
+            let data = profile_workload(&bench_bin, id, flame_cfg.profile_secs, scratch.path())?;
+            let svg = flame_dir.join(format!("{}.svg", workload_file_stem(id)));
+            render_flamegraph_svg(id, &data, &svg)?;
+            folded.insert(id, data);
+            svgs.insert(id, svg);
+        }
+    }
 
-        let baseline_svg = flame_dir.join(format!("{}.svg", workload_file_stem(baseline)));
-        render_flamegraph_svg(baseline, &baseline_folded, &baseline_svg)?;
-        let feature_svg = flame_dir.join(format!("{}.svg", workload_file_stem(feature)));
-        render_flamegraph_svg(feature, &feature_folded, &feature_svg)?;
+    let mut card_workloads = Vec::new();
+    let mut listed = std::collections::BTreeSet::new();
+    for FlameWorkloadPair { baseline, feature } in &flame_cfg.workloads {
         let diff_svg = flame_dir.join(format!("{}_diff.svg", workload_file_stem(feature)));
         render_differential_svg(
             &format!("{feature} vs {baseline}"),
-            &baseline_folded,
-            &feature_folded,
+            &folded[baseline],
+            &folded[feature],
             &diff_svg,
         )?;
-
-        card_workloads.push((feature.clone(), feature_svg, Some(diff_svg)));
-        card_workloads.push((baseline.clone(), baseline_svg, None));
+        card_workloads.push((feature.clone(), svgs[feature].clone(), Some(diff_svg)));
+        if listed.insert(baseline) {
+            card_workloads.push((baseline.clone(), svgs[baseline].clone(), None));
+        }
     }
 
     let pruned = store.prune_flame_dirs(&day, flame_cfg.retention_days)?;
@@ -271,7 +326,7 @@ pub fn run_flamegraph_pipeline(
         workloads: card_workloads,
     })?;
 
-    Ok(FlamegraphOutcome { flame_dir, card, pruned })
+    Ok(FlamegraphOutcome { sha: meta.sha, flame_dir, card, pruned })
 }
 
 #[cfg(test)]

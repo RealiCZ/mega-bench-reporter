@@ -64,15 +64,34 @@ pub fn image_placeholder(path: &Path) -> String {
     format!("${{image:{basename}}}")
 }
 
+/// Single-pass `{{key}}` expansion: substituted values are never re-scanned,
+/// so a value that happens to contain `{{...}}` (e.g. a benchmark named that
+/// way) is emitted literally instead of being expanded again. Unknown keys are
+/// left as-is.
+fn expand_placeholders(template: &str, vars: &BTreeMap<&str, String>) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find("}}") {
+            Some(end) if vars.contains_key(&after[..end]) => {
+                out.push_str(&vars[&after[..end]]);
+                rest = &after[end + 2..];
+            }
+            _ => {
+                out.push_str("{{");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn substitute_strings(value: &mut Value, vars: &BTreeMap<&str, String>) {
     match value {
-        Value::String(s) if s.contains("{{") => {
-            let mut out = s.clone();
-            for (key, val) in vars {
-                out = out.replace(&format!("{{{{{key}}}}}"), val);
-            }
-            *s = out;
-        }
+        Value::String(s) if s.contains("{{") => *s = expand_placeholders(s, vars),
         Value::Array(items) => items.iter_mut().for_each(|v| substitute_strings(v, vars)),
         Value::Object(map) => map.values_mut().for_each(|v| substitute_strings(v, vars)),
         _ => {}
@@ -530,6 +549,27 @@ mod tests {
             serde_json::from_str::<Value>(template)
                 .unwrap_or_else(|e| panic!("template {name} is invalid JSON: {e}"));
         }
+    }
+
+    #[test]
+    fn test_substituted_values_are_not_re_expanded() {
+        // A row name containing a literal placeholder must come out verbatim,
+        // not expand the card's other variables into the body.
+        let params = AlertCardParams {
+            repo_name: "mega-evm",
+            github: "megaeth-labs/mega-evm",
+            sha: "abcdef0123456789",
+            regressed: vec![AlertRow {
+                row_key: "g/rex5/x{{title}}y".into(),
+                median: 1.0,
+                current: 1.2,
+            }],
+            recovered: vec![],
+            images: vec![],
+        };
+        let rendered = render_alert_card(&params).unwrap();
+        let text = card_text(&rendered.card);
+        assert!(text.contains(r"x{{title}}y"), "placeholder in value was re-expanded: {text}");
     }
 
     #[test]

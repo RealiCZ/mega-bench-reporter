@@ -192,6 +192,32 @@ fn test_synthetic_ten_commit_run_with_regression_and_recovery() {
 }
 
 #[test]
+fn test_rerunning_same_sha_does_not_double_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_root = tmp.path().join("data");
+    let cfg = Config::parse(CONFIG).unwrap();
+    let repo = cfg.repo("mega-evm").unwrap();
+    let store = RepoStore::new(&data_root, "mega-evm");
+
+    let scratch = tmp.path().join("criterion");
+    write_criterion_tree(&scratch, 2.0);
+    process_results(repo, &store, &scratch, &meta(0), vec![]).unwrap();
+    let state_after_first = State::load(&store.state_path()).unwrap();
+
+    // Same sha again (e.g. a relaying-agent retry): artifacts refresh, but the
+    // rolling window and digest counter must not move.
+    let outcome = process_results(repo, &store, &scratch, &meta(0), vec![]).unwrap();
+    assert!(outcome.cards.is_empty());
+    let state_after_rerun = State::load(&store.state_path()).unwrap();
+    assert_eq!(state_after_first, state_after_rerun);
+    assert_eq!(
+        state_after_rerun.rows["salt_dynamic_gas/rex5_salt/sstore_100"].recent_ratios.len(),
+        1
+    );
+    assert_eq!(state_after_rerun.commits_since_digest, 1);
+}
+
+#[test]
 fn test_failed_targets_are_marked_not_silently_dropped() {
     let tmp = tempfile::tempdir().unwrap();
     let data_root = tmp.path().join("data");

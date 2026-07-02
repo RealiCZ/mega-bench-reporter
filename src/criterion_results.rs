@@ -9,7 +9,14 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Deserialize)]
 struct BenchmarkJson {
     group_id: String,
-    function_id: String,
+    /// `None` for bare `bench_function` benches and for
+    /// `BenchmarkId::from_parameter` rows.
+    #[serde(default)]
+    function_id: Option<String>,
+    /// Set for value-parameterized benches (`BenchmarkId::new(f, value)`),
+    /// which nest one directory level deeper; folded into the workload.
+    #[serde(default)]
+    value_str: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,10 +59,14 @@ fn split_function_id(function_id: &str) -> (String, String) {
     }
 }
 
-/// Scans a `target/criterion` directory (recursively, one level: `<group>/<dir>/new/*.json`)
-/// and returns every row it can fully parse. A row missing `estimates.json` or
-/// `sample.json` (e.g. an in-progress or profile-time-only run) is skipped, not
-/// an error — the caller decides whether a missing row is fatal.
+/// Scans a `target/criterion` directory and returns every row it can fully
+/// parse. Criterion lays benchmarks out at three possible depths, all handled:
+/// `<name>/new` (bare `bench_function`), `<group>/<function>/new`, and
+/// `<group>/<function>/<value>/new` (value-parameterized) — the same function
+/// can have both of the last two at once. A directory missing any of the three
+/// JSON files (e.g. an in-progress or profile-time-only run) is skipped;
+/// a directory whose JSON fails to parse is skipped with a stderr warning —
+/// neither aborts the scan.
 pub fn scan(criterion_dir: &Path) -> anyhow::Result<Vec<Row>> {
     let mut rows = Vec::new();
     if !criterion_dir.is_dir() {
@@ -70,6 +81,10 @@ pub fn scan(criterion_dir: &Path) -> anyhow::Result<Vec<Row>> {
         if group_entry.file_name() == "report" {
             continue;
         }
+        // A bare `bench_function` writes its data directly at the top level.
+        if let Some(row) = read_row(&group_entry.path())? {
+            rows.push(row);
+        }
         for dir_entry in std::fs::read_dir(group_entry.path())? {
             let dir_entry = dir_entry?;
             if !dir_entry.file_type()?.is_dir() || dir_entry.file_name() == "report" {
@@ -77,6 +92,20 @@ pub fn scan(criterion_dir: &Path) -> anyhow::Result<Vec<Row>> {
             }
             if let Some(row) = read_row(&dir_entry.path())? {
                 rows.push(row);
+            }
+            // Value-parameterized benches nest one level deeper
+            // (`<group>/<function>/<value>/new`) and can coexist with the
+            // `<group>/<function>/new` layout above. Criterion's own data
+            // dirs (`new`, `base`, `change`) contain no nested benchmark.json
+            // and fall out of read_row as None.
+            for value_entry in std::fs::read_dir(dir_entry.path())? {
+                let value_entry = value_entry?;
+                if !value_entry.file_type()?.is_dir() || value_entry.file_name() == "report" {
+                    continue;
+                }
+                if let Some(row) = read_row(&value_entry.path())? {
+                    rows.push(row);
+                }
             }
         }
     }
@@ -93,13 +122,33 @@ fn read_row(bench_dir: &Path) -> anyhow::Result<Option<Row>> {
     if !benchmark_path.is_file() || !estimates_path.is_file() || !sample_path.is_file() {
         return Ok(None);
     }
-    let benchmark: BenchmarkJson =
-        serde_json::from_str(&std::fs::read_to_string(&benchmark_path)?)?;
-    let estimates: EstimatesJson =
-        serde_json::from_str(&std::fs::read_to_string(&estimates_path)?)?;
-    let sample: SampleJson = serde_json::from_str(&std::fs::read_to_string(&sample_path)?)?;
+    // A malformed row (unexpected schema) is warned about and skipped rather
+    // than aborting the whole scan and losing every other row's data.
+    macro_rules! parse_or_skip {
+        ($ty:ty, $path:expr) => {
+            match serde_json::from_str::<$ty>(&std::fs::read_to_string(&$path)?) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("skipping unparseable {}: {e}", $path.display());
+                    return Ok(None);
+                }
+            }
+        };
+    }
+    let benchmark = parse_or_skip!(BenchmarkJson, benchmark_path);
+    let estimates = parse_or_skip!(EstimatesJson, estimates_path);
+    let sample = parse_or_skip!(SampleJson, sample_path);
 
-    let (subject, workload) = split_function_id(&benchmark.function_id);
+    // Bare `bench_function` / `BenchmarkId::from_parameter` rows have no
+    // function_id; the group name doubles as the subject so the row still
+    // gets a stable, non-empty key.
+    let (subject, mut workload) = match &benchmark.function_id {
+        Some(function_id) => split_function_id(function_id),
+        None => (benchmark.group_id.clone(), String::new()),
+    };
+    if let Some(value) = &benchmark.value_str {
+        workload = if workload.is_empty() { value.clone() } else { format!("{workload}/{value}") };
+    }
     let samples_ns: Vec<f64> =
         sample.iters.iter().zip(sample.times.iter()).map(|(iters, ns)| ns / iters).collect();
 
@@ -145,14 +194,21 @@ pub fn compute_ratios(rows: &[Row]) -> Vec<WorkloadRatios> {
     by_key
         .into_iter()
         .map(|((group, workload), group_rows)| {
-            let baseline_ns =
-                group_rows.iter().find(|r| r.subject == BASELINE_SUBJECT).map(|r| r.mean_ns);
+            // A degenerate baseline (zero/NaN estimate) would poison every
+            // downstream median/chart with inf/NaN — treat it as absent.
+            let baseline_ns = group_rows
+                .iter()
+                .find(|r| r.subject == BASELINE_SUBJECT)
+                .map(|r| r.mean_ns)
+                .filter(|ns| ns.is_finite() && *ns > 0.0);
             let mut ratio_rows: Vec<RatioRow> = group_rows
                 .iter()
                 .map(|r| RatioRow {
                     subject: r.subject.clone(),
                     mean_ns: r.mean_ns,
-                    ratio_vs_revm_pinned: baseline_ns.map(|b| r.mean_ns / b),
+                    ratio_vs_revm_pinned: baseline_ns
+                        .map(|b| r.mean_ns / b)
+                        .filter(|ratio| ratio.is_finite()),
                 })
                 .collect();
             ratio_rows.sort_by(|a, b| a.subject.cmp(&b.subject));
@@ -271,6 +327,45 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_value_parameterized_layout_one_level_deeper() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `<group>/<function>/<value>/new` with value_str set, as criterion
+        // lays out `BenchmarkId::new(function, value)` benches.
+        let new_dir = tmp.path().join("param_group").join("rex5_case").join("100").join("new");
+        fs::create_dir_all(&new_dir).unwrap();
+        fs::write(
+            new_dir.join("benchmark.json"),
+            serde_json::json!({
+                "group_id": "param_group",
+                "function_id": "rex5_case",
+                "value_str": "100",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            new_dir.join("estimates.json"),
+            serde_json::json!({
+                "mean": {"point_estimate": 5000.0},
+                "std_dev": {"point_estimate": 50.0},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            new_dir.join("sample.json"),
+            serde_json::json!({"sampling_mode": "Auto", "iters": [1.0], "times": [5000.0]})
+                .to_string(),
+        )
+        .unwrap();
+
+        let rows = scan(tmp.path()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subject, "rex5_case");
+        assert_eq!(rows[0].workload, "100");
+    }
+
+    #[test]
     fn test_compute_ratios_against_revm_pinned() {
         let rows = vec![
             Row {
@@ -326,6 +421,118 @@ mod tests {
         let ratios = compute_ratios(&rows);
         assert_eq!(ratios.len(), 1);
         assert_eq!(ratios[0].rows[0].ratio_vs_revm_pinned, None);
+    }
+
+    #[test]
+    fn test_scan_bare_bench_function_top_level_layout() {
+        // `Criterion::bench_function("name", ...)` writes directly at
+        // `target/criterion/<name>/new` with a null function_id.
+        let tmp = tempfile::tempdir().unwrap();
+        let new_dir = tmp.path().join("standalone_bench").join("new");
+        fs::create_dir_all(&new_dir).unwrap();
+        fs::write(
+            new_dir.join("benchmark.json"),
+            serde_json::json!({"group_id": "standalone_bench", "function_id": null}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            new_dir.join("estimates.json"),
+            serde_json::json!({
+                "mean": {"point_estimate": 7000.0},
+                "std_dev": {"point_estimate": 70.0},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            new_dir.join("sample.json"),
+            serde_json::json!({"sampling_mode": "Auto", "iters": [1.0], "times": [7000.0]})
+                .to_string(),
+        )
+        .unwrap();
+
+        let rows = scan(tmp.path()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].group, "standalone_bench");
+        assert_eq!(rows[0].subject, "standalone_bench");
+        assert_eq!(rows[0].workload, "");
+    }
+
+    #[test]
+    fn test_scan_coexisting_flat_and_value_layouts() {
+        // The same function id can have both `<g>/<f>/new` and
+        // `<g>/<f>/<value>/new`; neither may shadow the other.
+        let tmp = tempfile::tempdir().unwrap();
+        write_row(tmp.path(), "g", "f", "f", 1000.0, 10.0, &[(1.0, 1000.0)]);
+        let nested = tmp.path().join("g").join("f").join("8").join("new");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("benchmark.json"),
+            serde_json::json!({"group_id": "g", "function_id": "f", "value_str": "8"}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            nested.join("estimates.json"),
+            serde_json::json!({
+                "mean": {"point_estimate": 2000.0},
+                "std_dev": {"point_estimate": 20.0},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            nested.join("sample.json"),
+            serde_json::json!({"sampling_mode": "Auto", "iters": [1.0], "times": [2000.0]})
+                .to_string(),
+        )
+        .unwrap();
+
+        let mut rows = scan(tmp.path()).unwrap();
+        rows.sort_by(|a, b| a.workload.cmp(&b.workload));
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].subject.as_str(), rows[0].workload.as_str()), ("f", ""));
+        assert_eq!((rows[1].subject.as_str(), rows[1].workload.as_str()), ("f", "8"));
+    }
+
+    #[test]
+    fn test_unparseable_row_is_skipped_not_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_row(tmp.path(), "g", "good", "good", 1000.0, 10.0, &[(1.0, 1000.0)]);
+        let bad = tmp.path().join("g").join("bad").join("new");
+        fs::create_dir_all(&bad).unwrap();
+        fs::write(bad.join("benchmark.json"), "{not json").unwrap();
+        fs::write(bad.join("estimates.json"), "{}").unwrap();
+        fs::write(bad.join("sample.json"), "{}").unwrap();
+
+        let rows = scan(tmp.path()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subject, "good");
+    }
+
+    #[test]
+    fn test_degenerate_baseline_yields_no_ratio_not_inf() {
+        let rows = vec![
+            Row {
+                group: "g".into(),
+                subject: "revm_pinned".into(),
+                workload: "w".into(),
+                mean_ns: 0.0,
+                std_dev_ns: 0.0,
+                samples_ns: vec![0.0],
+            },
+            Row {
+                group: "g".into(),
+                subject: "rex5".into(),
+                workload: "w".into(),
+                mean_ns: 1000.0,
+                std_dev_ns: 10.0,
+                samples_ns: vec![1000.0],
+            },
+        ];
+        let ratios = compute_ratios(&rows);
+        for row in &ratios[0].rows {
+            assert_eq!(row.ratio_vs_revm_pinned, None, "subject {}", row.subject);
+        }
     }
 
     #[test]

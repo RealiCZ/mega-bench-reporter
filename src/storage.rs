@@ -178,6 +178,24 @@ impl RepoStore {
         Ok(all.split_off(skip))
     }
 
+    /// Exclusive per-repo advisory lock: two invocations for the same repo
+    /// share the checkout, the criterion tree, and `state.json`, so they must
+    /// never run concurrently. The OS releases the lock when the returned
+    /// handle drops — including on crash, so no stale-lock cleanup is needed.
+    pub fn acquire_lock(&self) -> anyhow::Result<std::fs::File> {
+        std::fs::create_dir_all(&self.root)?;
+        let path = self.root.join(".lock");
+        let file = std::fs::File::create(&path)?;
+        file.try_lock().map_err(|e| {
+            anyhow::anyhow!(
+                "another invocation for this repo is already running (lock {} is held: {e}); \
+                 refusing to run concurrently",
+                path.display()
+            )
+        })?;
+        Ok(file)
+    }
+
     /// Removes `flame/<day>` directories older than `keep_days` days before
     /// `today` (a `YYYYMMDD` string, lexicographic comparison — same format as
     /// the directory names). Returns the pruned directory names.

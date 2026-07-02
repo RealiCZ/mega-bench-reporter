@@ -68,19 +68,39 @@ fn median(values: &VecDeque<f64>) -> f64 {
 }
 
 impl State {
+    /// A corrupt state file (e.g. a partial write from a crashed run) is
+    /// backed up to `<path>.corrupt` and treated as empty rather than
+    /// wedging every subsequent run.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
         let text = std::fs::read_to_string(path)?;
-        Ok(serde_json::from_str(&text)?)
+        match serde_json::from_str(&text) {
+            Ok(state) => Ok(state),
+            Err(e) => {
+                let backup = path.with_extension("json.corrupt");
+                eprintln!(
+                    "state file {} is corrupt ({e}); backing it up to {} and starting from an \
+                     empty baseline",
+                    path.display(),
+                    backup.display()
+                );
+                std::fs::rename(path, &backup)?;
+                Ok(Self::default())
+            }
+        }
     }
 
+    /// Write-to-temp + rename so a crash mid-write can't leave a truncated
+    /// state file behind.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
+        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 
@@ -88,6 +108,14 @@ impl State {
     /// against the rolling median of its history so far, records the verdict's
     /// regression latch, then folds `ratio` into the window. Call once per
     /// `(row_key, run)` — order matters, this both reads and mutates.
+    ///
+    /// Regressed values are NOT folded into the window: otherwise a sustained
+    /// regression would converge the median onto the regressed level, emit a
+    /// false "recovered" card, and silently rebaseline. The baseline stays
+    /// frozen while a row is regressed — a permanent regression stays
+    /// `StillRegressed` (quiet after the one alert) until it is actually
+    /// fixed, or until the operator accepts the new level by clearing the
+    /// row's entry in `state.json`.
     pub fn check_and_record(&mut self, row_key: &str, ratio: f64) -> Verdict {
         let entry = self.rows.entry(row_key.to_string()).or_default();
         let verdict = if entry.recent_ratios.is_empty() {
@@ -108,9 +136,11 @@ impl State {
             }
         };
         entry.currently_regressed = verdict.is_regressed();
-        entry.recent_ratios.push_back(ratio);
-        if entry.recent_ratios.len() > ROLLING_WINDOW {
-            entry.recent_ratios.pop_front();
+        if !verdict.is_regressed() {
+            entry.recent_ratios.push_back(ratio);
+            if entry.recent_ratios.len() > ROLLING_WINDOW {
+                entry.recent_ratios.pop_front();
+            }
         }
         verdict
     }
@@ -204,6 +234,43 @@ mod tests {
         // Next run at the same level: no repeated recovery notice, just Ok.
         let v2 = state.check_and_record(key, 2.0);
         assert_eq!(v2, Verdict::Ok);
+    }
+
+    #[test]
+    fn test_sustained_regression_never_falsely_recovers() {
+        // The regressed values must not be folded into the window: a +50%
+        // regression held for many runs stays StillRegressed (frozen baseline)
+        // instead of converging the median and emitting a false Recovered.
+        let mut state = State::default();
+        let key = "g/rex5/w";
+        for _ in 0..5 {
+            state.check_and_record(key, 2.0);
+        }
+        assert!(matches!(state.check_and_record(key, 3.0), Verdict::NewRegression { .. }));
+        for run in 0..30 {
+            let v = state.check_and_record(key, 3.0);
+            assert_eq!(v, Verdict::StillRegressed, "run {run} must stay regressed");
+        }
+        // The baseline is still the pre-regression 2.0 median, so an actual
+        // fix back to 2.05 recovers against the ORIGINAL baseline.
+        match state.check_and_record(key, 2.05) {
+            Verdict::Recovered { median, .. } => assert!((median - 2.0).abs() < 1e-9),
+            other => panic!("expected Recovered, got {other:?}"),
+        }
+        // And the window was not polluted by the regressed era: a fresh +15%
+        // over the old level alerts again.
+        assert!(matches!(state.check_and_record(key, 2.35), Verdict::NewRegression { .. }));
+    }
+
+    #[test]
+    fn test_corrupt_state_file_is_backed_up_not_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.json");
+        std::fs::write(&path, "{truncated").unwrap();
+        let loaded = State::load(&path).unwrap();
+        assert_eq!(loaded, State::default());
+        assert!(path.with_extension("json.corrupt").is_file());
+        assert!(!path.exists());
     }
 
     #[test]

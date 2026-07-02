@@ -111,7 +111,7 @@ The list shape is deliberate: adding a second tracked repo is a new `[[repos]]` 
   commits/<YYYYMMDD>-<shortsha>/
     raw.json              # source of truth: { commit, date, rustc, failed_targets?, groups: { <group>: { <subject>[/<workload>]: { ns, ratio_vs_revm_pinned } } } }
     compare.png           # headline-family ratios, one bar per (workload, subject)
-    dist_<group>[_<workload>].png   # per-call time distribution (violin), one per group/workload with >= 2 subjects
+    dist_<group>[_<workload>].png   # per-call time distribution (violin), one per group/workload with >= 2 subjects; "/" in workloads becomes "_"
   digests/<YYYYMMDD>-<first>..<last>/
     summary.json          # last-10-commits headline series, table-ready (first/last/median per row)
     trend.png             # headline ratios over the window
@@ -123,9 +123,11 @@ The list shape is deliberate: adding a second tracked repo is a new `[[repos]]` 
 
 ## Regression semantics
 
-- Ratios are compared against the row's rolling median (window: last 20 runs) — noise-robust, no fixed absolute baseline.
+- Ratios are compared against the row's rolling median (window: last 20 healthy runs) — noise-robust, no fixed absolute baseline.
 - A headline-spec row rising more than 10% above its rolling median triggers a regression-alert card the same run.
 - The alert is latched: while the row stays regressed no further card is sent; when it drops back under the threshold a recovery card is sent once.
+- Regressed values never enter the rolling window, so a sustained regression stays measured against the pre-regression baseline instead of silently becoming the new normal; accepting a new level = deleting that row's entry from `state.json`.
+- Re-running the most recently processed sha refreshes artifacts without touching regression state (retry-safe).
 - The first run establishes the baseline and never alerts.
 - Only headline-family subjects (`headline_spec` and its `_`-suffixed variants, e.g. `rex5`, `rex5_salt`, `rex5_oracle`) can alert; all rows are recorded in history regardless.
 
@@ -140,6 +142,6 @@ Template language: `{{key}}` substitution inside string values, plus a `{"tag": 
 ```bash
 cargo test                        # unit + synthetic end-to-end pipeline tests
 cargo fmt --all
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --locked -- -D warnings
 cargo run --example render_samples -- /tmp/charts   # visual check of the three chart types
 ```
