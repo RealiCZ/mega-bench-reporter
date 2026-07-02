@@ -28,6 +28,9 @@ None of these block using the tool; they need a joint decision or a follow-up ou
 6b. **Digest window is ordered by committer date, not processing order.**
    A benched commit with a backdated committer date (rebase artifacts) can sort outside its own digest window.
    Accepted for now; switching to a stored processing sequence number is the fix if it ever bites.
+6d. **Recovery has no hysteresis.**
+   Recovery = the latched row returning within the SAME +10% band it regressed past (vs the frozen pre-regression median), so recovery ≠ back-to-original (settling at +9.9% counts), and a row oscillating around the threshold emits alternating regression/recovery event pairs.
+   If that proves noisy, add a stricter recovery threshold (e.g. regress at +10%, recover under +5%) — one config knob + one comparison.
 6c. **Accepted-regression workflow is manual.**
    A sustained regression stays latched forever (baseline frozen); accepting the new level means deleting that row from `state.json`.
    A `rebaseline` subcommand would formalize this if it happens often.
