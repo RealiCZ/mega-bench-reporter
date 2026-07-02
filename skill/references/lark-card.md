@@ -84,6 +84,14 @@ from `summary.json.rows` (`row_key` / `median` / `first` / `last`) and attach
 `trend.png`. If your Lark stack uses card v1: move `body.elements` to top-level
 `elements` and swap `markdown` for `div`+`lark_md`.
 
+**Clean-run report card** (optional — your policy): when `events` is empty you can still
+post a `--template green` "run completed" card (the very first run always lands here —
+it only establishes baselines). Pull `sha` from `latest.json`, row/subject counts and the
+top `headline_ratio` rows from `compare_table.json`, and attach `compare_bars.png` if it
+exists (it is only rendered when headline rows have ratios — absent on repos/branches
+without headline subjects yet; fall back to a `dist_*.png` or no image). Use
+`--template yellow` instead if `raw.json.failed_targets` is non-empty.
+
 ---
 
 ## 4. Images
