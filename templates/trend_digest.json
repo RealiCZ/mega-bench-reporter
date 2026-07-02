@@ -1,0 +1,17 @@
+{
+  "config": { "wide_screen_mode": true },
+  "header": {
+    "template": "blue",
+    "title": { "tag": "plain_text", "content": "{{title}}" }
+  },
+  "elements": [
+    { "tag": "markdown", "content": "{{summary_md}}" },
+    { "tag": "markdown", "content": "{{table_md}}" },
+    { "tag": "__images__", "group": "charts" },
+    { "tag": "hr" },
+    {
+      "tag": "note",
+      "elements": [{ "tag": "plain_text", "content": "{{footer}}" }]
+    }
+  ]
+}

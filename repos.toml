@@ -1,0 +1,18 @@
+# Tracked-repo list (D8). A list from day one: adding a repo is a new
+# [[repos]] entry, not a code change.
+
+[[repos]]
+name = "mega-evm"
+github = "megaeth-labs/mega-evm"
+branch = "main"
+clone_url = "https://github.com/megaeth-labs/mega-evm.git"
+bench_targets = ["transact", "revm_bench", "mega_bench", "comp_cost", "block_bench"]
+headline_spec = "rex5"
+
+[repos.flamegraph]
+bench_target = "mega_bench"
+profile_secs = 30
+retention_days = 30
+workloads = [
+  { baseline = "salt_dynamic_gas/revm_pinned/sstore_100", feature = "salt_dynamic_gas/rex5_salt/sstore_100" },
+]
