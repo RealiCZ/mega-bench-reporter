@@ -1,10 +1,6 @@
-//! Chart rendering with `plotters`: comparison bar chart, violin
-//! (distribution) plot, and the digest trend chart — all PNG, all using an
+//! Chart rendering with `plotters`: relative-speed bars, violin
+//! (distribution) plots, and the digest trend chart — all PNG, all using an
 //! embedded font so the binary has no system font/fontconfig dependency.
-//!
-//! The violin shape/interpretation was validated against real criterion
-//! `sample.json` data with a Python prototype; this is the `plotters`
-//! re-implementation of the same approach.
 
 use crate::criterion_results::{Row, WorkloadRatios};
 use plotters::prelude::*;
@@ -307,8 +303,7 @@ pub fn render_speed_bars(
     Ok(())
 }
 
-/// Gaussian KDE over `grid` with Silverman's rule-of-thumb bandwidth — the
-/// same estimator the validated Python (scipy) prototype used.
+/// Gaussian KDE over `grid` with Silverman's rule-of-thumb bandwidth.
 fn gaussian_kde(samples: &[f64], grid: &[f64]) -> Vec<f64> {
     let n = samples.len() as f64;
     let mean = samples.iter().sum::<f64>() / n;
@@ -331,8 +326,7 @@ fn gaussian_kde(samples: &[f64], grid: &[f64]) -> Vec<f64> {
 }
 
 /// Horizontal violin plot for one `(group, workload)`: one violin per subject,
-/// x = per-call time in µs, with min–max whiskers and a mean tick — the same
-/// layout as the validated `fig-dist-real.png` prototype.
+/// x = per-call time in µs, with min–max whiskers and a mean tick.
 pub fn render_violin(path: &Path, title: &str, rows: &[&Row]) -> anyhow::Result<()> {
     ensure_font();
     if rows.is_empty() {

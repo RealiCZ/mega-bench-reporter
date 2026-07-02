@@ -404,9 +404,8 @@ mod tests {
 
     #[test]
     fn test_compute_ratios_missing_baseline_skips_ratio_not_the_group() {
-        // Matches the existing "group missing the revm_pinned baseline row skips
-        // its ratio" behavior (design.md's Error handling section) — the row
-        // still shows up (mean_ns), just with ratio_vs_revm_pinned = None.
+        // A group/workload without a baseline row still shows up (mean_ns),
+        // just with ratio_vs_baseline = None.
         let rows = vec![Row {
             group: "oracle_real_data".into(),
             subject: "rex5_oracle".into(),

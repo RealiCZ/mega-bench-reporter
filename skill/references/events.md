@@ -43,4 +43,4 @@ for that dir — treat as `[]`.
 
 `regression_threshold_pct`, `rolling_window`, `digest_batch_size`, `bench_profile`
 live in `repos.toml` (`[defaults]` + per-repo overrides); built-in fallbacks in
-`src/state.rs`.
+`src/config.rs`.

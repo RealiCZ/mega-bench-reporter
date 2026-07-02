@@ -1,8 +1,7 @@
 //! Nightly flame-graph pipeline: build the `profiling`-profile
 //! bench binary, sample each configured workload with the platform's profiler
 //! — `perf record`/`perf script` on Linux, the built-in `sample` tool on
-//! macOS (1 ms interval, same rate as the original samply-based
-//! proof-of-concept) — then fold and render via the `inferno` crate as a
+//! macOS (1 ms interval) — then fold and render via the `inferno` crate as a
 //! library (no `inferno-*` CLI binaries to install anywhere).
 //!
 //! Layering mirrors `pipeline.rs`: subprocess helpers (cargo/perf/sample) are

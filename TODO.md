@@ -18,7 +18,7 @@ None of these block using the tool; they need a joint decision or a follow-up ou
    The real trial run therefore targeted the branch head (`d21a86f`).
    Decide: merge Part A first (preferred) or temporarily set `headline_spec = "rex4"`.
 5. ~~Thresholds are code constants, not config.~~ **Resolved:** `regression_threshold_pct`, `rolling_window`, `digest_batch_size`, and `bench_profile` are now config (`[defaults]` + per-repo overrides in `repos.toml`).
-   Still fixed in code: the digest card/table caps (15 rows, 8 trend series) — say the word if these should be knobs too.
+   Still fixed in code: the digest trend chart caps at 8 series (full data in summary.json) — say the word if that should be a knob too.
 6. **Digest counter counts runs, not distinct commits.**
    An immediate retry of the last processed sha is guarded (idempotent, no double count), but re-running an OLDER sha still bumps the counter.
    Harmless under BB9's one-run-per-new-commit model; flag if manual re-runs of old commits will be common.

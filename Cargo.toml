@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
-description = "Continuous mega-evm vs revm comparison pipeline: bench, chart, and render Lark cards. Triggered externally (e.g. by BB9); never calls the Lark API itself."
+description = "Continuous benchmark-overhead tracking: bench a repo per commit, compare every subject against a configured baseline, and store raw metrics, charts, and factual events on disk for consuming agents."
 publish = false
 
 [[bin]]
@@ -34,7 +34,6 @@ inferno = { version = "0.12", default-features = false, features = ["multithread
 anyhow = "1"
 rustc-demangle = "0.1"
 tempfile = "3"
-thiserror = "2"
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 
 [profile.release]

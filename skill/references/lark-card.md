@@ -59,12 +59,12 @@ Regression example — replace every `{{…}}`:
   "config": { "wide_screen_mode": true },
   "header": {
     "template": "red",
-    "title":    { "tag": "plain_text", "content": "⚠️ {{repo}} 基准回归 @ {{short_sha}}" },
-    "subtitle": { "tag": "plain_text", "content": "{{n_regressions}} 行超过阈值" }
+    "title":    { "tag": "plain_text", "content": "⚠️ {{repo}} benchmark regression @ {{short_sha}}" },
+    "subtitle": { "tag": "plain_text", "content": "{{n_regressions}} row(s) over threshold" }
   },
   "body": { "elements": [
     { "tag": "markdown",
-      "content": "**提交** [{{short_sha}}](https://github.com/{{github}}/commit/{{sha}})\n{{event_lines}}" },
+      "content": "**Commit** [{{short_sha}}](https://github.com/{{github}}/commit/{{sha}})\n{{event_lines}}" },
     { "tag": "hr" },
     { "tag": "img", "img_key": "{{img_key}}",
       "alt": { "tag": "plain_text", "content": "relative speed vs baseline" } }
@@ -75,11 +75,11 @@ Regression example — replace every `{{…}}`:
 **`{{event_lines}}`** — one line per `regression` event, biggest `pct_over` first:
 
 ```
-🔴 `{{row_key}}` {{baseline_median}}× → {{current}}× (**{{+pct_over}}%** vs 滚动中位数)
+🔴 `{{row_key}}` {{baseline_median}}× → {{current}}× (**{{+pct_over}}%** vs rolling median)
 ```
 
 Recovery uses the same shape with `--template green`, a ✅ title, and
-`回到 {{current}}×（中位数 {{baseline_median}}×）` lines. Digest cards: build a table
+`back to {{current}}× (median {{baseline_median}}×)` lines. Digest cards: build a table
 from `summary.json.rows` (`row_key` / `median` / `first` / `last`) and attach
 `trend.png`. If your Lark stack uses card v1: move `body.elements` to top-level
 `elements` and swap `markdown` for `div`+`lark_md`.
@@ -116,12 +116,12 @@ From the reporter's own verified end-to-end run (minibench, sha `cef2a4d`):
   "config": { "wide_screen_mode": true },
   "header": {
     "template": "red",
-    "title":    { "tag": "plain_text", "content": "⚠️ minibench 基准回归 @ cef2a4d" },
-    "subtitle": { "tag": "plain_text", "content": "1 行超过阈值" }
+    "title":    { "tag": "plain_text", "content": "⚠️ minibench benchmark regression @ cef2a4d" },
+    "subtitle": { "tag": "plain_text", "content": "1 row over threshold" }
   },
   "body": { "elements": [
     { "tag": "markdown",
-      "content": "**提交** [cef2a4d](https://github.com/example/minibench/commit/cef2a4d50b89ad795ad347d9c4aef15d3a36dd94)\n🔴 `quick_group/rex5/noop` 1.49× → 2.06× (**+38.6%** vs 滚动中位数)" },
+      "content": "**Commit** [cef2a4d](https://github.com/example/minibench/commit/cef2a4d50b89ad795ad347d9c4aef15d3a36dd94)\n🔴 `quick_group/rex5/noop` 1.49× → 2.06× (**+38.6%** vs rolling median)" },
     { "tag": "hr" },
     { "tag": "img", "img_key": "{{image_key from uploading compare_bars.png}}",
       "alt": { "tag": "plain_text", "content": "relative speed vs baseline" } }

@@ -1,6 +1,6 @@
-//! CLI entry point. Subcommands take `(repo, sha)` or a schedule tag and
-//! print exactly one JSON document to stdout — a summary of what the run
-//! produced and which factual events occurred. All logs go to stderr.
+//! CLI entry point. Each subcommand prints exactly one JSON document to
+//! stdout — a summary of what the run produced and which factual events
+//! occurred. All logs go to stderr.
 //! This tool produces data only; composing/sending Lark cards is the
 //! consuming agent's job (see `skill/`).
 
@@ -84,7 +84,7 @@ fn main() {
     }
 }
 
-/// Attachment paths in the output JSON must survive the relaying agent's cwd
+/// Paths in the output JSON must survive the invoker's cwd
 /// being different from ours — canonicalize the data root up front.
 fn canonical_data_root(data_root: PathBuf) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(&data_root)?;

@@ -214,7 +214,7 @@ pub fn commit_meta(checkout: &Path, sha: &str) -> anyhow::Result<CommitMeta> {
 /// the invocation the tracked repo's CI uses (mega-evm's benchmark.yml):
 /// `cargo bench -p <pkg> --bench <target> -- --output-format bencher` — so the
 /// numbers stay comparable with the per-PR `/benchmark` flow. Output streams
-/// to stderr for the relaying agent's process logs; the data we parse is
+/// to stderr for the invoker's process logs; the data we parse is
 /// criterion's `target/criterion` tree, written as a side effect of any run.
 pub fn bench_target(
     checkout: &Path,
@@ -280,7 +280,7 @@ pub fn process_results(
     let ratios = criterion_results::compute_ratios(&rows, &repo.baseline_subject);
 
     // Idempotence guard: a retried run of the sha we just processed (e.g. the
-    // relaying agent re-invoking after a downstream delivery failure) must not
+    // invoker re-running after losing the output) must not
     // fold the same ratios into the rolling window twice or double-bump the
     // digest counter. The record and charts are still refreshed.
     let mut state = State::load(&store.state_path())?;
@@ -318,8 +318,8 @@ pub fn process_results(
         is_headline,
     );
     if !table.rows.is_empty() {
-        // Emitted as structured JSON — the relaying agent builds its own
-        // native table from it instead of embedding a rendered image.
+        // Emitted as structured JSON — consumers build their own native
+        // table from it instead of embedding a rendered image.
         if let Err(e) = serde_json::to_string_pretty(&table)
             .map_err(anyhow::Error::from)
             .and_then(|json| Ok(std::fs::write(commit_dir.join("compare_table.json"), json)?))

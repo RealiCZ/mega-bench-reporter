@@ -77,6 +77,11 @@ pub struct Tuning {
     pub bench_profile: Option<String>,
 }
 
+/// Built-in defaults used when neither the repo nor `[defaults]` sets a knob.
+const DEFAULT_REGRESSION_THRESHOLD_PCT: f64 = 10.0;
+const DEFAULT_ROLLING_WINDOW: usize = 20;
+const DEFAULT_DIGEST_BATCH_SIZE: u32 = 10;
+
 /// Fully-resolved settings for one repo.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -92,15 +97,15 @@ impl Settings {
             regression_threshold_pct: repo
                 .regression_threshold_pct
                 .or(defaults.regression_threshold_pct)
-                .unwrap_or(crate::state::REGRESSION_THRESHOLD_PCT),
+                .unwrap_or(DEFAULT_REGRESSION_THRESHOLD_PCT),
             rolling_window: repo
                 .rolling_window
                 .or(defaults.rolling_window)
-                .unwrap_or(crate::state::ROLLING_WINDOW),
+                .unwrap_or(DEFAULT_ROLLING_WINDOW),
             digest_batch_size: repo
                 .digest_batch_size
                 .or(defaults.digest_batch_size)
-                .unwrap_or(crate::state::DIGEST_BATCH_SIZE),
+                .unwrap_or(DEFAULT_DIGEST_BATCH_SIZE),
             bench_profile: repo.bench_profile.clone().or_else(|| defaults.bench_profile.clone()),
         };
         // Nonsense values would silently disable alerting (window 0 makes
@@ -248,9 +253,9 @@ headline_subjects = ["rex5", "rex5_*"]
     fn test_settings_built_in_defaults_when_nothing_configured() {
         let cfg = Config::parse(SAMPLE).expect("parses");
         let settings = cfg.settings(cfg.repo("mega-evm").unwrap()).unwrap();
-        assert_eq!(settings.regression_threshold_pct, crate::state::REGRESSION_THRESHOLD_PCT);
-        assert_eq!(settings.rolling_window, crate::state::ROLLING_WINDOW);
-        assert_eq!(settings.digest_batch_size, crate::state::DIGEST_BATCH_SIZE);
+        assert_eq!(settings.regression_threshold_pct, 10.0);
+        assert_eq!(settings.rolling_window, 20);
+        assert_eq!(settings.digest_batch_size, 10);
         assert_eq!(settings.bench_profile, None);
     }
 
