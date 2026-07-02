@@ -16,7 +16,7 @@ The three card layouts are JSON files in `templates/`:
 
 ## Chart set per card
 
-- Alert/recovery cards embed `compare_table.png`, `compare_bars.png`, and the dist plots of up to 3 affected rows.
+- Alert/recovery cards embed `compare_bars.png` and the dist plots of up to 3 affected rows; the commit dir's `compare_table.json` carries the full numbers table for the relaying agent to render natively.
 - Digest cards embed `trend.png`; the markdown table caps at 15 rows (full data in `summary.json`), the trend chart at 8 series.
 - Flamegraph cards embed nothing; their SVGs are listed in the body and attached as files.
 

@@ -8,9 +8,8 @@ None of these block using the tool; they need a joint decision or a follow-up ou
 1. **Output contract is `{"cards": [...]}`, not the plan's single `{"card": null | {...}}`.**
    One run can legitimately produce two cards (regression alert + 10th-commit digest), so the CLI always emits an array (empty = nothing to post).
    The relaying agent must iterate `cards[]`. Confirm this shape before wiring BB9.
-2. **Lark markdown table rendering.**
-   The trend-digest card renders its table as a markdown table inside a `{"tag": "markdown"}` element.
-   Whether Lark renders `|---|` tables depends on the card version BB9 posts with; if it renders poorly, switch the template to a card-2.0 `table` component (template edit only).
+2. ~~Lark markdown table rendering.~~ **Resolved:** tested on the Lark side, renders fine.
+   Additionally, the per-commit comparison table is now emitted as `compare_table.json` (not a PNG) so the relaying agent can assemble a native table.
 3. **Flamegraph SVGs cannot be embedded in cards.**
    The flamegraph card lists the SVG file names; BB9 should post the attachments as file messages in the same thread.
 
@@ -21,7 +20,7 @@ None of these block using the tool; they need a joint decision or a follow-up ou
    The real trial run therefore targeted the branch head (`d21a86f`).
    Decide: merge Part A first (preferred) or temporarily set `headline_spec = "rex4"`.
 5. ~~Thresholds are code constants, not config.~~ **Resolved:** `regression_threshold_pct`, `rolling_window`, `digest_batch_size`, and `bench_profile` are now config (`[defaults]` + per-repo overrides in `repos.toml`).
-   Still fixed in code: the comparison table's color bands (1.075/1.25) and the digest card/table caps (15 rows, 8 trend series) — say the word if these should be knobs too.
+   Still fixed in code: the digest card/table caps (15 rows, 8 trend series) — say the word if these should be knobs too.
 6. **Digest counter counts runs, not distinct commits.**
    An immediate retry of the last processed sha is guarded (idempotent, no double count), but re-running an OLDER sha still bumps the counter.
    Harmless under BB9's one-run-per-new-commit model; flag if manual re-runs of old commits will be common.

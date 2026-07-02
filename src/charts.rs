@@ -74,10 +74,11 @@ pub fn p95(samples: &[f64]) -> f64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
-/// The comparison table (the Lark doc's 对比图 table view): one row per test
-/// item, one column per implementation, last column = the headline family's
-/// time ratio vs `revm_pinned`, color-banded.
-#[derive(Debug, Clone, PartialEq)]
+/// The comparison table (the design doc's table view): one row per test item,
+/// one column per implementation, last column = the headline family's time
+/// ratio vs `revm_pinned`. Emitted as `compare_table.json` for the relaying
+/// agent to assemble into a native Lark table.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct CompareTable {
     /// Column order: baselines first, then specs, then variants.
     pub subjects: Vec<String>,
@@ -86,7 +87,7 @@ pub struct CompareTable {
     pub headline_label: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct CompareTableRow {
     /// `group[/workload]`.
     pub item: String,
@@ -166,172 +167,6 @@ pub fn build_compare_table(
         .collect();
 
     CompareTable { subjects, rows: table_rows, headline_label: headline_label.to_string() }
-}
-
-/// Ratio-column color bands — the time-ratio equivalents of the design mock's
-/// speedup bands (green ≥0.93×, amber 0.80–0.93×, red <0.80×).
-fn ratio_band_color(ratio: f64) -> RGBColor {
-    if ratio <= 1.075 {
-        RGBColor(212, 237, 218) // light green
-    } else if ratio <= 1.25 {
-        RGBColor(255, 243, 205) // light amber
-    } else {
-        RGBColor(248, 215, 218) // light red
-    }
-}
-
-fn format_p95(us: f64) -> String {
-    if us >= 100.0 {
-        format!("{us:.0}")
-    } else if us >= 10.0 {
-        format!("{us:.1}")
-    } else {
-        format!("{us:.2}")
-    }
-}
-
-/// Renders the comparison table as a PNG (drawn cell by cell — plotters has no
-/// table primitive).
-pub fn render_compare_table(path: &Path, title: &str, table: &CompareTable) -> anyhow::Result<()> {
-    ensure_font();
-    if table.rows.is_empty() {
-        anyhow::bail!("no rows to render a comparison table for");
-    }
-    // Lower clamp fits the fixed header caption, not just the item names.
-    let item_col_w: i32 = (table.rows.iter().map(|r| r.item.len()).max().unwrap_or(10) as i32 * 8
-        + 24)
-        .clamp(340, 420);
-    let subj_col_w: i32 = 106;
-    let ratio_col_w: i32 = 96;
-    let row_h: i32 = 30;
-    let header_h: i32 = 36;
-    let title_h: i32 = 40;
-    let legend_h: i32 = 56;
-    let margin: i32 = 12;
-
-    let width =
-        (margin * 2 + item_col_w + subj_col_w * table.subjects.len() as i32 + ratio_col_w) as u32;
-    let height =
-        (margin * 2 + title_h + header_h + row_h * table.rows.len() as i32 + legend_h) as u32;
-    let root = BitMapBackend::new(path, (width, height)).into_drawing_area();
-    root.fill(&WHITE).map_err(map_err)?;
-
-    root.draw(&Text::new(
-        title.to_string(),
-        (margin, margin),
-        ("sans-serif", 22).into_font().color(&BLACK),
-    ))
-    .map_err(map_err)?;
-
-    let top = margin + title_h;
-    let subj_x0 = margin + item_col_w;
-    let ratio_x = subj_x0 + subj_col_w * table.subjects.len() as i32;
-
-    // Header band.
-    root.draw(&Rectangle::new(
-        [(margin, top), (ratio_x + ratio_col_w, top + header_h)],
-        RGBColor(238, 241, 246).filled(),
-    ))
-    .map_err(map_err)?;
-    root.draw(&Text::new(
-        "test item (p95 µs/call — lower is faster)".to_string(),
-        (margin + 8, top + 10),
-        ("sans-serif", 15).into_font().color(&BLACK),
-    ))
-    .map_err(map_err)?;
-    for (i, subject) in table.subjects.iter().enumerate() {
-        root.draw(&Text::new(
-            subject.clone(),
-            (subj_x0 + subj_col_w * i as i32 + 6, top + 10),
-            ("sans-serif", 14).into_font().color(&BLACK),
-        ))
-        .map_err(map_err)?;
-    }
-    root.draw(&Text::new(
-        format!("{} ×", table.headline_label),
-        (ratio_x + 8, top + 10),
-        ("sans-serif", 15).into_font().color(&BLACK),
-    ))
-    .map_err(map_err)?;
-
-    for (r, row) in table.rows.iter().enumerate() {
-        let y0 = top + header_h + row_h * r as i32;
-        if r % 2 == 1 {
-            root.draw(&Rectangle::new(
-                [(margin, y0), (ratio_x + ratio_col_w, y0 + row_h)],
-                RGBColor(248, 249, 251).filled(),
-            ))
-            .map_err(map_err)?;
-        }
-        root.draw(&Text::new(
-            row.item.clone(),
-            (margin + 8, y0 + 8),
-            ("sans-serif", 14).into_font().color(&BLACK),
-        ))
-        .map_err(map_err)?;
-        for (c, value) in row.p95_us.iter().enumerate() {
-            let cell = value.map(format_p95).unwrap_or_else(|| "–".to_string());
-            root.draw(&Text::new(
-                cell,
-                (subj_x0 + subj_col_w * c as i32 + 6, y0 + 8),
-                ("sans-serif", 14).into_font().color(&RGBColor(60, 64, 72)),
-            ))
-            .map_err(map_err)?;
-        }
-        match row.headline_ratio {
-            Some(ratio) => {
-                root.draw(&Rectangle::new(
-                    [(ratio_x, y0), (ratio_x + ratio_col_w, y0 + row_h)],
-                    ratio_band_color(ratio).filled(),
-                ))
-                .map_err(map_err)?;
-                root.draw(&Text::new(
-                    format!("{ratio:.2}×"),
-                    (ratio_x + 8, y0 + 8),
-                    ("sans-serif", 15).into_font().color(&BLACK),
-                ))
-                .map_err(map_err)?;
-            }
-            None => {
-                root.draw(&Text::new(
-                    "–".to_string(),
-                    (ratio_x + 8, y0 + 8),
-                    ("sans-serif", 15).into_font().color(&RGBColor(60, 64, 72)),
-                ))
-                .map_err(map_err)?;
-            }
-        }
-    }
-
-    let legend_y = top + header_h + row_h * table.rows.len() as i32 + 8;
-    for (i, (color, label)) in [
-        (RGBColor(212, 237, 218), "<=1.075x"),
-        (RGBColor(255, 243, 205), "<=1.25x"),
-        (RGBColor(248, 215, 218), ">1.25x"),
-    ]
-    .iter()
-    .enumerate()
-    {
-        let x = margin + i as i32 * 130;
-        root.draw(&Rectangle::new([(x, legend_y), (x + 16, legend_y + 16)], color.filled()))
-            .map_err(map_err)?;
-        root.draw(&Text::new(
-            label.to_string(),
-            (x + 22, legend_y + 2),
-            ("sans-serif", 13).into_font().color(&BLACK),
-        ))
-        .map_err(map_err)?;
-    }
-    // Second legend line so the explanation always fits the canvas.
-    root.draw(&Text::new(
-        format!("{} time ratio vs revm_pinned (lower is better)", table.headline_label),
-        (margin, legend_y + 22),
-        ("sans-serif", 13).into_font().color(&BLACK),
-    ))
-    .map_err(map_err)?;
-
-    root.present().map_err(map_err)?;
-    Ok(())
 }
 
 /// One item of the speed bar chart: baseline plus each headline subject's
@@ -773,16 +608,6 @@ mod tests {
         // Worst headline ratio (only rex5_salt matches the filter).
         assert_eq!(table.rows[0].headline_ratio, Some(2.0));
         assert!(table.rows[0].p95_us.iter().all(|v| v.is_some()));
-    }
-
-    #[test]
-    fn test_render_compare_table_writes_png() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("compare_table.png");
-        let (rows, ratios) = sample_ratio_rows();
-        let table = build_compare_table(&rows, &ratios, "rex5", |s| s.starts_with("rex5"));
-        render_compare_table(&path, "mega-evm vs revm @ abc1234", &table).unwrap();
-        assert_png(&path);
     }
 
     #[test]

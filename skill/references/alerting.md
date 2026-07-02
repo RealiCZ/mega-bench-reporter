@@ -19,4 +19,4 @@ The trend chart's red rings are a window-local approximation (each point vs the 
 
 `regression_threshold_pct`, `rolling_window`, `digest_batch_size`, and `bench_profile` live in the config file (`repos.toml`): a `[defaults]` section plus optional per-repo overrides inside each `[[repos]]` entry.
 Built-in fallbacks (used when neither is set) are in `src/state.rs`.
-The comparison table's color bands (≤1.075× green, ≤1.25× amber, >1.25× red) are fixed in `src/charts.rs`.
+Suggested color bands when rendering the table (matching the design mock): ≤1.075× green, ≤1.25× amber, >1.25× red.

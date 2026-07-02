@@ -33,7 +33,7 @@ Each invocation prints exactly one JSON document to stdout:
 
 | kind | color | when | attachments |
 |---|---|---|---|
-| `regression_alert` | red | a headline row crossed the threshold this run — post immediately | compare_table.png, compare_bars.png, dist plots of affected rows |
+| `regression_alert` | red | a headline row crossed the threshold this run — post immediately | compare_bars.png + dist plots of affected rows; build the numbers table from the commit dir's `compare_table.json` if wanted |
 | `recovery` | green | a previously-regressed row dropped back under the threshold | same as alert |
 | `trend_digest` | blue | every Nth commit (default 10) | trend.png |
 | `flamegraph` | orange | nightly | per-workload SVG + differential SVG (post as files) |

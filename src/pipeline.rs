@@ -263,12 +263,13 @@ pub fn process_results(
     let is_headline = |s: &str| digest::is_headline_subject(s, &repo.headline_spec);
     let table = charts::build_compare_table(&rows, &ratios, &repo.headline_spec, is_headline);
     if !table.rows.is_empty() {
-        if let Err(e) = charts::render_compare_table(
-            &commit_dir.join("compare_table.png"),
-            &format!("{} vs revm_pinned @ {}", repo.name, record.short_sha()),
-            &table,
-        ) {
-            eprintln!("compare table chart failed (continuing): {e:#}");
+        // Emitted as structured JSON — the relaying agent builds its own
+        // native table from it instead of embedding a rendered image.
+        if let Err(e) = serde_json::to_string_pretty(&table)
+            .map_err(anyhow::Error::from)
+            .and_then(|json| Ok(std::fs::write(commit_dir.join("compare_table.json"), json)?))
+        {
+            eprintln!("compare table json failed (continuing): {e:#}");
         }
     }
 
@@ -368,14 +369,9 @@ pub fn process_results(
         // Attach the comparison chart plus the distribution plots of the
         // affected rows (capped to keep the card readable).
         let mut images = Vec::new();
-        for (file, alt) in [
-            ("compare_table.png", "对比表（p95 µs + 倍率）"),
-            ("compare_bars.png", "相对速度（revm=100%）"),
-        ] {
-            let path = commit_dir.join(file);
-            if path.is_file() {
-                images.push(ImageRef::new(path, alt));
-            }
+        let bars_png = commit_dir.join("compare_bars.png");
+        if bars_png.is_file() {
+            images.push(ImageRef::new(bars_png, "相对速度（revm=100%）"));
         }
         for alert_row in regressed.iter().chain(&recovered).take(3) {
             if let Some((group, _subject, workload)) =

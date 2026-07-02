@@ -35,7 +35,7 @@ What one `run` does:
 1. Clones (first run) or fetches the tracked repo into `<work-root>/<repo>` (default work root: `<data-root>/_checkouts`) and checks out the sha, submodules included.
 2. Runs `cargo bench -p <package> --bench <target> -- --output-format bencher` for every configured bench target — the exact invocation mega-evm's CI (benchmark.yml) uses, so numbers stay comparable with the per-PR `/benchmark` flow (`bench_profile` in the config adds `--profile <p>`). A failing target is recorded in `raw.json` (`failed_targets`) and skipped, not fatal — unless every target fails.
 3. Parses criterion's `target/criterion/**/new/*.json` tree and computes each row's `ratio_vs_revm_pinned` (time ratio against the `revm_pinned` row of the same group/workload; > 1 means mega-evm is slower).
-4. Writes `commits/<YYYYMMDD>-<shortsha>/{raw.json, compare_table.png, compare_bars.png, dist_*.png}` under `<data-root>/<repo>/`.
+4. Writes `commits/<YYYYMMDD>-<shortsha>/{raw.json, compare_table.json, compare_bars.png, dist_*.png}` under `<data-root>/<repo>/`.
 5. Checks every headline-spec row against its rolling median and renders a regression-alert (or recovery) card on state change.
 6. Every 10th commit, rolls the last 10 records into `digests/<YYYYMMDD>-<range>/{summary.json, trend.png}` plus a trend-digest card.
 
@@ -119,7 +119,7 @@ The list shape is deliberate: adding a second tracked repo is a new `[[repos]]` 
 <data-root>/<repo>/
   commits/<YYYYMMDD>-<shortsha>/
     raw.json              # source of truth: { commit, date, rustc, failed_targets?, groups: { <group>: { <subject>[/<workload>]: { ns, ratio_vs_revm_pinned } } } }
-    compare_table.png     # test item x implementation p95 µs table, last column = headline ratio (color-banded)
+    compare_table.json    # table-ready JSON: subjects[], rows[{item, p95_us[], headline_ratio}] — the relaying agent builds its own table from it
     compare_bars.png      # relative speed per item, revm_pinned = 100% (lower = more overhead)
     dist_<group>[_<workload>].png   # per-call time distribution (violin), one per group/workload with >= 2 subjects; "/" in workloads becomes "_"
   digests/<YYYYMMDD>-<first>..<last>/

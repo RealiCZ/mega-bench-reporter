@@ -113,8 +113,20 @@ fn test_synthetic_ten_commit_run_with_regression_and_recovery() {
     assert_eq!(commit_dirs.len(), 5, "one commits/ dir per run: {commit_dirs:?}");
     let first_dir = store.root().join("commits").join(format!("20260701-{}", &meta(0).sha[..7]));
     assert!(first_dir.join("raw.json").is_file());
-    assert!(first_dir.join("compare_table.png").is_file());
     assert!(first_dir.join("compare_bars.png").is_file());
+    let table: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(first_dir.join("compare_table.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(table["headline_label"], "rex5");
+    assert!(table["subjects"].as_array().unwrap().iter().any(|s| s == "revm_pinned"));
+    let salt_row = table["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["item"] == "salt_dynamic_gas/sstore_100")
+        .expect("salt row in compare_table.json");
+    assert_eq!(salt_row["headline_ratio"], 2.0);
     assert!(first_dir.join("dist_salt_dynamic_gas_sstore_100.png").is_file());
     assert!(first_dir.join("dist_empty_transaction.png").is_file());
     // Baseline-less group gets no violin with a single row, and no ratio.

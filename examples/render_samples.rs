@@ -56,7 +56,7 @@ fn main() {
         },
     ];
     let table = build_compare_table(&rows, &ratios, "rex5", |s| s.starts_with("rex5"));
-    render_compare_table(&out.join("compare_table.png"), "mega-evm vs revm @ abc1234", &table)
+    std::fs::write(out.join("compare_table.json"), serde_json::to_string_pretty(&table).unwrap())
         .unwrap();
 
     let items = vec![
