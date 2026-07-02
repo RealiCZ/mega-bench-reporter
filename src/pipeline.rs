@@ -77,6 +77,36 @@ fn git(checkout: &Path, args: &[&str], what: &str) -> anyhow::Result<String> {
     run_cmd(Command::new("git").arg("-C").arg(checkout).args(args), what)
 }
 
+/// Retries a git operation that talks to the network (clone / fetch /
+/// submodule update) with backoff. Transient failures to reach the remote
+/// (observed in the wild: SSL connection timeouts to GitHub) shouldn't fail
+/// an entire bench run. `backoff_secs` has one entry per retry.
+fn with_network_retry<T>(
+    what: &str,
+    backoff_secs: &[u64],
+    mut op: impl FnMut() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut attempt = 0;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(e) if attempt < backoff_secs.len() => {
+                let wait = backoff_secs[attempt];
+                attempt += 1;
+                eprintln!(
+                    "{what} failed (attempt {attempt}/{}, retrying in {wait}s): {e:#}",
+                    backoff_secs.len() + 1
+                );
+                std::thread::sleep(std::time::Duration::from_secs(wait));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Default backoff for git network operations: two retries.
+const GIT_RETRY_BACKOFF_SECS: &[u64] = &[5, 15];
+
 /// A `credential.helper` snippet that feeds `$GITHUB_TOKEN` from the process
 /// environment to git for https remotes — the token never appears in argv, and
 /// without the env var set git falls back to anonymous access (fine for public
@@ -102,15 +132,20 @@ pub fn ensure_checkout(work_root: &Path, repo: &RepoConfig) -> anyhow::Result<Pa
     if checkout.join(".git").exists() {
         return Ok(checkout);
     }
-    if checkout.exists() {
-        eprintln!("removing broken checkout {} (no .git) and re-cloning", checkout.display());
-        std::fs::remove_dir_all(&checkout)?;
-    }
     std::fs::create_dir_all(work_root)?;
-    let mut cmd = Command::new("git");
-    cmd.args(git_credential_args(&repo.clone_url));
-    cmd.arg("clone").arg("--recursive").arg(&repo.clone_url).arg(&checkout);
-    run_cmd(&mut cmd, &format!("git clone {}", repo.clone_url))?;
+    with_network_retry(&format!("git clone {}", repo.clone_url), GIT_RETRY_BACKOFF_SECS, || {
+        // A leftover from an interrupted/failed previous attempt would make
+        // `git clone` refuse with "destination exists" — clear it first.
+        if checkout.exists() {
+            eprintln!("removing broken checkout {} (no .git) and re-cloning", checkout.display());
+            std::fs::remove_dir_all(&checkout)?;
+        }
+        let mut cmd = Command::new("git");
+        cmd.args(git_credential_args(&repo.clone_url));
+        cmd.arg("clone").arg("--recursive").arg(&repo.clone_url).arg(&checkout);
+        run_cmd(&mut cmd, "git clone")?;
+        Ok(())
+    })?;
     Ok(checkout)
 }
 
@@ -124,15 +159,21 @@ pub fn checkout_commit(checkout: &Path, repo: &RepoConfig, sha: &str) -> anyhow:
     let cred_refs: Vec<&str> = cred.iter().map(String::as_str).collect();
 
     let fetch_branch: Vec<&str> = [&cred_refs[..], &["fetch", "origin", &repo.branch]].concat();
-    git(checkout, &fetch_branch, "git fetch")?;
+    with_network_retry("git fetch", GIT_RETRY_BACKOFF_SECS, || {
+        git(checkout, &fetch_branch, "git fetch").map(|_| ())
+    })?;
     if git(checkout, &["checkout", "--force", "--detach", sha], "git checkout").is_err() {
         let fetch_sha: Vec<&str> = [&cred_refs[..], &["fetch", "origin", sha]].concat();
-        git(checkout, &fetch_sha, "git fetch <sha>")?;
+        with_network_retry("git fetch <sha>", GIT_RETRY_BACKOFF_SECS, || {
+            git(checkout, &fetch_sha, "git fetch <sha>").map(|_| ())
+        })?;
         git(checkout, &["checkout", "--force", "--detach", sha], "git checkout")?;
     }
     let update_subs: Vec<&str> =
         [&cred_refs[..], &["submodule", "update", "--init", "--recursive"]].concat();
-    git(checkout, &update_subs, "git submodule update")?;
+    with_network_retry("git submodule update", GIT_RETRY_BACKOFF_SECS, || {
+        git(checkout, &update_subs, "git submodule update").map(|_| ())
+    })?;
     Ok(())
 }
 
@@ -143,11 +184,15 @@ pub fn checkout_branch_head(checkout: &Path, repo: &RepoConfig) -> anyhow::Resul
     let cred = git_credential_args(&repo.clone_url);
     let cred_refs: Vec<&str> = cred.iter().map(String::as_str).collect();
     let fetch: Vec<&str> = [&cred_refs[..], &["fetch", "origin", &repo.branch]].concat();
-    git(checkout, &fetch, "git fetch")?;
+    with_network_retry("git fetch", GIT_RETRY_BACKOFF_SECS, || {
+        git(checkout, &fetch, "git fetch").map(|_| ())
+    })?;
     git(checkout, &["checkout", "--force", "--detach", "FETCH_HEAD"], "git checkout FETCH_HEAD")?;
     let update_subs: Vec<&str> =
         [&cred_refs[..], &["submodule", "update", "--init", "--recursive"]].concat();
-    git(checkout, &update_subs, "git submodule update")?;
+    with_network_retry("git submodule update", GIT_RETRY_BACKOFF_SECS, || {
+        git(checkout, &update_subs, "git submodule update").map(|_| ())
+    })?;
     Ok(())
 }
 
@@ -529,6 +574,31 @@ mod tests {
             "dist_salt_dynamic_gas_sstore_100_x8.png"
         );
         assert_eq!(dist_file_name("empty_transaction", ""), "dist_empty_transaction.png");
+    }
+
+    #[test]
+    fn test_with_network_retry_retries_then_succeeds() {
+        let mut attempts = 0;
+        let result = with_network_retry("op", &[0, 0], || {
+            attempts += 1;
+            if attempts < 3 {
+                anyhow::bail!("transient");
+            }
+            Ok(attempts)
+        })
+        .unwrap();
+        assert_eq!(result, 3);
+    }
+
+    #[test]
+    fn test_with_network_retry_gives_up_after_backoff_exhausted() {
+        let mut attempts = 0;
+        let result: anyhow::Result<()> = with_network_retry("op", &[0], || {
+            attempts += 1;
+            anyhow::bail!("still down")
+        });
+        assert!(result.is_err());
+        assert_eq!(attempts, 2, "one initial try + one retry");
     }
 
     #[test]
