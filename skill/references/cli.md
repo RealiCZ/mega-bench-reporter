@@ -12,6 +12,7 @@ mega-bench-reporter run --repo mega-evm --sha <full-sha> \
 What it does: clone/fetch the repo into `<work-root>/<repo>` (default `<data-root>/_checkouts`), check out the sha (submodules included), run `cargo bench -p <package> --bench <target> -- --output-format bencher` per configured target (the exact invocation mega-evm's CI uses; a `bench_profile` config adds `--profile <p>`), parse criterion's JSON tree, render charts, store the record, check regressions, and batch digests.
 
 - A failing bench target is recorded in `failed_targets` and skipped; the run only fails when every target fails.
+- No need to hold a live connection for the whole run: launch detached, wait for process exit, then read the durable `cards.json` in the commit dir (see output-contract.md for the recovery rules).
 - Re-running the sha in `last_seen_sha` refreshes artifacts without touching regression state (retry-safe).
 - `--skip-bench` reuses the checkout's existing criterion tree — for re-rendering charts after a template/chart change, not for production runs. It only accepts the last processed sha (`state.json`'s `last_seen_sha`); anything else is rejected because the tree's provenance is unknown.
 

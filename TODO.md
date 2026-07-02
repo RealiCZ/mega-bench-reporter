@@ -8,6 +8,7 @@ None of these block using the tool; they need a joint decision or a follow-up ou
 1. **Output contract is `{"cards": [...]}`, not the plan's single `{"card": null | {...}}`.**
    One run can legitimately produce two cards (regression alert + 10th-commit digest), so the CLI always emits an array (empty = nothing to post).
    The relaying agent must iterate `cards[]`. Confirm this shape before wiring BB9.
+   Cards are also persisted as `cards.json` in the commit dir (at-least-once availability): BB9 can run detached and read the file after exit; exactly-once delivery tracking (posted / not yet) stays on BB9's side.
 2. ~~Lark markdown table rendering.~~ **Resolved:** tested on the Lark side, renders fine.
    Additionally, the per-commit comparison table is now emitted as `compare_table.json` (not a PNG) so the relaying agent can assemble a native table.
 3. ~~Flamegraph SVGs cannot be embedded in cards.~~ **Obsolete:** the flamegraph pipeline is now archive-only (user decision, 2026-07-02) — no card, nothing for BB9 to post; SVGs are viewed directly from `flame/<day>/`.

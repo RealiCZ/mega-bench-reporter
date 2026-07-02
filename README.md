@@ -62,6 +62,9 @@ If the `GITHUB_TOKEN` environment variable is set and the clone URL is `https://
 
 Each invocation prints exactly one JSON document to stdout; all logs go to stderr.
 Exit code 0 with an empty `cards` array means "nothing to post" (no regression, not a digest commit).
+The same document (minus `output_dir`) is also persisted as `cards.json` inside the commit dir before the run finishes — stdout is a convenience copy, the file is the durable one.
+The invoker therefore does not need to hold a live connection for the whole run: launch detached (nohup/systemd-run), wait for exit, then read `cards.json`.
+Recovery semantics: a run killed mid-bench never updates `state.json`, so re-running the same sha simply redoes everything; a run that completed but whose stdout was lost leaves `cards.json` on disk (an idempotent re-run of that sha refreshes artifacts but deliberately does not re-emit or overwrite the persisted cards).
 
 ```json
 {
@@ -120,6 +123,7 @@ The list shape is deliberate: adding a second tracked repo is a new `[[repos]]` 
 <data-root>/<repo>/
   commits/<YYYYMMDD>-<shortsha>/
     raw.json              # source of truth: { commit, date, rustc, failed_targets?, groups: { <group>: { <subject>[/<workload>]: { ns, ratio_vs_revm_pinned } } } }
+    cards.json            # durable copy of this run's cards output (recovery if stdout was lost)
     compare_table.json    # table-ready JSON: subjects[], rows[{item, p95_us[], headline_ratio}] — the relaying agent builds its own table from it
     compare_bars.png      # relative speed per item, revm_pinned = 100% (lower = more overhead)
     dist_<group>[_<workload>].png   # per-call time distribution (violin), one per group/workload with >= 2 subjects; "/" in workloads becomes "_"

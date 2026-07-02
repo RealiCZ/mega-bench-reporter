@@ -420,6 +420,23 @@ pub fn process_results(
         }
     }
 
+    // Durable copy of this run's cards, written BEFORE the state is saved:
+    // if the invoker loses the stdout (dropped connection, crashed relay),
+    // the cards are recoverable from disk instead of being gone forever —
+    // a retry of the same sha is idempotent and deliberately does NOT
+    // re-emit cards, so stdout alone would be a single chance. A crash
+    // between this write and the state save leaves last_seen_sha untouched,
+    // so the retry redoes the run and rewrites this file consistently.
+    if !is_rerun {
+        let persisted = serde_json::json!({
+            "sha": meta.sha,
+            "date": meta.date,
+            "failed_targets": failed_targets,
+            "cards": cards,
+        });
+        std::fs::write(commit_dir.join("cards.json"), serde_json::to_string_pretty(&persisted)?)?;
+    }
+
     state.last_seen_sha = Some(meta.sha.clone());
     state.save(&store.state_path())?;
 

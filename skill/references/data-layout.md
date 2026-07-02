@@ -5,6 +5,7 @@ Everything is under `<data-root>/<repo>/` (repo = `mega-evm`):
 | path | what it is |
 |---|---|
 | `commits/<YYYYMMDD>-<shortsha>/raw.json` | source of truth for one benched commit: every row's mean ns and ratio |
+| `commits/<YYYYMMDD>-<shortsha>/cards.json` | durable copy of that run's cards output (`{sha, date, failed_targets, cards[]}`) — the recovery source when stdout was lost; never overwritten by idempotent re-runs |
 | `commits/<YYYYMMDD>-<shortsha>/compare_table.json` | table-ready JSON: `{subjects[], headline_label, rows[{item, p95_us[], headline_ratio}]}` — build a native Lark table from it (`p95_us` aligns with `subjects`; `null` = subject absent; `headline_ratio` = worst headline-family time ratio, >1 = slower than revm) |
 | `commits/<YYYYMMDD>-<shortsha>/compare_bars.png` | grouped bars: relative speed per item, revm_pinned = 100% (lower = more overhead) |
 | `commits/<YYYYMMDD>-<shortsha>/dist_<group>[_<workload>].png` | violin plot of per-call time distributions (`/` in workloads becomes `_`) |

@@ -156,6 +156,23 @@ fn test_synthetic_ten_commit_run_with_regression_and_recovery() {
         assert!(attachment.is_file(), "attachment missing: {}", attachment.display());
     }
 
+    // The cards are persisted durably in the commit dir (recovery path for a
+    // lost stdout), and a retry of the same sha must NOT clobber them with
+    // its empty card list.
+    let alert_dir = store.root().join("commits").join(format!("20260702-{}", &meta(5).sha[..7]));
+    let read_persisted = || -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(alert_dir.join("cards.json")).unwrap())
+            .unwrap()
+    };
+    assert_eq!(read_persisted()["cards"][0]["kind"], "regression_alert");
+    let retry = run(5, 2.3);
+    assert!(retry.cards.is_empty(), "idempotent rerun emits no cards on stdout");
+    assert_eq!(
+        read_persisted()["cards"][0]["kind"],
+        "regression_alert",
+        "rerun must not overwrite the persisted cards"
+    );
+
     // Run 6: still elevated — no re-alert (latched).
     let outcome = run(6, 2.32);
     assert!(outcome.cards.is_empty(), "still-regressed must not re-alert");

@@ -19,6 +19,8 @@ Each invocation prints exactly one JSON document to stdout:
 ```
 
 - `cards` empty → nothing to post; you are done.
+- **Durability / recovery:** the same document is persisted as `cards.json` in the commit dir before the run exits. You do not need to babysit stdout for the whole run — launch detached, wait for exit, then read `<data-root>/<repo>/commits/<YYYYMMDD>-<shortsha>/cards.json`. If your invocation died mid-bench, `state.json` was not updated: just re-run the same sha (full redo). If the run completed but you lost the output, read `cards.json` — an idempotent re-run of that sha will NOT re-emit the cards (and will not overwrite the file).
+- Track your own delivered/undelivered state per commit dir if you need exactly-once posting; the reporter guarantees at-least-once availability of the cards, not delivery.
 - One run can produce more than one card (e.g. a regression alert plus the 10th-commit digest) — always iterate the array.
 - `failed_targets` non-empty means some bench targets failed but the run still produced data; mention it when relaying, do not treat the run as failed.
 
