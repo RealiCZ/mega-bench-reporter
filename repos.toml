@@ -5,8 +5,11 @@
 # per-repo by setting the same key inside its own section. The values shown
 # here are the built-in defaults — the section can be omitted entirely.
 [defaults]
-# Alert when a headline row rises more than this % over its rolling median.
-regression_threshold_pct = 10.0
+# Event when a headline row rises more than this % over its rolling median.
+# Measured run-to-run ratio noise on the trial box was ~1-2% stdev, so 5% is
+# ~4 sigma; recalibrate from state.json's recent_ratios after ~20 real runs
+# on the production box (built-in fallback stays at 10).
+regression_threshold_pct = 5.0
 # How many healthy (non-regressed) runs feed the rolling median.
 rolling_window = 20
 # Commits per trend digest.

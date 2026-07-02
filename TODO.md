@@ -28,6 +28,10 @@ None of these block using the tool; they need a joint decision or a follow-up ou
 6b. **Digest window is ordered by committer date, not processing order.**
    A benched commit with a backdated committer date (rebase artifacts) can sort outside its own digest window.
    Accepted for now; switching to a stored processing sequence number is the fix if it ever bites.
+6e. **Threshold calibration after deployment.**
+   `regression_threshold_pct` is set to 5.0 in repos.toml (measured run-to-run ratio noise ~1-2% stdev on the trial box → 5% ≈ 4σ; the old 10% was ~8σ and would miss small real steps).
+   After ~20 runs on mega-engineer, recalibrate from `state.json`'s per-row `recent_ratios` (target: ≥4σ of the noisiest headline row); the structural next step if more sensitivity is wanted is a per-row adaptive threshold (`max(k × row noise, floor)`).
+   Note slow drift (~1%/commit) escapes any vs-rolling-median threshold by design — the digest trend is the drift catcher.
 6d. **Recovery has no hysteresis.**
    Recovery = the latched row returning within the SAME +10% band it regressed past (vs the frozen pre-regression median), so recovery ≠ back-to-original (settling at +9.9% counts), and a row oscillating around the threshold emits alternating regression/recovery event pairs.
    If that proves noisy, add a stricter recovery threshold (e.g. regress at +10%, recover under +5%) — one config knob + one comparison.
