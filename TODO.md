@@ -16,7 +16,7 @@ None of these block using the tool; they need a joint decision or a follow-up ou
 4. **`repos.toml` ships `branch = "main"` + `headline_spec = "rex5"`, but the Part A comparison benches are not on `main` yet.**
    Until the bench-coverage PR (`cz/feat/bench-coverage-vs-revm`) merges, runs against `main` produce no rex5 rows: no headline charts, no alerts, digest skipped with a stderr note.
    The real trial run therefore targeted the branch head (`d21a86f`).
-   Decide: merge Part A first (preferred) or temporarily set `headline_spec = "rex4"`.
+   Decide: merge Part A first (preferred) or temporarily set `headline_subjects = ["rex4"]`.
 5. ~~Thresholds are code constants, not config.~~ **Resolved:** `regression_threshold_pct`, `rolling_window`, `digest_batch_size`, and `bench_profile` are now config (`[defaults]` + per-repo overrides in `repos.toml`).
    Still fixed in code: the digest trend chart caps at 8 series (full data in summary.json) — say the word if that should be a knob too.
 6. **Digest counter counts runs, not distinct commits.**
@@ -41,9 +41,7 @@ None of these block using the tool; they need a joint decision or a follow-up ou
 7. **Same-day short-sha collision.**
    Commit dirs are keyed `<YYYYMMDD>-<7-char-sha>`; two same-day commits sharing a 7-char prefix would overwrite each other (probability ~1e-8 per pair, accepted).
 
-4a. **Transient `git fetch` failures (SSL timeout to GitHub) fail the run.**
-   Semantics are safe (state untouched → retry redoes everything), and the poller's next tick retries anyway — but an in-process fetch retry (2 attempts with backoff) would reduce noise.
-   Observed twice on the trial box.
+4a. ~~Transient `git fetch` failures fail the run.~~ **Resolved:** clone/fetch/submodule update now retry twice with backoff (5s, 15s).
 
 ## Not yet done (deliberately)
 
@@ -66,7 +64,7 @@ None of these block using the tool; they need a joint decision or a follow-up ou
 12. Ratios are parsed from criterion's `target/criterion/**/new/*.json` tree, not from captured bencher-format stdout (plan Task 1.2 said "port the benchmark.yml inline JS"); the tree is structured and lossless, bencher stdout is only forwarded to stderr as logs.
 13. `state.json` stores each row's raw rolling window + regression latch (`rows.<key>.{recent_ratios, currently_regressed}`), not a precomputed `rolling_median`, and covers all rows (headline rows are filtered at alert time) — a superset of the plan's sketch.
 14. Per-commit benches now run with cargo's default bench profile — exactly the tracked repo CI's invocation (user request #5) — instead of the plan's "one profiling profile for both bench and flamegraph"; set `bench_profile = "profiling"` in the config to restore the old behavior. The flamegraph build keeps the profiling profile.
-15. Card templates are files in `templates/` but compiled in via `include_str!` — editing one requires a rebuild; keeps the deployable a single binary (D9).
+15. ~~Card templates compiled in via `include_str!`.~~ Superseded by 19 — the template layer no longer exists.
 16. `repos.toml` ships an `https://` clone URL (plan sketched ssh) so the optional `GITHUB_TOKEN` credential-helper path works.
 17. The flamegraph pipeline always runs `cargo bench --no-run` and relies on cargo's cache instead of an explicit "reuse if same-day" check.
 18. The plan's 火焰图 card (Task 2.1 last step) was dropped: the nightly flamegraph is archive-only per user decision (2026-07-02); `flame/<day>/` on disk is the deliverable.
