@@ -14,7 +14,7 @@ It never talks to Lark itself: the relaying agent (e.g. BB9) invokes the CLI, re
 |---|---|
 | `mega-bench-reporter run --repo <name> --sha <sha> --config repos.toml --data-root <dir>` | per-commit pipeline: bench → charts → store → regression check → (every Nth commit) trend digest |
 | `mega-bench-reporter run … --skip-bench` | re-render charts/records from the checkout's existing criterion tree (dev/regen; no benching) |
-| `mega-bench-reporter flamegraph --repo <name> --config repos.toml --data-root <dir>` | nightly flame graphs: profile configured workloads (Linux `perf` / macOS `sample`), render SVG + differential |
+| `mega-bench-reporter flamegraph --repo <name> --config repos.toml --data-root <dir>` | nightly flame-graph **archive**: profile configured workloads (Linux `perf` / macOS `sample`), render SVG + differential into `flame/<day>/` — no cards, nothing to relay |
 
 Ground rules: exit 0 = success; stdout carries exactly one JSON document; stderr is logs; runs take as long as the benches take (tens of minutes — no short timeouts); a per-repo lock rejects concurrent invocations; set `GITHUB_TOKEN` only for private repos.
 

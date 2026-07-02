@@ -1,12 +1,13 @@
 # Card templates
 
-The three card layouts are JSON files in `templates/`:
+The card layouts are JSON files in `templates/`:
 
 | template | renders | header |
 |---|---|---|
 | `templates/regression_alert.json` | `regression_alert` (red) and `recovery` (green) — color/title are parameters | parameterized |
 | `templates/trend_digest.json` | `trend_digest`: summary, markdown table, trend chart | blue |
-| `templates/flamegraph.json` | `flamegraph`: workload list; SVGs ride as file attachments, not embedded images | orange |
+
+(The flamegraph pipeline is archive-only and has no card.)
 
 ## Template language (all of it)
 
@@ -18,7 +19,6 @@ The three card layouts are JSON files in `templates/`:
 
 - Alert/recovery cards embed `compare_bars.png` and the dist plots of up to 3 affected rows; the commit dir's `compare_table.json` carries the full numbers table for the relaying agent to render natively.
 - Digest cards embed `trend.png`; the markdown table caps at 15 rows (full data in `summary.json`), the trend chart at 8 series.
-- Flamegraph cards embed nothing; their SVGs are listed in the body and attached as files.
 
 ## Changing a card
 

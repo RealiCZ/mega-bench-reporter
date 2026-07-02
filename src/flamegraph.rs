@@ -9,7 +9,6 @@
 //! thin and OS-bound; folding, demangling, differential folding, and SVG
 //! rendering are pure library calls, testable anywhere.
 
-use crate::cards::{self, FlamegraphCardParams, RenderedCard};
 use crate::config::{FlameWorkloadPair, RepoConfig};
 use crate::pipeline::{commit_meta, ensure_checkout};
 use crate::storage::RepoStore;
@@ -18,13 +17,13 @@ use std::io::{BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Everything a `flamegraph` invocation produced.
+/// Everything a `flamegraph` invocation produced. Archive-only: the SVGs land
+/// under `flame/<day>/` and nothing is posted anywhere — no card is rendered.
 #[derive(Debug)]
 pub struct FlamegraphOutcome {
     /// The sha that was actually profiled (branch HEAD at checkout time).
     pub sha: String,
     pub flame_dir: PathBuf,
-    pub card: RenderedCard,
     /// `flame/<day>` directories removed by retention pruning.
     pub pruned: Vec<String>,
 }
@@ -375,8 +374,8 @@ fn profile_with_sample(
 
 /// The complete `flamegraph` subcommand: checkout the tracked branch's HEAD,
 /// build the bench binary once, profile every configured pair, render
-/// per-workload SVGs + one differential per pair into `flame/<day>/`, prune
-/// old days, and render the flamegraph card.
+/// per-workload SVGs + one differential per pair into `flame/<day>/`, and
+/// prune old days. Pure archive — no card, nothing to relay.
 pub fn run_flamegraph_pipeline(
     repo: &RepoConfig,
     data_root: &Path,
@@ -425,7 +424,6 @@ pub fn run_flamegraph_pipeline(
     // Profile and render each unique id exactly once — a baseline shared by
     // several pairs is not re-profiled per pair.
     let mut folded: BTreeMap<&String, Vec<u8>> = BTreeMap::new();
-    let mut svgs: BTreeMap<&String, PathBuf> = BTreeMap::new();
     for FlameWorkloadPair { baseline, feature } in &flame_cfg.workloads {
         for id in [baseline, feature] {
             if folded.contains_key(id) {
@@ -435,12 +433,9 @@ pub fn run_flamegraph_pipeline(
             let svg = flame_dir.join(format!("{}.svg", workload_file_stem(id)));
             render_flamegraph_svg(id, &data, &svg)?;
             folded.insert(id, data);
-            svgs.insert(id, svg);
         }
     }
 
-    let mut card_workloads = Vec::new();
-    let mut listed = std::collections::BTreeSet::new();
     for FlameWorkloadPair { baseline, feature } in &flame_cfg.workloads {
         let diff_svg = flame_dir.join(format!("{}_diff.svg", workload_file_stem(feature)));
         render_differential_svg(
@@ -449,22 +444,10 @@ pub fn run_flamegraph_pipeline(
             &folded[feature],
             &diff_svg,
         )?;
-        card_workloads.push((feature.clone(), svgs[feature].clone(), Some(diff_svg)));
-        if listed.insert(baseline) {
-            card_workloads.push((baseline.clone(), svgs[baseline].clone(), None));
-        }
     }
 
     let pruned = store.prune_flame_dirs(&day, flame_cfg.retention_days)?;
-    let card = cards::render_flamegraph_card(&FlamegraphCardParams {
-        repo_name: &repo.name,
-        github: &repo.github,
-        sha: &meta.sha,
-        day: &day,
-        workloads: card_workloads,
-    })?;
-
-    Ok(FlamegraphOutcome { sha: meta.sha, flame_dir, card, pruned })
+    Ok(FlamegraphOutcome { sha: meta.sha, flame_dir, pruned })
 }
 
 #[cfg(test)]

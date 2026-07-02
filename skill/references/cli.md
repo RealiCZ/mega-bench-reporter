@@ -15,13 +15,15 @@ What it does: clone/fetch the repo into `<work-root>/<repo>` (default `<data-roo
 - Re-running the sha in `last_seen_sha` refreshes artifacts without touching regression state (retry-safe).
 - `--skip-bench` reuses the checkout's existing criterion tree — for re-rendering charts after a template/chart change, not for production runs. It only accepts the last processed sha (`state.json`'s `last_seen_sha`); anything else is rejected because the tree's provenance is unknown.
 
-## Nightly flamegraph
+## Nightly flamegraph (archive only)
 
 ```bash
 mega-bench-reporter flamegraph --repo mega-evm --config repos.toml --data-root <data-root>
 ```
 
 Checks out the tracked branch's HEAD, builds the bench binary once (`cargo bench --no-run --profile profiling`), verifies each configured benchmark id against `--list`, profiles each unique id (Linux: `perf record` + `perf script`; macOS: the built-in `sample` tool at 1 ms — no root needed), folds + demangles via `inferno`, renders one SVG per workload and one differential SVG per baseline/feature pair, prunes days past retention.
+
+Pure archive: no card is produced (`cards` is always `[]`), so any timer works — plain cron on the box is enough, no relaying agent involvement needed. View the SVGs by opening `flame/<day>/*.svg` in a browser (they are interactive).
 
 ## Environment and safety
 

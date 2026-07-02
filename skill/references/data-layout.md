@@ -10,7 +10,7 @@ Everything is under `<data-root>/<repo>/` (repo = `mega-evm`):
 | `commits/<YYYYMMDD>-<shortsha>/dist_<group>[_<workload>].png` | violin plot of per-call time distributions (`/` in workloads becomes `_`) |
 | `digests/<YYYYMMDD>-<first>..<last>/summary.json` | last-N-commits headline series: per-row `ratios[]`, `first`, `last`, `median` |
 | `digests/<YYYYMMDD>-<first>..<last>/trend.png` | headline ratios over the digest window, red rings on threshold-tripping points |
-| `flame/<YYYYMMDD>/<workload>.svg` | flame graph of one benchmark id (nightly) |
+| `flame/<YYYYMMDD>/<workload>.svg` | flame graph of one benchmark id (nightly, archive-only — open directly in a browser) |
 | `flame/<YYYYMMDD>/<workload>_diff.svg` | differential flame graph, feature vs baseline (red = grew, blue = shrank) |
 | `state.json` | rolling windows, regression latches, digest counter, `last_seen_sha` |
 

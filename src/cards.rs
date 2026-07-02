@@ -1,5 +1,5 @@
-//! Lark card rendering (Task 1.6). The three card layouts (regression alert /
-//! trend digest / flamegraph) live as JSON template files in `templates/` —
+//! Lark card rendering (Task 1.6). The card layouts (regression alert /
+//! trend digest) live as JSON template files in `templates/` —
 //! changing a card's look
 //! is a template edit + test, never string-building in code and never a BB9
 //! change.
@@ -13,9 +13,7 @@
 //! 3. Every `img` element's `img_key` is the placeholder `${image:<basename>}`
 //!    and the image's path is listed in [`RenderedCard::attachments`]. The
 //!    relaying agent (BB9) uploads each attachment to Lark and string-replaces
-//!    the placeholder with the returned `image_key` before posting. SVG
-//!    attachments (flame graphs) are not embeddable as card images — they are
-//!    listed in `attachments` for BB9 to post as plain file messages.
+//!    the placeholder with the returned `image_key` before posting.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -24,7 +22,6 @@ use std::path::{Path, PathBuf};
 
 const TEMPLATE_REGRESSION_ALERT: &str = include_str!("../templates/regression_alert.json");
 const TEMPLATE_TREND_DIGEST: &str = include_str!("../templates/trend_digest.json");
-const TEMPLATE_FLAMEGRAPH: &str = include_str!("../templates/flamegraph.json");
 
 /// Which of the card layouts a rendered card came from — serialized alongside
 /// the card so the relaying agent can log/route without inspecting the JSON.
@@ -34,7 +31,6 @@ pub enum CardKind {
     RegressionAlert,
     Recovery,
     TrendDigest,
-    Flamegraph,
 }
 
 /// A ready-to-post card: the Lark card JSON plus the local files BB9 must
@@ -343,60 +339,6 @@ pub fn render_digest_card(params: &DigestCardParams<'_>) -> anyhow::Result<Rende
     render_template(TEMPLATE_TREND_DIGEST, CardKind::TrendDigest, &vars, &images, &[])
 }
 
-/// Params for the flamegraph card. Flame graphs are SVGs — not embeddable as Lark
-/// card images — so they ride along as plain attachments for BB9 to post as
-/// files, and the card body just describes them.
-#[derive(Debug, Clone)]
-pub struct FlamegraphCardParams<'a> {
-    pub repo_name: &'a str,
-    pub github: &'a str,
-    pub sha: &'a str,
-    /// `YYYYMMDD` of the nightly run.
-    pub day: &'a str,
-    /// `(workload id, svg path, optional differential svg path)` triples.
-    pub workloads: Vec<(String, PathBuf, Option<PathBuf>)>,
-}
-
-pub fn render_flamegraph_card(params: &FlamegraphCardParams<'_>) -> anyhow::Result<RenderedCard> {
-    if params.workloads.is_empty() {
-        anyhow::bail!("flamegraph card requested with no workloads");
-    }
-    let title = format!("🔥 {} 每日火焰图 {}", params.repo_name, params.day);
-    let mut body = format!(
-        "**提交:** {}\n\n**已生成火焰图（SVG 见附件）:**\n",
-        commit_link(params.github, params.sha)
-    );
-    let mut attachments = Vec::new();
-    for (workload, svg, diff_svg) in &params.workloads {
-        let file = svg.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-        match diff_svg {
-            Some(diff) => {
-                let diff_file = diff.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-                body.push_str(&format!("- **{workload}**: `{file}` + 差分 `{diff_file}`\n"));
-                attachments.push(svg.clone());
-                attachments.push(diff.clone());
-            }
-            None => {
-                body.push_str(&format!("- **{workload}**: `{file}`\n"));
-                attachments.push(svg.clone());
-            }
-        }
-    }
-
-    let vars = BTreeMap::from([
-        ("title", title),
-        ("body_md", body),
-        ("footer", "mega-bench-reporter · 每日定时 perf 采样，差分基线为 revm_pinned".to_string()),
-    ]);
-    render_template(
-        TEMPLATE_FLAMEGRAPH,
-        CardKind::Flamegraph,
-        &vars,
-        &BTreeMap::new(),
-        &attachments,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,39 +461,10 @@ mod tests {
     }
 
     #[test]
-    fn test_flamegraph_card_lists_svgs_as_attachments_without_img_elements() {
-        let params = FlamegraphCardParams {
-            repo_name: "mega-evm",
-            github: "megaeth-labs/mega-evm",
-            sha: "abcdef0123456789",
-            day: "20260702",
-            workloads: vec![(
-                "salt_dynamic_gas/rex5_salt/sstore_100".into(),
-                PathBuf::from(
-                    "/data/mega-evm/flame/20260702/salt_dynamic_gas_rex5_salt_sstore_100.svg",
-                ),
-                Some(PathBuf::from(
-                    "/data/mega-evm/flame/20260702/salt_dynamic_gas_rex5_salt_sstore_100_diff.svg",
-                )),
-            )],
-        };
-        let rendered = render_flamegraph_card(&params).unwrap();
-        assert_eq!(rendered.kind, CardKind::Flamegraph);
-        let text = card_text(&rendered.card);
-        assert!(text.contains("每日火焰图 20260702"));
-        assert!(text.contains("_diff.svg"));
-        // SVGs can't be embedded as card images — attachments only.
-        assert!(!text.contains("${image:"));
-        assert_eq!(rendered.attachments.len(), 2);
-        assert!(!text.contains("{{"));
-    }
-
-    #[test]
     fn test_all_templates_are_valid_json() {
         for (name, template) in [
             ("regression_alert", TEMPLATE_REGRESSION_ALERT),
             ("trend_digest", TEMPLATE_TREND_DIGEST),
-            ("flamegraph", TEMPLATE_FLAMEGRAPH),
         ] {
             serde_json::from_str::<Value>(template)
                 .unwrap_or_else(|e| panic!("template {name} is invalid JSON: {e}"));

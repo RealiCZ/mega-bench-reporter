@@ -10,8 +10,7 @@ None of these block using the tool; they need a joint decision or a follow-up ou
    The relaying agent must iterate `cards[]`. Confirm this shape before wiring BB9.
 2. ~~Lark markdown table rendering.~~ **Resolved:** tested on the Lark side, renders fine.
    Additionally, the per-commit comparison table is now emitted as `compare_table.json` (not a PNG) so the relaying agent can assemble a native table.
-3. **Flamegraph SVGs cannot be embedded in cards.**
-   The flamegraph card lists the SVG file names; BB9 should post the attachments as file messages in the same thread.
+3. ~~Flamegraph SVGs cannot be embedded in cards.~~ **Obsolete:** the flamegraph pipeline is now archive-only (user decision, 2026-07-02) — no card, nothing for BB9 to post; SVGs are viewed directly from `flame/<day>/`.
 
 ## Data / repo state
 
@@ -46,7 +45,8 @@ None of these block using the tool; they need a joint decision or a follow-up ou
 10. **Deployment (D9): GitHub repo creation, first push, and a release-artifact workflow.**
     CI (fmt/clippy/test/release-build) is in `.github/workflows/ci.yml`; publishing a binary via GitHub Release is not set up yet.
     Also: nothing has been pushed anywhere — the repo exists only locally.
-11. **BB9 wiring** (poll loop, invoking the CLI on mega-engineer, card relay) — explicitly out of scope here, owner: user.
+11. **BB9 wiring** (poll loop, invoking `run` on mega-engineer, card relay) — explicitly out of scope here, owner: user.
+    Note: only flow A (per-commit) needs BB9 now; the nightly flamegraph can be a plain cron entry on mega-engineer since it posts nothing.
 
 11a. **The design doc's "commit 选择" page has no card equivalent.**
    Navigation of past reports is Lark chat scrollback plus `commits/` on disk (per the revised no-web-page plan); if a browsable index is wanted later, it is a new small feature.
@@ -59,3 +59,4 @@ None of these block using the tool; they need a joint decision or a follow-up ou
 15. Card templates are files in `templates/` but compiled in via `include_str!` — editing one requires a rebuild; keeps the deployable a single binary (D9).
 16. `repos.toml` ships an `https://` clone URL (plan sketched ssh) so the optional `GITHUB_TOKEN` credential-helper path works.
 17. The flamegraph pipeline always runs `cargo bench --no-run` and relies on cargo's cache instead of an explicit "reuse if same-day" check.
+18. The plan's 火焰图 card (Task 2.1 last step) was dropped: the nightly flamegraph is archive-only per user decision (2026-07-02); `flame/<day>/` on disk is the deliverable.

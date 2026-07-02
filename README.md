@@ -39,7 +39,7 @@ What one `run` does:
 5. Checks every headline-spec row against its rolling median and renders a regression-alert (or recovery) card on state change.
 6. Every 10th commit, rolls the last 10 records into `digests/<YYYYMMDD>-<range>/{summary.json, trend.png}` plus a trend-digest card.
 
-### Nightly flame graph (Linux / macOS)
+### Nightly flame graph (Linux / macOS) — archive only
 
 ```bash
 mega-bench-reporter flamegraph \
@@ -48,7 +48,8 @@ mega-bench-reporter flamegraph \
   --data-root /srv/mega-bench/data
 ```
 
-Checks out the tracked branch's current HEAD, builds the bench binary once (`cargo bench --no-run --profile profiling`), profiles each configured workload (criterion `--profile-time` mode, `--exact` id matching) with the platform profiler — `perf record` on Linux, the built-in `sample` tool on macOS (1 ms interval, no root) — folds, demangles, and renders SVGs plus one differential SVG per baseline/feature pair via `inferno`, writes `flame/<YYYYMMDD>/`, prunes days past retention, and renders a flamegraph card.
+Checks out the tracked branch's current HEAD, builds the bench binary once (`cargo bench --no-run --profile profiling`), profiles each configured workload (criterion `--profile-time` mode, `--exact` id matching) with the platform profiler — `perf record` on Linux, the built-in `sample` tool on macOS (1 ms interval, no root) — folds, demangles, and renders SVGs plus one differential SVG per baseline/feature pair via `inferno`, writes `flame/<YYYYMMDD>/`, and prunes days past retention.
+This is a pure archive: no card is rendered, `cards` in the output JSON is always empty, and nothing needs relaying — schedule it with plain cron (or any timer) and view the SVGs directly in a browser.
 
 For development, `run --skip-bench` re-renders charts and records from the checkout's existing criterion tree without re-benching (only for the last processed sha — the tree's provenance is unknown for anything else).
 
@@ -81,8 +82,8 @@ Exit code 0 with an empty `cards` array means "nothing to post" (no regression, 
 Relaying rules for the posting agent:
 
 - For every attachment that an `img` element references, upload it to Lark, then string-replace the `${image:<basename>}` placeholder in the card JSON with the returned `image_key`.
-- Flamegraph cards attach SVGs, which Lark cannot embed as card images; post those as plain file messages alongside the card (the card body lists the file names).
-- `kind` is one of `regression_alert`, `recovery`, `trend_digest`, `flamegraph` — useful for logging/routing, no need to inspect the card JSON.
+- `kind` is one of `regression_alert`, `recovery`, `trend_digest` — useful for logging/routing, no need to inspect the card JSON.
+- The `flamegraph` subcommand always emits an empty `cards` array (archive-only); there is nothing to relay for it.
 
 ## Configuration (`repos.toml`)
 
@@ -125,7 +126,7 @@ The list shape is deliberate: adding a second tracked repo is a new `[[repos]]` 
   digests/<YYYYMMDD>-<first>..<last>/
     summary.json          # last-N-commits headline series, table-ready (first/last/median per row)
     trend.png             # headline ratios over the window, red rings on threshold-tripping points
-  flame/<YYYYMMDD>/
+  flame/<YYYYMMDD>/       # archive-only: open the SVGs directly, nothing is posted
     <workload>.svg        # one per profiled benchmark id
     <workload>_diff.svg   # differential, feature vs baseline
   state.json              # rolling medians, regression latches, digest counter, last seen sha

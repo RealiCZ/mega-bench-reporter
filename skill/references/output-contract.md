@@ -27,7 +27,6 @@ Each invocation prints exactly one JSON document to stdout:
 1. For every attachment that an `img` element references, upload it to Lark.
 2. String-replace the `${image:<basename>}` placeholder in the card JSON with the returned `image_key`.
 3. Post the card JSON as an interactive card.
-4. Flamegraph attachments are SVGs — Lark cards cannot embed them; post them as plain file messages in the same thread as the card (the card body lists the file names).
 
 ## Card kinds
 
@@ -36,6 +35,6 @@ Each invocation prints exactly one JSON document to stdout:
 | `regression_alert` | red | a headline row crossed the threshold this run — post immediately | compare_bars.png + dist plots of affected rows; build the numbers table from the commit dir's `compare_table.json` if wanted |
 | `recovery` | green | a previously-regressed row dropped back under the threshold | same as alert |
 | `trend_digest` | blue | every Nth commit (default 10) | trend.png |
-| `flamegraph` | orange | nightly | per-workload SVG + differential SVG (post as files) |
 
 `kind` is for logging/routing — no need to inspect the card JSON.
+The `flamegraph` subcommand never produces cards (archive-only): its output JSON always has `"cards": []`.

@@ -42,7 +42,8 @@ enum Command {
         #[arg(long)]
         work_root: Option<PathBuf>,
     },
-    /// Nightly flame-graph pipeline (Linux: `perf`; macOS: `sample`).
+    /// Nightly flame-graph archive (Linux: `perf`; macOS: `sample`).
+    /// Writes SVGs under `flame/<day>/` only — no cards, nothing to relay.
     Flamegraph {
         /// Repo name — must match a `[[repos]]` entry in the config.
         #[arg(long)]
@@ -121,7 +122,8 @@ fn run() -> anyhow::Result<()> {
                 sha: outcome.sha,
                 output_dir: outcome.flame_dir,
                 failed_targets: Vec::new(),
-                cards: vec![outcome.card],
+                // Archive-only: the flamegraph subcommand never emits cards.
+                cards: Vec::new(),
             }
         }
     };
