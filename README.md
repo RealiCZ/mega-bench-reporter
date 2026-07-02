@@ -1,15 +1,17 @@
 # mega-bench-reporter
 
-Continuous mega-evm vs vanilla-revm comparison reporting.
-This tool owns everything between "a commit landed" and "here is a ready-to-post Lark card": clone/pull → build → bench → parse → chart → categorized storage → regression check → digest batching → card rendering.
-It never calls the Lark API and holds no Lark credentials; a triggering agent (e.g. BB9) invokes the CLI, reads its JSON output, uploads the attachments, and posts the card.
+Continuous benchmark-overhead tracking for Rust repos, against a configured baseline
+(for mega-evm: vanilla `revm_pinned`).
+This tool owns "a commit landed" → "structured data on disk": clone/pull → `cargo bench` → parse → ratios → charts → categorized storage → regression detection → digest batching.
+It produces **data only** — raw metrics JSON, chart images, and factual events.
+It never calls the Lark API, renders no cards, and holds no messaging credentials: a consuming agent (e.g. BB9) discovers results from the data root and composes/delivers whatever reports it wants, guided by [`skill/`](skill/SKILL.md).
 
 ## Requirements
 
-- `git` and a Rust toolchain (`cargo`, `rustc`) on the machine — the tool shells out to both to build and bench the tracked repo.
-- Whatever the tracked repo itself needs to build (for mega-evm: git submodules are handled automatically, and Foundry must be installed — its CI installs it before benching).
-- For the `flamegraph` subcommand: `perf` on Linux; on macOS the built-in `sample` tool is used (nothing to install). The per-commit `run` subcommand works anywhere.
-- No Python, no gnuplot, no system fonts: charts are rendered with `plotters` using an embedded font, and flame graphs with the `inferno` crate as a library.
+- `git` and a Rust toolchain (`cargo`, `rustc`) — the tool shells out to both to build and bench the tracked repo.
+- Whatever the tracked repo itself needs to build (for mega-evm: git submodules are handled automatically, and Foundry must be installed).
+- For the `flamegraph` subcommand: `perf` on Linux; on macOS the built-in `sample` tool is used (nothing to install).
+- No Python, no gnuplot, no system fonts: charts are rendered with `plotters` using an embedded font, flame graphs with the `inferno` crate as a library.
 
 ## Build
 
@@ -33,78 +35,61 @@ mega-bench-reporter run \
 What one `run` does:
 
 1. Clones (first run) or fetches the tracked repo into `<work-root>/<repo>` (default work root: `<data-root>/_checkouts`) and checks out the sha, submodules included.
-2. Runs `cargo bench -p <package> --bench <target> -- --output-format bencher` for every configured bench target — the exact invocation mega-evm's CI (benchmark.yml) uses, so numbers stay comparable with the per-PR `/benchmark` flow (`bench_profile` in the config adds `--profile <p>`). A failing target is recorded in `raw.json` (`failed_targets`) and skipped, not fatal — unless every target fails.
-3. Parses criterion's `target/criterion/**/new/*.json` tree and computes each row's `ratio_vs_revm_pinned` (time ratio against the `revm_pinned` row of the same group/workload; > 1 means mega-evm is slower).
-4. Writes `commits/<YYYYMMDD>-<shortsha>/{raw.json, compare_table.json, compare_bars.png, dist_*.png}` under `<data-root>/<repo>/`.
-5. Checks every headline-spec row against its rolling median and renders a regression-alert (or recovery) card on state change.
-6. Every 10th commit, rolls the last 10 records into `digests/<YYYYMMDD>-<range>/{summary.json, trend.png}` plus a trend-digest card.
+2. Runs `cargo bench -p <package> --bench <target> -- --output-format bencher` for every configured bench target — the exact invocation mega-evm's CI (benchmark.yml) uses, so numbers stay comparable with the per-PR `/benchmark` flow (`bench_profile` in the config adds `--profile <p>`). A failing target is recorded in `failed_targets` and skipped; the run only fails when every target fails.
+3. Parses criterion's `target/criterion/**/new/*.json` tree and computes each row's `ratio_vs_baseline` (time ratio against the configured `baseline_subject` row of the same group/workload; > 1 means slower than the baseline).
+4. Writes `commits/<YYYYMMDD>-<shortsha>/{raw.json, events.json, compare_table.json, compare_bars.png, dist_*.png}` under `<data-root>/<repo>/`.
+5. Checks every headline row against its rolling median and records regression/recovery **events** (facts, not alerts — the consumer decides what to do with them).
+6. Every Nth commit (default 10), rolls the window into `digests/<YYYYMMDD>-<range>/{summary.json, trend.png}` and records a digest event.
+7. Atomically updates `<data-root>/<repo>/latest.json` — the discovery pointer consumers poll.
+
+stdout carries one JSON summary (`{repo, sha, output_dir, failed_targets, events}`); the same facts are durable on disk, so the invoker can run detached and read files after exit.
 
 ### Nightly flame graph (Linux / macOS) — archive only
 
 ```bash
-mega-bench-reporter flamegraph \
-  --repo mega-evm \
-  --config repos.toml \
-  --data-root /srv/mega-bench/data
+mega-bench-reporter flamegraph --repo mega-evm --config repos.toml --data-root /srv/mega-bench/data
 ```
 
-Checks out the tracked branch's current HEAD, builds the bench binary once (`cargo bench --no-run --profile profiling`), profiles each configured workload (criterion `--profile-time` mode, `--exact` id matching) with the platform profiler — `perf record` on Linux, the built-in `sample` tool on macOS (1 ms interval, no root) — folds, demangles, and renders SVGs plus one differential SVG per baseline/feature pair via `inferno`, writes `flame/<YYYYMMDD>/`, and prunes days past retention.
-This is a pure archive: no card is rendered, `cards` in the output JSON is always empty, and nothing needs relaying — schedule it with plain cron (or any timer) and view the SVGs directly in a browser.
+Checks out the tracked branch's HEAD, builds the bench binary once (`cargo bench --no-run --profile profiling`), profiles each configured workload (criterion `--profile-time`, `--exact` id matching) with the platform profiler — `perf record` on Linux, the built-in `sample` tool on macOS — folds, demangles, and renders per-workload SVGs plus one differential SVG per baseline/feature pair into `flame/<YYYYMMDD>/`, pruning days past retention.
+Pure archive: no events, nothing to relay; schedule with plain cron and open the SVGs in a browser.
 
-For development, `run --skip-bench` re-renders charts and records from the checkout's existing criterion tree without re-benching (only for the last processed sha — the tree's provenance is unknown for anything else).
+For development, `run --skip-bench` re-renders artifacts from the checkout's existing criterion tree (only for the last processed sha).
 
 ### GitHub access
 
 The tool holds no GitHub credentials of its own.
 If the `GITHUB_TOKEN` environment variable is set and the clone URL is `https://`, git is wired to use it via a credential helper (the token never appears in argv); otherwise clones are anonymous, which is fine for public repos.
 
-## Output contract (stdout)
+## Consuming the data
 
-Each invocation prints exactly one JSON document to stdout; all logs go to stderr.
-Exit code 0 with an empty `cards` array means "nothing to post" (no regression, not a digest commit).
-The same document (minus `output_dir`) is also persisted as `cards.json` inside the commit dir before the run finishes — stdout is a convenience copy, the file is the durable one.
-The invoker therefore does not need to hold a live connection for the whole run: launch detached (nohup/systemd-run), wait for exit, then read `cards.json`.
-Recovery semantics: a run killed mid-bench never updates `state.json`, so re-running the same sha simply redoes everything; a run that completed but whose stdout was lost leaves `cards.json` on disk (an idempotent re-run of that sha refreshes artifacts but deliberately does not re-emit or overwrite the persisted cards).
+Everything a consumer needs is documented in the agent-facing skill:
 
-```json
-{
-  "repo": "mega-evm",
-  "sha": "<full sha>",
-  "output_dir": "<data-root>/mega-evm/commits/20260702-d21a86f",
-  "failed_targets": [],
-  "cards": [
-    {
-      "kind": "regression_alert",
-      "card": { "...": "Lark card JSON, ready to post" },
-      "attachments": ["<paths of files referenced by the card>"]
-    }
-  ]
-}
-```
-
-Relaying rules for the posting agent:
-
-- For every attachment that an `img` element references, upload it to Lark, then string-replace the `${image:<basename>}` placeholder in the card JSON with the returned `image_key`.
-- `kind` is one of `regression_alert`, `recovery`, `trend_digest` — useful for logging/routing, no need to inspect the card JSON.
-- The `flamegraph` subcommand always emits an empty `cards` array (archive-only); there is nothing to relay for it.
+- [`skill/references/discovery.md`](skill/references/discovery.md) — find new runs via `latest.json`, dedup with a last-posted-sha marker, crash recovery.
+- [`skill/references/events.md`](skill/references/events.md) — regression/recovery/digest event semantics and tuning.
+- [`skill/references/data-layout.md`](skill/references/data-layout.md) — every file and schema under the data root.
+- [`skill/references/lark-card.md`](skill/references/lark-card.md) — a self-contained recipe for composing Lark cards from the data (field mapping, red/yellow/green color standard, skeleton, verified example).
+- [`skill/references/repos/mega-evm.md`](skill/references/repos/mega-evm.md) — what mega-evm's subjects and groups mean.
 
 ## Configuration (`repos.toml`)
 
 ```toml
 # Global tuning defaults; every [[repos]] entry may override any of them.
 [defaults]
-regression_threshold_pct = 10.0   # alert when a headline row rises this % over its rolling median
+regression_threshold_pct = 10.0   # event when a headline row rises this % over its rolling median
 rolling_window = 20               # healthy runs feeding the rolling median
-digest_batch_size = 10            # commits per trend digest
+digest_batch_size = 10            # commits per digest
 # bench_profile = "profiling"     # unset = cargo's default bench profile (matches mega-evm CI)
 
 [[repos]]
 name = "mega-evm"                       # repo key; also the cargo package name unless `package` is set
-github = "megaeth-labs/mega-evm"        # owner/repo, used for commit links in cards
+github = "megaeth-labs/mega-evm"        # owner/repo, for commit links composed by consumers
 branch = "main"                         # branch the poller watches / flamegraph profiles
 clone_url = "https://github.com/megaeth-labs/mega-evm.git"
 bench_targets = ["transact", "revm_bench", "mega_bench", "comp_cost", "block_bench"]
-headline_spec = "rex5"                  # subject family that alerts and headlines digests
+baseline_subject = "revm_pinned"        # the subject every ratio is computed against
+headline_subjects = ["rex5", "rex5_*"]  # exact names or trailing-* prefixes; these rows drive events
+subject_order = ["revm_pinned", "revm_latest", "op_revm_pinned", "op_revm_latest",
+                 "equivalence", "mini_rex", "rex4", "rex5"]  # optional table column order
 
 [repos.flamegraph]                      # optional; omit to disable the flamegraph subcommand
 bench_target = "mega_bench"
@@ -115,46 +100,35 @@ workloads = [
 ]
 ```
 
-The list shape is deliberate: adding a second tracked repo is a new `[[repos]]` entry and a new top-level data directory, not a code or schema change.
+Adding a tracked repo is a new `[[repos]]` entry plus a `skill/references/repos/<name>.md` — no code change.
 
 ## Data layout
 
 ```text
 <data-root>/<repo>/
+  latest.json             # discovery pointer: {sha, commit_dir, finished_at}
   commits/<YYYYMMDD>-<shortsha>/
-    raw.json              # source of truth: { commit, date, rustc, failed_targets?, groups: { <group>: { <subject>[/<workload>]: { ns, ratio_vs_revm_pinned } } } }
-    cards.json            # durable copy of this run's cards output (recovery if stdout was lost)
-    compare_table.json    # table-ready JSON: subjects[], rows[{item, p95_us[], headline_ratio}] — the relaying agent builds its own table from it
-    compare_bars.png      # relative speed per item, revm_pinned = 100% (lower = more overhead)
-    dist_<group>[_<workload>].png   # per-call time distribution (violin), one per group/workload with >= 2 subjects; "/" in workloads becomes "_"
+    raw.json              # source of truth: { commit, date, rustc, baseline_subject, failed_targets?, groups: { <group>: { <subject>[/<workload>]: { ns, ratio_vs_baseline } } } }
+    events.json           # this run's factual events: regression / recovery / digest
+    compare_table.json    # table-ready JSON: subjects[], rows[{item, p95_us[], headline_ratio}]
+    compare_bars.png      # relative speed per item, baseline = 100%
+    dist_<group>[_<workload>].png   # per-call time distribution (violin)
   digests/<YYYYMMDD>-<first>..<last>/
-    summary.json          # last-N-commits headline series, table-ready (first/last/median per row)
+    summary.json          # last-N-commits headline series (first/last/median per row)
     trend.png             # headline ratios over the window, red rings on threshold-tripping points
-  flame/<YYYYMMDD>/       # archive-only: open the SVGs directly, nothing is posted
-    <workload>.svg        # one per profiled benchmark id
+  flame/<YYYYMMDD>/       # archive-only nightly flame graphs
+    <workload>.svg
     <workload>_diff.svg   # differential, feature vs baseline
-  state.json              # rolling medians, regression latches, digest counter, last seen sha
+  state.json              # rolling windows, event latches, digest counter, last seen sha
 ```
 
-## Regression semantics
+## Event semantics
 
 - Ratios are compared against the row's rolling median (window: last `rolling_window` healthy runs) — noise-robust, no fixed absolute baseline.
-- A headline-spec row rising more than `regression_threshold_pct` above its rolling median triggers a regression-alert card the same run. Both knobs (and `digest_batch_size`) live in `repos.toml`.
-- The alert is latched: while the row stays regressed no further card is sent; when it drops back under the threshold a recovery card is sent once.
-- Regressed values never enter the rolling window, so a sustained regression stays measured against the pre-regression baseline instead of silently becoming the new normal; accepting a new level = deleting that row's entry from `state.json`.
-- Re-running the most recently processed sha refreshes artifacts without touching regression state (retry-safe).
-- The first run establishes the baseline and never alerts.
-- Only headline-family subjects (`headline_spec` and its `_`-suffixed variants, e.g. `rex5`, `rex5_salt`, `rex5_oracle`) can alert; all rows are recorded in history regardless.
-
-## Card templates
-
-The three Lark card layouts live in `templates/*.json` and are embedded into the binary at compile time.
-Changing a card's look is a template edit plus a test run — never code string-building, never a change to the relaying agent.
-Template language: `{{key}}` substitution inside string values, plus a `{"tag": "__images__", "group": "<name>"}` marker element that expands to one `img` element per registered image.
-
-## Agent skill
-
-`skill/SKILL.md` (plus `skill/references/`) documents everything an operating agent needs: how to invoke the CLI, the output contract and card relaying rules, where the data lives, what every metric means, and the alert conditions.
+- A headline row rising more than `regression_threshold_pct` above its rolling median records a regression event the same run; the row is then latched (no repeat events) until a recovery event fires.
+- Regressed values never enter the rolling window, so a sustained regression stays measured against the pre-regression baseline; accepting a new level = deleting that row's entry from `state.json`.
+- Re-running the most recently processed sha refreshes artifacts without touching state or events (retry-safe); a run killed mid-bench leaves state untouched (clean full retry).
+- The first run establishes baselines and emits nothing.
 
 ## Development
 
@@ -162,5 +136,5 @@ Template language: `{{key}}` substitution inside string values, plus a `{"tag": 
 cargo test                        # unit + synthetic end-to-end pipeline tests
 cargo fmt --all
 cargo clippy --all-targets --locked -- -D warnings
-cargo run --example render_samples -- /tmp/charts   # visual check of the three chart types
+cargo run --example render_samples -- /tmp/charts   # visual check of the chart types
 ```

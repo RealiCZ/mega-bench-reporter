@@ -21,7 +21,16 @@ github = "megaeth-labs/mega-evm"
 branch = "main"
 clone_url = "https://github.com/megaeth-labs/mega-evm.git"
 bench_targets = ["transact", "revm_bench", "mega_bench", "comp_cost", "block_bench"]
-headline_spec = "rex5"
+# The subject every ratio is computed against.
+baseline_subject = "revm_pinned"
+# Subject patterns that headline this repo (exact, or trailing-* prefix).
+headline_subjects = ["rex5", "rex5_*"]
+# Optional column order for the comparison table; unlisted subjects follow
+# alphabetically. Omit to default to baseline-first.
+subject_order = [
+  "revm_pinned", "revm_latest", "op_revm_pinned", "op_revm_latest",
+  "equivalence", "mini_rex", "rex4", "rex5",
+]
 
 [repos.flamegraph]
 bench_target = "mega_bench"

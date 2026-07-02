@@ -2,34 +2,61 @@
 
 ## Per-commit run
 
-On every new commit on a tracked branch (poll with `git ls-remote`, compare against `state.json`'s `last_seen_sha`):
-
 ```bash
-mega-bench-reporter run --repo mega-evm --sha <full-sha> \
+mega-bench-reporter run --repo <name> --sha <full-sha> \
   --config repos.toml --data-root <data-root>
 ```
 
-What it does: clone/fetch the repo into `<work-root>/<repo>` (default `<data-root>/_checkouts`), check out the sha (submodules included), run `cargo bench -p <package> --bench <target> -- --output-format bencher` per configured target (the exact invocation mega-evm's CI uses; a `bench_profile` config adds `--profile <p>`), parse criterion's JSON tree, render charts, store the record, check regressions, and batch digests.
+What it does: clone/fetch the repo into `<work-root>/<repo>` (default
+`<data-root>/_checkouts`), check out the sha (submodules included), run
+`cargo bench -p <package> --bench <target> -- --output-format bencher` per configured
+target (the exact invocation the tracked repo's CI uses; a `bench_profile` config adds
+`--profile <p>`), parse criterion's JSON tree, compute ratios against the configured
+`baseline_subject`, render charts + table JSON, record events, update `state.json`
+and `latest.json`.
 
-- A failing bench target is recorded in `failed_targets` and skipped; the run only fails when every target fails.
-- No need to hold a live connection for the whole run: launch detached, wait for process exit, then read the durable `cards.json` in the commit dir (see output-contract.md for the recovery rules).
-- Re-running the sha in `last_seen_sha` refreshes artifacts without touching regression state (retry-safe).
-- `--skip-bench` reuses the checkout's existing criterion tree — for re-rendering charts after a template/chart change, not for production runs. It only accepts the last processed sha (`state.json`'s `last_seen_sha`); anything else is rejected because the tree's provenance is unknown.
+- A failing bench target lands in `failed_targets` and is skipped; the run only
+  fails when every target fails.
+- No need to hold a live connection: launch detached, wait for exit, read the files
+  (see [`discovery.md`](discovery.md)).
+- `--skip-bench` re-renders artifacts from the checkout's existing criterion tree —
+  dev/regen only; it accepts only the last processed sha.
+
+## stdout summary
+
+Exactly one JSON document (logs go to stderr); the same facts are durable on disk:
+
+```json
+{
+  "repo": "mega-evm",
+  "sha": "<full sha>",
+  "output_dir": "<data-root>/mega-evm/commits/20260702-d21a86f",
+  "failed_targets": [],
+  "events": [ { "type": "regression", "row_key": "…", "baseline_median": 2.0,
+                "current": 2.3, "pct_over": 15.0 } ]
+}
+```
 
 ## Nightly flamegraph (archive only)
 
 ```bash
-mega-bench-reporter flamegraph --repo mega-evm --config repos.toml --data-root <data-root>
+mega-bench-reporter flamegraph --repo <name> --config repos.toml --data-root <data-root>
 ```
 
-Checks out the tracked branch's HEAD, builds the bench binary once (`cargo bench --no-run --profile profiling`), verifies each configured benchmark id against `--list`, profiles each unique id (Linux: `perf record` + `perf script`; macOS: the built-in `sample` tool at 1 ms — no root needed), folds + demangles via `inferno`, renders one SVG per workload and one differential SVG per baseline/feature pair, prunes days past retention.
-
-Pure archive: no card is produced (`cards` is always `[]`), so any timer works — plain cron on the box is enough, no relaying agent involvement needed. View the SVGs by opening `flame/<day>/*.svg` in a browser (they are interactive).
+Checks out the tracked branch's HEAD, builds the bench binary once
+(`cargo bench --no-run --profile profiling`), verifies each configured benchmark id
+against `--list`, profiles each unique id (Linux: `perf`; macOS: the built-in
+`sample` tool — no root), folds + demangles via `inferno`, renders one SVG per
+workload plus one differential SVG per pair, prunes days past retention. No events,
+nothing to relay — plain cron is enough; view `flame/<day>/*.svg` in a browser.
 
 ## Environment and safety
 
-- Exit code 0 = success. stdout = exactly one JSON document. stderr = all logs and subprocess output.
-- Runs take as long as the benches take (tens of minutes) — do not add short timeouts.
-- `GITHUB_TOKEN` env var: set only for private repos; https clone URLs then authenticate via a git credential helper (token never in argv). Public repos need nothing.
-- Concurrency: a per-repo lock (`<data-root>/<repo>/.lock`) makes a second invocation fail fast instead of corrupting shared state. Never run two invocations for the same repo at once.
-- The machine needs: `git`, a Rust toolchain, whatever the tracked repo's build needs (mega-evm: Foundry), and `perf` (Linux) or nothing extra (macOS) for flamegraphs.
+- Exit 0 = success. Runs take as long as the benches take (tens of minutes) — no
+  short timeouts.
+- `GITHUB_TOKEN` env var: only needed for private repos (https clone URLs use it via
+  a git credential helper; the token never appears in argv).
+- Concurrency: a per-repo lock (`<data-root>/<repo>/.lock`) makes a second
+  invocation fail fast. Never run two invocations for the same repo at once.
+- The box needs: `git`, a Rust toolchain, whatever the tracked repo's build needs
+  (mega-evm: Foundry), and `perf` on Linux for flamegraphs.

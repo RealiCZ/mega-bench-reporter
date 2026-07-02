@@ -2,25 +2,15 @@
 //! commit records into `digests/<day>-<range>/{summary.json, trend.png}` plus
 //! a ready-to-post trend-digest card.
 
-use crate::cards::{self, DigestCardParams, DigestTableRow, ImageRef, RenderedCard};
 use crate::charts::{self, TrendSeries};
 use crate::storage::{CommitRecord, RepoStore};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// Table cap on the card (full data always lands in `summary.json`); the trend
-/// chart gets a tighter cap to stay readable.
-const CARD_TABLE_MAX_ROWS: usize = 15;
+/// The trend chart stays readable with a bounded series count; the full data
+/// always lands in `summary.json`.
 const TREND_MAX_SERIES: usize = 8;
-
-/// Is `subject` part of the headline spec family? (`rex5` matches `rex5` and
-/// `rex5_salt`, but not `rex50` or `rex4`.)
-pub fn is_headline_subject(subject: &str, headline_spec: &str) -> bool {
-    subject == headline_spec
-        || (subject.starts_with(headline_spec)
-            && subject.as_bytes().get(headline_spec.len()) == Some(&b'_'))
-}
 
 /// One headline row's ratio series across the digest window, `summary.json`'s
 /// `rows[]` entry — "table-ready": first/last/median precomputed.
@@ -28,7 +18,7 @@ pub fn is_headline_subject(subject: &str, headline_spec: &str) -> bool {
 pub struct SummaryRow {
     /// Full row key, e.g. `salt_dynamic_gas/rex5_salt/sstore_100`.
     pub row_key: String,
-    /// `ratio_vs_revm_pinned` per commit of the window (same order as
+    /// `ratio_vs_baseline` per commit of the window (same order as
     /// `commits`); `null` where the row was missing that run.
     pub ratios: Vec<Option<f64>>,
     pub first: Option<f64>,
@@ -60,7 +50,10 @@ fn median_of(values: &[f64]) -> Option<f64> {
 }
 
 /// Extracts the headline rows' ratio series from the window's records.
-pub fn build_summary(records: &[CommitRecord], headline_spec: &str) -> DigestSummary {
+pub fn build_summary(
+    records: &[CommitRecord],
+    is_headline: impl Fn(&str) -> bool,
+) -> DigestSummary {
     let commits: Vec<String> = records.iter().map(|r| r.commit.clone()).collect();
 
     // row_key -> per-commit ratios.
@@ -69,10 +62,10 @@ pub fn build_summary(records: &[CommitRecord], headline_spec: &str) -> DigestSum
         for (group, rows) in &record.groups {
             for (row_name, row) in rows {
                 let subject = row_name.split('/').next().unwrap_or(row_name);
-                if !is_headline_subject(subject, headline_spec) {
+                if !is_headline(subject) {
                     continue;
                 }
-                let Some(ratio) = row.ratio_vs_revm_pinned else { continue };
+                let Some(ratio) = row.ratio_vs_baseline else { continue };
                 series
                     .entry(format!("{group}/{row_name}"))
                     .or_insert_with(|| vec![None; records.len()])[i] = Some(ratio);
@@ -138,26 +131,26 @@ fn alert_markers(ratios: &[Option<f64>], threshold_pct: f64) -> Vec<bool> {
 
 pub struct DigestOutcome {
     pub dir: PathBuf,
-    pub card: RenderedCard,
 }
 
-/// Builds the digest directory (`summary.json` + `trend.png`) and the
-/// trend-digest card from the window's records (oldest first).
+/// Builds the digest directory (`summary.json` + `trend.png`) from the
+/// window's records (oldest first). Pure data — the consumer composes its own
+/// report from `summary.json` and the chart.
 pub fn build_digest(
     store: &RepoStore,
-    github: &str,
     repo_name: &str,
-    headline_spec: &str,
+    headline_label: &str,
+    is_headline: impl Fn(&str) -> bool,
     regression_threshold_pct: f64,
     records: &[CommitRecord],
 ) -> anyhow::Result<DigestOutcome> {
     if records.is_empty() {
         anyhow::bail!("digest requested with no commit records");
     }
-    let summary = build_summary(records, headline_spec);
+    let summary = build_summary(records, is_headline);
     if summary.rows.is_empty() {
         anyhow::bail!(
-            "digest window has no '{headline_spec}' rows with a revm_pinned ratio — \
+            "digest window has no '{headline_label}' rows with a baseline ratio — \
              nothing to summarize"
         );
     }
@@ -168,7 +161,7 @@ pub fn build_digest(
     std::fs::write(dir.join("summary.json"), serde_json::to_string_pretty(&summary)?)?;
 
     // Trend chart: the biggest-overhead rows (summary is sorted by median
-    // descending); the card table gets a larger slice of the same order.
+    // descending), capped so the chart stays readable.
     let commit_labels: Vec<String> = records.iter().map(|r| r.short_sha().to_string()).collect();
     let trend_series: Vec<TrendSeries> = summary
         .rows
@@ -180,49 +173,16 @@ pub fn build_digest(
             alerts: alert_markers(&row.ratios, regression_threshold_pct),
         })
         .collect();
-    let trend_path = dir.join("trend.png");
+    let baseline_subject = &last.baseline_subject;
     charts::render_trend(
-        &trend_path,
-        &format!("{repo_name} headline ({headline_spec}) — last {} commits", records.len()),
+        &dir.join("trend.png"),
+        &format!("{repo_name} headline ({headline_label}) — last {} commits", records.len()),
+        baseline_subject,
         &commit_labels,
         &trend_series,
     )?;
 
-    let mut table_rows: Vec<DigestTableRow> = summary
-        .rows
-        .iter()
-        .take(CARD_TABLE_MAX_ROWS)
-        .map(|row| DigestTableRow {
-            row_key: row.row_key.clone(),
-            first: row.first,
-            last: row.last,
-            median: row.median,
-        })
-        .collect();
-    if summary.rows.len() > CARD_TABLE_MAX_ROWS {
-        table_rows.push(DigestTableRow {
-            row_key: format!(
-                "…以及另外 {} 行（见 summary.json）",
-                summary.rows.len() - CARD_TABLE_MAX_ROWS
-            ),
-            first: None,
-            last: None,
-            median: None,
-        });
-    }
-
-    let card = cards::render_digest_card(&DigestCardParams {
-        repo_name,
-        github,
-        first_sha: &summary.first_commit,
-        last_sha: &summary.last_commit,
-        commit_count: records.len(),
-        rows: table_rows,
-        failed_targets: summary.failed_targets.clone(),
-        trend_image: ImageRef::new(trend_path, "headline 趋势图"),
-    })?;
-
-    Ok(DigestOutcome { dir, card })
+    Ok(DigestOutcome { dir })
 }
 
 #[cfg(test)]
@@ -236,15 +196,19 @@ mod tests {
         rows: &[(&str, &str, f64, Option<f64>)],
         failed: &[&str],
     ) -> CommitRecord {
-        let mut record =
-            CommitRecord::new(sha.to_string(), date.to_string(), "rustc 1.86.0".into());
+        let mut record = CommitRecord::new(
+            sha.to_string(),
+            date.to_string(),
+            "rustc 1.86.0".into(),
+            "revm_pinned".into(),
+        );
         record.failed_targets = failed.iter().map(|s| s.to_string()).collect();
         for (group, row_name, ns, ratio) in rows {
             record
                 .groups
                 .entry(group.to_string())
                 .or_default()
-                .insert(row_name.to_string(), RowRecord { ns: *ns, ratio_vs_revm_pinned: *ratio });
+                .insert(row_name.to_string(), RowRecord { ns: *ns, ratio_vs_baseline: *ratio });
         }
         record
     }
@@ -274,19 +238,13 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn test_is_headline_subject_family_matching() {
-        assert!(is_headline_subject("rex5", "rex5"));
-        assert!(is_headline_subject("rex5_salt", "rex5"));
-        assert!(is_headline_subject("rex5_oracle", "rex5"));
-        assert!(!is_headline_subject("rex4", "rex5"));
-        assert!(!is_headline_subject("rex50", "rex5"));
-        assert!(!is_headline_subject("revm_pinned", "rex5"));
+    fn rex5_family(subject: &str) -> bool {
+        subject == "rex5" || subject.starts_with("rex5_")
     }
 
     #[test]
     fn test_build_summary_headline_rows_sorted_by_median() {
-        let summary = build_summary(&window(), "rex5");
+        let summary = build_summary(&window(), rex5_family);
         let keys: Vec<&str> = summary.rows.iter().map(|r| r.row_key.as_str()).collect();
         // rex4 and revm_pinned rows excluded; ratio-less rex5_oracle row excluded.
         assert_eq!(keys, vec!["salt_dynamic_gas/rex5_salt/sstore_100", "empty_transaction/rex5"]);
@@ -298,13 +256,12 @@ mod tests {
     }
 
     #[test]
-    fn test_build_digest_writes_summary_and_trend_and_card() {
+    fn test_build_digest_writes_summary_and_trend() {
         let tmp = tempfile::tempdir().unwrap();
         let store = RepoStore::new(tmp.path(), "mega-evm");
         let records = window();
         let outcome =
-            build_digest(&store, "megaeth-labs/mega-evm", "mega-evm", "rex5", 10.0, &records)
-                .unwrap();
+            build_digest(&store, "mega-evm", "rex5, rex5_*", rex5_family, 10.0, &records).unwrap();
 
         // Directory named after the last commit's day + the sha range.
         assert_eq!(
@@ -313,12 +270,11 @@ mod tests {
         );
         assert!(outcome.dir.join("summary.json").is_file());
         assert!(outcome.dir.join("trend.png").is_file());
-
-        let text = serde_json::to_string(&outcome.card.card).unwrap();
-        assert!(text.contains("趋势汇总（近 10 次提交）"));
-        assert!(text.contains("block_bench"));
-        assert!(text.contains("${image:trend.png}"));
-        assert_eq!(outcome.card.attachments, vec![outcome.dir.join("trend.png")]);
+        let summary: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(outcome.dir.join("summary.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(summary["failed_targets"][0], "block_bench");
     }
 
     #[test]
@@ -331,6 +287,6 @@ mod tests {
             &[("g", "revm_pinned/w", 1.0, Some(1.0))],
             &[],
         )];
-        assert!(build_digest(&store, "o/r", "r", "rex5", 10.0, &records).is_err());
+        assert!(build_digest(&store, "r", "rex5", rex5_family, 10.0, &records).is_err());
     }
 }

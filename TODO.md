@@ -5,10 +5,8 @@ None of these block using the tool; they need a joint decision or a follow-up ou
 
 ## Contract / integration (BB9 side)
 
-1. **Output contract is `{"cards": [...]}`, not the plan's single `{"card": null | {...}}`.**
-   One run can legitimately produce two cards (regression alert + 10th-commit digest), so the CLI always emits an array (empty = nothing to post).
-   The relaying agent must iterate `cards[]`. Confirm this shape before wiring BB9.
-   Cards are also persisted as `cards.json` in the commit dir (at-least-once availability): BB9 can run detached and read the file after exit; exactly-once delivery tracking (posted / not yet) stays on BB9's side.
+1. ~~Output contract is `{"cards": [...]}`.~~ **Superseded (user decision, 2026-07-02): the reporter renders no cards at all.**
+   It emits factual events (`events.json` + stdout summary) and a discovery pointer (`latest.json`); BB9 composes/sends cards itself following `skill/references/lark-card.md` (incl. the red/yellow/green `--template` color standard) and dedups with its own last-posted-sha marker (`skill/references/discovery.md`).
 2. ~~Lark markdown table rendering.~~ **Resolved:** tested on the Lark side, renders fine.
    Additionally, the per-commit comparison table is now emitted as `compare_table.json` (not a PNG) so the relaying agent can assemble a native table.
 3. ~~Flamegraph SVGs cannot be embedded in cards.~~ **Obsolete:** the flamegraph pipeline is now archive-only (user decision, 2026-07-02) — no card, nothing for BB9 to post; SVGs are viewed directly from `flame/<day>/`.
@@ -36,6 +34,10 @@ None of these block using the tool; they need a joint decision or a follow-up ou
 7. **Same-day short-sha collision.**
    Commit dirs are keyed `<YYYYMMDD>-<7-char-sha>`; two same-day commits sharing a 7-char prefix would overwrite each other (probability ~1e-8 per pair, accepted).
 
+4a. **Transient `git fetch` failures (SSL timeout to GitHub) fail the run.**
+   Semantics are safe (state untouched → retry redoes everything), and the poller's next tick retries anyway — but an in-process fetch retry (2 attempts with backoff) would reduce noise.
+   Observed twice on the trial box.
+
 ## Not yet done (deliberately)
 
 8. **Flamegraph: macOS path validated for real; the Linux `perf` path still needs one smoke run on `mega-engineer`.**
@@ -61,3 +63,4 @@ None of these block using the tool; they need a joint decision or a follow-up ou
 16. `repos.toml` ships an `https://` clone URL (plan sketched ssh) so the optional `GITHUB_TOKEN` credential-helper path works.
 17. The flamegraph pipeline always runs `cargo bench --no-run` and relies on cargo's cache instead of an explicit "reuse if same-day" check.
 18. The plan's 火焰图 card (Task 2.1 last step) was dropped: the nightly flamegraph is archive-only per user decision (2026-07-02); `flame/<day>/` on disk is the deliverable.
+19. The whole card-rendering layer (Task 1.6 templates, card JSON output contract) was removed per user decision (2026-07-02): the reporter is a pure data producer (events + latest.json + charts + JSON), and card composition lives in `skill/references/lark-card.md` for the consuming agent. mega-evm-specific knowledge moved out of code into config (`baseline_subject`, `headline_subjects`, `subject_order`) and `skill/references/repos/mega-evm.md` — adding a repo is config + one doc file.

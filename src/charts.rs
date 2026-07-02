@@ -76,15 +76,17 @@ pub fn p95(samples: &[f64]) -> f64 {
 
 /// The comparison table (the design doc's table view): one row per test item,
 /// one column per implementation, last column = the headline family's time
-/// ratio vs `revm_pinned`. Emitted as `compare_table.json` for the relaying
+/// ratio vs the baseline subject. Emitted as `compare_table.json` for the relaying
 /// agent to assemble into a native Lark table.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct CompareTable {
-    /// Column order: baselines first, then specs, then variants.
+    /// Column order: configured `subject_order` first, then alphabetical.
     pub subjects: Vec<String>,
     pub rows: Vec<CompareTableRow>,
-    /// Label of the ratio column, e.g. `rex5`.
+    /// Label of the ratio column, e.g. `rex5, rex5_*`.
     pub headline_label: String,
+    /// The subject every ratio is against.
+    pub baseline_subject: String,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -93,40 +95,26 @@ pub struct CompareTableRow {
     pub item: String,
     /// p95 per-call µs per subject column (`None` = subject absent).
     pub p95_us: Vec<Option<f64>>,
-    /// Worst (max) headline-family time ratio vs revm_pinned for this item.
+    /// Worst (max) headline-family time ratio vs the baseline for this item.
     pub headline_ratio: Option<f64>,
 }
 
-/// Fixed display order for well-known subjects; everything else goes after,
-/// alphabetically.
-const SUBJECT_ORDER: &[&str] = &[
-    "revm_pinned",
-    "revm_latest",
-    "op_revm_pinned",
-    "op_revm_latest",
-    "equivalence",
-    "mini_rex",
-    "rex",
-    "rex1",
-    "rex2",
-    "rex3",
-    "rex4",
-    "rex5",
-];
-
-fn subject_rank(subject: &str) -> (usize, String) {
-    match SUBJECT_ORDER.iter().position(|s| *s == subject) {
+fn subject_rank(subject: &str, order: &[String]) -> (usize, String) {
+    match order.iter().position(|s| s == subject) {
         Some(i) => (i, String::new()),
-        None => (SUBJECT_ORDER.len(), subject.to_string()),
+        None => (order.len(), subject.to_string()),
     }
 }
 
 /// Assembles the comparison table from parsed rows + ratio tables.
-/// `is_headline` decides which subjects feed the ratio column.
+/// `is_headline` decides which subjects feed the ratio column;
+/// `subject_order` pins the leading columns (unlisted subjects follow
+/// alphabetically).
 pub fn build_compare_table(
     rows: &[Row],
     ratios: &[WorkloadRatios],
     headline_label: &str,
+    subject_order: &[String],
     is_headline: impl Fn(&str) -> bool,
 ) -> CompareTable {
     let mut subjects: Vec<String> = rows
@@ -135,7 +123,7 @@ pub fn build_compare_table(
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
-    subjects.sort_by_key(|s| subject_rank(s));
+    subjects.sort_by_key(|s| subject_rank(s, subject_order));
 
     // (group, workload) -> subject -> p95 µs.
     let mut p95_by_item: BTreeMap<(String, String), BTreeMap<String, f64>> = BTreeMap::new();
@@ -160,17 +148,22 @@ pub fn build_compare_table(
                 .rows
                 .iter()
                 .filter(|r| is_headline(&r.subject))
-                .filter_map(|r| r.ratio_vs_revm_pinned)
+                .filter_map(|r| r.ratio_vs_baseline)
                 .fold(None, |acc: Option<f64>, r| Some(acc.map_or(r, |a| a.max(r))));
             CompareTableRow { item, p95_us, headline_ratio }
         })
         .collect();
 
-    CompareTable { subjects, rows: table_rows, headline_label: headline_label.to_string() }
+    CompareTable {
+        subjects,
+        rows: table_rows,
+        headline_label: headline_label.to_string(),
+        baseline_subject: subject_order.first().cloned().unwrap_or_default(),
+    }
 }
 
 /// One item of the speed bar chart: baseline plus each headline subject's
-/// relative speed (`100 × baseline_time / subject_time`; revm_pinned = 100%,
+/// relative speed (`100 × baseline_time / subject_time`; baseline = 100%,
 /// lower = more overhead — the design mock's revm=100% bar view).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpeedBarItem {
@@ -182,7 +175,12 @@ pub struct SpeedBarItem {
 /// Grouped horizontal bar chart, one group per test item (horizontal because
 /// real item names like `salt_dynamic_gas/sstore_100` are far too long for
 /// the mock's vertical layout).
-pub fn render_speed_bars(path: &Path, title: &str, items: &[SpeedBarItem]) -> anyhow::Result<()> {
+pub fn render_speed_bars(
+    path: &Path,
+    title: &str,
+    baseline_subject: &str,
+    items: &[SpeedBarItem],
+) -> anyhow::Result<()> {
     ensure_font();
     if items.is_empty() {
         anyhow::bail!("no items to render speed bars for");
@@ -197,7 +195,7 @@ pub fn render_speed_bars(path: &Path, title: &str, items: &[SpeedBarItem]) -> an
         }
     }
     let subject_color = |subject: &str| -> RGBColor {
-        if subject == "revm_pinned" {
+        if subject == baseline_subject {
             RGBColor(144, 153, 176) // neutral gray-blue baseline
         } else {
             let i = legend_subjects.iter().position(|s| s == subject).unwrap_or(0);
@@ -249,7 +247,9 @@ pub fn render_speed_bars(path: &Path, title: &str, items: &[SpeedBarItem]) -> an
             }
             String::new()
         })
-        .x_desc("relative speed, revm_pinned = 100% (lower = more overhead)")
+        .x_desc(
+            format!("relative speed, {baseline_subject} = 100% (lower = more overhead)").as_str(),
+        )
         .label_style(("sans-serif", 14))
         .axis_desc_style(("sans-serif", 16))
         .draw()
@@ -437,10 +437,11 @@ pub struct TrendSeries {
 }
 
 /// Digest trend chart: headline-row ratios over the last N commits,
-/// x = commit (short sha), y = `× vs revm_pinned`.
+/// x = commit (short sha), y = `× vs baseline`.
 pub fn render_trend(
     path: &Path,
     title: &str,
+    baseline_subject: &str,
     commit_labels: &[String],
     series: &[TrendSeries],
 ) -> anyhow::Result<()> {
@@ -484,7 +485,7 @@ pub fn render_trend(
         })
         .y_label_formatter(&|v: &f64| format!("{v:.2}×"))
         .x_desc("commit")
-        .y_desc("× vs revm_pinned")
+        .y_desc(format!("× vs {baseline_subject}").as_str())
         .label_style(("sans-serif", 13))
         .axis_desc_style(("sans-serif", 16))
         .draw()
@@ -581,17 +582,17 @@ mod tests {
                 RatioRow {
                     subject: "revm_pinned".into(),
                     mean_ns: 14000.0,
-                    ratio_vs_revm_pinned: Some(1.0),
+                    ratio_vs_baseline: Some(1.0),
                 },
                 RatioRow {
                     subject: "rex4".into(),
                     mean_ns: 20000.0,
-                    ratio_vs_revm_pinned: Some(1.43),
+                    ratio_vs_baseline: Some(1.43),
                 },
                 RatioRow {
                     subject: "rex5_salt".into(),
                     mean_ns: 28000.0,
-                    ratio_vs_revm_pinned: Some(2.0),
+                    ratio_vs_baseline: Some(2.0),
                 },
             ],
         }];
@@ -601,7 +602,10 @@ mod tests {
     #[test]
     fn test_build_compare_table_orders_subjects_and_picks_worst_headline_ratio() {
         let (rows, ratios) = sample_ratio_rows();
-        let table = build_compare_table(&rows, &ratios, "rex5", |s| s.starts_with("rex5"));
+        let table =
+            build_compare_table(&rows, &ratios, "rex5", &["revm_pinned".to_string()], |s| {
+                s.starts_with("rex5")
+            });
         assert_eq!(table.subjects, vec!["revm_pinned", "rex4", "rex5_salt"]);
         assert_eq!(table.rows.len(), 1);
         assert_eq!(table.rows[0].item, "salt_dynamic_gas/sstore_100");
@@ -628,7 +632,8 @@ mod tests {
                 bars: vec![("revm_pinned".into(), 100.0), ("rex5_oracle".into(), 143.0)],
             },
         ];
-        render_speed_bars(&path, "relative speed (revm_pinned = 100%)", &items).unwrap();
+        render_speed_bars(&path, "relative speed (revm_pinned = 100%)", "revm_pinned", &items)
+            .unwrap();
         assert_png(&path);
     }
 
@@ -703,7 +708,7 @@ mod tests {
                 alerts: Vec::new(),
             },
         ];
-        render_trend(&path, "mega-evm 10-commit trend", &commits, &series).unwrap();
+        render_trend(&path, "mega-evm 10-commit trend", "revm_pinned", &commits, &series).unwrap();
         assert_png(&path);
     }
 }

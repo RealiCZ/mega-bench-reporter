@@ -163,15 +163,14 @@ fn read_row(bench_dir: &Path) -> anyhow::Result<Option<Row>> {
 }
 
 /// One workload's ratio table: every subject's `mean_ns` and its ratio against
-/// `revm_pinned` for the same `(group, workload)`. `None` if the group/workload
-/// has no `revm_pinned` row to compare against (skipped, not an error — mirrors
-/// the existing "group missing the revm_pinned baseline row skips its ratio"
-/// behavior).
+/// the configured baseline subject for the same `(group, workload)`. `None` if
+/// the group/workload has no baseline row to compare against (skipped, not an
+/// error).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RatioRow {
     pub subject: String,
     pub mean_ns: f64,
-    pub ratio_vs_revm_pinned: Option<f64>,
+    pub ratio_vs_baseline: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -181,12 +180,10 @@ pub struct WorkloadRatios {
     pub rows: Vec<RatioRow>,
 }
 
-const BASELINE_SUBJECT: &str = "revm_pinned";
-
 /// Groups `rows` by `(group, workload)` and computes each subject's ratio
-/// against that workload's `revm_pinned` row. Ordering is deterministic
+/// against that workload's `baseline_subject` row. Ordering is deterministic
 /// (BTreeMap) so digest tables and tests aren't flaky on directory-read order.
-pub fn compute_ratios(rows: &[Row]) -> Vec<WorkloadRatios> {
+pub fn compute_ratios(rows: &[Row], baseline_subject: &str) -> Vec<WorkloadRatios> {
     let mut by_key: BTreeMap<(String, String), Vec<&Row>> = BTreeMap::new();
     for row in rows {
         by_key.entry((row.group.clone(), row.workload.clone())).or_default().push(row);
@@ -198,7 +195,7 @@ pub fn compute_ratios(rows: &[Row]) -> Vec<WorkloadRatios> {
             // downstream median/chart with inf/NaN — treat it as absent.
             let baseline_ns = group_rows
                 .iter()
-                .find(|r| r.subject == BASELINE_SUBJECT)
+                .find(|r| r.subject == baseline_subject)
                 .map(|r| r.mean_ns)
                 .filter(|ns| ns.is_finite() && *ns > 0.0);
             let mut ratio_rows: Vec<RatioRow> = group_rows
@@ -206,7 +203,7 @@ pub fn compute_ratios(rows: &[Row]) -> Vec<WorkloadRatios> {
                 .map(|r| RatioRow {
                     subject: r.subject.clone(),
                     mean_ns: r.mean_ns,
-                    ratio_vs_revm_pinned: baseline_ns
+                    ratio_vs_baseline: baseline_ns
                         .map(|b| r.mean_ns / b)
                         .filter(|ratio| ratio.is_finite()),
                 })
@@ -393,16 +390,16 @@ mod tests {
                 samples_ns: vec![28000.0],
             },
         ];
-        let ratios = compute_ratios(&rows);
+        let ratios = compute_ratios(&rows, "revm_pinned");
         assert_eq!(ratios.len(), 1);
         let wl = &ratios[0];
         assert_eq!(wl.group, "salt_dynamic_gas");
         assert_eq!(wl.workload, "sstore_100");
         assert_eq!(wl.rows.len(), 3);
         let rex5_salt = wl.rows.iter().find(|r| r.subject == "rex5_salt").unwrap();
-        assert!((rex5_salt.ratio_vs_revm_pinned.unwrap() - 2.0).abs() < 1e-9);
+        assert!((rex5_salt.ratio_vs_baseline.unwrap() - 2.0).abs() < 1e-9);
         let baseline = wl.rows.iter().find(|r| r.subject == "revm_pinned").unwrap();
-        assert!((baseline.ratio_vs_revm_pinned.unwrap() - 1.0).abs() < 1e-9);
+        assert!((baseline.ratio_vs_baseline.unwrap() - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -418,9 +415,9 @@ mod tests {
             std_dev_ns: 100.0,
             samples_ns: vec![5000.0],
         }];
-        let ratios = compute_ratios(&rows);
+        let ratios = compute_ratios(&rows, "revm_pinned");
         assert_eq!(ratios.len(), 1);
-        assert_eq!(ratios[0].rows[0].ratio_vs_revm_pinned, None);
+        assert_eq!(ratios[0].rows[0].ratio_vs_baseline, None);
     }
 
     #[test]
@@ -529,9 +526,9 @@ mod tests {
                 samples_ns: vec![1000.0],
             },
         ];
-        let ratios = compute_ratios(&rows);
+        let ratios = compute_ratios(&rows, "revm_pinned");
         for row in &ratios[0].rows {
-            assert_eq!(row.ratio_vs_revm_pinned, None, "subject {}", row.subject);
+            assert_eq!(row.ratio_vs_baseline, None, "subject {}", row.subject);
         }
     }
 

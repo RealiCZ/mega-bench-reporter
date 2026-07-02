@@ -24,7 +24,7 @@ fn main() {
     let ratio_row = |subject: &str, mean: f64, ratio: f64| RatioRow {
         subject: subject.into(),
         mean_ns: mean,
-        ratio_vs_revm_pinned: Some(ratio),
+        ratio_vs_baseline: Some(ratio),
     };
 
     let rows = vec![
@@ -55,7 +55,9 @@ fn main() {
             ],
         },
     ];
-    let table = build_compare_table(&rows, &ratios, "rex5", |s| s.starts_with("rex5"));
+    let table = build_compare_table(&rows, &ratios, "rex5", &["revm_pinned".to_string()], |s| {
+        s.starts_with("rex5")
+    });
     std::fs::write(out.join("compare_table.json"), serde_json::to_string_pretty(&table).unwrap())
         .unwrap();
 
@@ -76,6 +78,7 @@ fn main() {
     render_speed_bars(
         &out.join("compare_bars.png"),
         "mega-evm relative speed (revm_pinned = 100%)",
+        "revm_pinned",
         &items,
     )
     .unwrap();
@@ -127,7 +130,13 @@ fn main() {
             alerts: Vec::new(),
         },
     ];
-    render_trend(&out.join("trend.png"), "mega-evm 10-commit headline trend", &commits, &series)
-        .unwrap();
+    render_trend(
+        &out.join("trend.png"),
+        "mega-evm 10-commit headline trend",
+        "revm_pinned",
+        &commits,
+        &series,
+    )
+    .unwrap();
     println!("rendered to {}", out.display());
 }

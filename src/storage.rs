@@ -24,9 +24,10 @@ use time::OffsetDateTime;
 pub struct RowRecord {
     /// Mean wall-clock per call, nanoseconds.
     pub ns: f64,
-    /// `mean_ns / revm_pinned mean_ns` for the same `(group, workload)`;
-    /// `None` when the group/workload has no `revm_pinned` baseline row.
-    pub ratio_vs_revm_pinned: Option<f64>,
+    /// `mean_ns / baseline mean_ns` for the same `(group, workload)`;
+    /// `None` when the group/workload has no baseline row. The baseline
+    /// subject's name is recorded at the record level (`baseline_subject`).
+    pub ratio_vs_baseline: Option<f64>,
 }
 
 /// `raw.json` — the structured source of truth for one benched commit.
@@ -38,6 +39,8 @@ pub struct CommitRecord {
     pub date: String,
     /// `rustc --version` used for the run.
     pub rustc: String,
+    /// The subject every `ratio_vs_baseline` in this record is against.
+    pub baseline_subject: String,
     /// Bench targets that failed to compile or run this commit. Marked, not
     /// silently dropped; their rows are simply absent from `groups`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -47,8 +50,15 @@ pub struct CommitRecord {
 }
 
 impl CommitRecord {
-    pub fn new(commit: String, date: String, rustc: String) -> Self {
-        Self { commit, date, rustc, failed_targets: Vec::new(), groups: BTreeMap::new() }
+    pub fn new(commit: String, date: String, rustc: String, baseline_subject: String) -> Self {
+        Self {
+            commit,
+            date,
+            rustc,
+            baseline_subject,
+            failed_targets: Vec::new(),
+            groups: BTreeMap::new(),
+        }
     }
 
     /// Folds parsed ratio tables into `groups`.
@@ -58,7 +68,7 @@ impl CommitRecord {
             for row in &wl.rows {
                 group.insert(
                     row_name(&row.subject, &wl.workload),
-                    RowRecord { ns: row.mean_ns, ratio_vs_revm_pinned: row.ratio_vs_revm_pinned },
+                    RowRecord { ns: row.mean_ns, ratio_vs_baseline: row.ratio_vs_baseline },
                 );
             }
         }
@@ -178,6 +188,24 @@ impl RepoStore {
         Ok(all.split_off(skip))
     }
 
+    /// `latest.json` — an atomic pointer to the most recently completed run:
+    /// `{sha, commit_dir, finished_at}`. Consumers compare `sha` against their
+    /// own last-processed marker to decide whether there is anything new.
+    pub fn write_latest(&self, sha: &str, commit_dir: &Path) -> anyhow::Result<()> {
+        let latest = serde_json::json!({
+            "sha": sha,
+            "commit_dir": commit_dir,
+            "finished_at": time::OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .unwrap_or_default(),
+        });
+        let path = self.root.join("latest.json");
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(&latest)?)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
     /// Exclusive per-repo advisory lock: two invocations for the same repo
     /// share the checkout, the criterion tree, and `state.json`, so they must
     /// never run concurrently. The OS releases the lock when the returned
@@ -242,12 +270,12 @@ mod tests {
                     RatioRow {
                         subject: "revm_pinned".into(),
                         mean_ns: 14000.0,
-                        ratio_vs_revm_pinned: Some(1.0),
+                        ratio_vs_baseline: Some(1.0),
                     },
                     RatioRow {
                         subject: "rex5_salt".into(),
                         mean_ns: 28000.0,
-                        ratio_vs_revm_pinned: Some(2.0),
+                        ratio_vs_baseline: Some(2.0),
                     },
                 ],
             },
@@ -257,14 +285,15 @@ mod tests {
                 rows: vec![RatioRow {
                     subject: "rex5".into(),
                     mean_ns: 9000.0,
-                    ratio_vs_revm_pinned: None,
+                    ratio_vs_baseline: None,
                 }],
             },
         ]
     }
 
     fn record(sha: &str, date: &str) -> CommitRecord {
-        let mut r = CommitRecord::new(sha.into(), date.into(), "rustc 1.86.0".into());
+        let mut r =
+            CommitRecord::new(sha.into(), date.into(), "rustc 1.86.0".into(), "revm_pinned".into());
         r.add_ratios(&sample_ratios());
         r
     }
@@ -275,7 +304,7 @@ mod tests {
         assert_eq!(r.short_sha(), "abcdef0");
         assert_eq!(r.day().unwrap(), "20260702");
         assert_eq!(
-            r.groups["salt_dynamic_gas"]["rex5_salt/sstore_100"].ratio_vs_revm_pinned,
+            r.groups["salt_dynamic_gas"]["rex5_salt/sstore_100"].ratio_vs_baseline,
             Some(2.0)
         );
         // Bare row (no workload) keys on the subject alone.

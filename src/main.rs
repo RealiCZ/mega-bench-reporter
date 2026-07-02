@@ -1,11 +1,12 @@
-//! CLI entry point (Task 1.1). Subcommands take `(repo, sha)` or a schedule
-//! tag and print exactly one JSON document to stdout — the ready-to-post
-//! card(s) plus attachment paths. All logs go to stderr. Any agent that can
-//! "run a command, read JSON" can drive this; nothing here is BB9-specific.
+//! CLI entry point. Subcommands take `(repo, sha)` or a schedule tag and
+//! print exactly one JSON document to stdout — a summary of what the run
+//! produced and which factual events occurred. All logs go to stderr.
+//! This tool produces data only; composing/sending Lark cards is the
+//! consuming agent's job (see `skill/`).
 
 use clap::{Parser, Subcommand};
-use mega_bench_reporter::cards::RenderedCard;
 use mega_bench_reporter::config::Config;
+use mega_bench_reporter::pipeline::Event;
 use mega_bench_reporter::{flamegraph, pipeline};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -60,8 +61,9 @@ enum Command {
     },
 }
 
-/// The stdout contract: one JSON document per invocation. `cards` is empty
-/// when there is nothing to post (no regression, not a digest commit).
+/// The stdout summary: one JSON document per invocation. The same facts are
+/// durable on disk (`events.json` in the commit dir, `latest.json` at the
+/// repo's data root), so losing this output loses nothing.
 #[derive(Serialize)]
 struct CliOutput {
     repo: String,
@@ -69,9 +71,10 @@ struct CliOutput {
     /// Directory the run's artifacts were written to (commit dir or flame dir).
     output_dir: PathBuf,
     /// Bench targets that failed this run (already marked in raw.json).
-    /// Always present — a stable shape is easier on the relaying agent.
+    /// Always present — a stable shape is easier on consumers.
     failed_targets: Vec<String>,
-    cards: Vec<RenderedCard>,
+    /// Factual events from this run (regression / recovery / digest).
+    events: Vec<Event>,
 }
 
 fn main() {
@@ -105,7 +108,7 @@ fn run() -> anyhow::Result<()> {
                 sha,
                 output_dir: outcome.commit_dir,
                 failed_targets: outcome.failed_targets,
-                cards: outcome.cards,
+                events: outcome.events,
             }
         }
         Command::Flamegraph { repo, config, data_root, work_root } => {
@@ -122,8 +125,8 @@ fn run() -> anyhow::Result<()> {
                 sha: outcome.sha,
                 output_dir: outcome.flame_dir,
                 failed_targets: Vec::new(),
-                // Archive-only: the flamegraph subcommand never emits cards.
-                cards: Vec::new(),
+                // Archive-only: the flamegraph subcommand never emits events.
+                events: Vec::new(),
             }
         }
     };

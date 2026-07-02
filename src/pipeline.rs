@@ -1,29 +1,48 @@
-//! The per-commit pipeline (Task 1.2): clone/pull → `cargo bench --profile
-//! profiling` → parse criterion tree → charts → categorized storage →
-//! regression check → (every 10th commit) trend digest.
+//! The per-commit pipeline: clone/pull → `cargo bench` → parse criterion tree
+//! → charts + structured JSON → categorized storage → regression check
+//! (emitted as events, not cards) → (every Nth commit) trend digest.
+//!
+//! This tool produces DATA ONLY — raw metrics, charts, and factual events.
+//! Composing and delivering Lark cards is entirely the consuming agent's job,
+//! guided by `skill/`.
 //!
 //! Split in two layers: subprocess helpers (`ensure_checkout`, `bench_target`,
 //! …) and the pure post-bench stage ([`process_results`]) that integration
 //! tests drive against fixture criterion trees without running git or cargo.
 
-use crate::cards::{self, AlertCardParams, AlertRow, ImageRef, RenderedCard};
 use crate::charts;
 use crate::config::{RepoConfig, Settings};
 use crate::criterion_results::{self, Row};
 use crate::digest;
 use crate::state::{State, Verdict};
 use crate::storage::{CommitRecord, RepoStore};
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// A factual thing that happened during a run — the consumer decides what (if
+/// anything) to do about it. Persisted as `events.json` in the commit dir and
+/// echoed in the CLI's stdout summary.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Event {
+    /// A headline row rose past the regression threshold this run (fires once
+    /// per regression — latched until recovery).
+    Regression { row_key: String, baseline_median: f64, current: f64, pct_over: f64 },
+    /// A previously-regressed headline row dropped back under the threshold.
+    Recovery { row_key: String, baseline_median: f64, current: f64 },
+    /// A digest window completed; its data is in `dir` (repo-relative).
+    Digest { dir: String },
+}
+
 /// Everything a `run` invocation produced. Serialized (via the CLI) as the
-/// stdout JSON contract for the relaying agent.
+/// stdout JSON summary for the consuming agent.
 #[derive(Debug)]
 pub struct RunOutcome {
     pub commit_dir: PathBuf,
     pub failed_targets: Vec<String>,
-    pub cards: Vec<RenderedCard>,
+    pub events: Vec<Event>,
 }
 
 /// Commit-level metadata stored in `raw.json`.
@@ -202,25 +221,6 @@ pub fn dist_file_name(group: &str, workload: &str) -> String {
     }
 }
 
-/// Splits a full row key (`group/subject[/workload…]`, as stored in
-/// `state.json`) back into its parts using the known group prefix. The
-/// LONGEST matching group wins — group ids may themselves contain `/`, so a
-/// shorter group must not shadow a longer one (`a` vs `a/b`).
-fn split_row_key<'a>(
-    row_key: &'a str,
-    groups: &BTreeMap<String, Vec<&Row>>,
-) -> Option<(&'a str, &'a str, &'a str)> {
-    groups
-        .keys()
-        .filter(|group| row_key.starts_with(&format!("{group}/")))
-        .max_by_key(|group| group.len())
-        .map(|group| {
-            let rest = &row_key[group.len() + 1..];
-            let (subject, workload) = rest.split_once('/').unwrap_or((rest, ""));
-            (&row_key[..group.len()], subject, workload)
-        })
-}
-
 /// The whole post-bench stage for one commit:
 /// parse → record → charts → rolling-median regression check → digest batch.
 pub fn process_results(
@@ -232,7 +232,7 @@ pub fn process_results(
     failed_targets: Vec<String>,
 ) -> anyhow::Result<RunOutcome> {
     let rows = criterion_results::scan(criterion_dir)?;
-    let ratios = criterion_results::compute_ratios(&rows);
+    let ratios = criterion_results::compute_ratios(&rows, &repo.baseline_subject);
 
     // Idempotence guard: a retried run of the sha we just processed (e.g. the
     // relaying agent re-invoking after a downstream delivery failure) must not
@@ -250,18 +250,28 @@ pub fn process_results(
 
     // 1. raw.json — the structured record is written before anything that can
     //    fail cosmetically (charts), so the data survives a rendering bug.
-    let mut record = CommitRecord::new(meta.sha.clone(), meta.date.clone(), meta.rustc.clone());
+    let mut record = CommitRecord::new(
+        meta.sha.clone(),
+        meta.date.clone(),
+        meta.rustc.clone(),
+        repo.baseline_subject.clone(),
+    );
     record.add_ratios(&ratios);
     record.failed_targets = failed_targets.clone();
     let commit_dir = store.write_commit_record(&record)?;
 
-    // 2. Charts. Comparison table (test item x implementation p95 + headline
-    //    ratio column) and the revm=100% speed bars — the two views the design
-    //    doc's 对比图 asks for. Charts are derived artifacts: a rendering
-    //    failure is logged, not fatal — raw.json is already on disk and the
-    //    state update below must still happen.
-    let is_headline = |s: &str| digest::is_headline_subject(s, &repo.headline_spec);
-    let table = charts::build_compare_table(&rows, &ratios, &repo.headline_spec, is_headline);
+    // 2. Charts and structured tables. Derived artifacts: a rendering failure
+    //    is logged, not fatal — raw.json is already on disk and the state
+    //    update below must still happen.
+    let is_headline = |s: &str| repo.is_headline(s);
+    let subject_order = repo.subject_order();
+    let table = charts::build_compare_table(
+        &rows,
+        &ratios,
+        &repo.headline_label(),
+        &subject_order,
+        is_headline,
+    );
     if !table.rows.is_empty() {
         // Emitted as structured JSON — the relaying agent builds its own
         // native table from it instead of embedding a rendered image.
@@ -280,15 +290,13 @@ pub fn process_results(
                 .rows
                 .iter()
                 .filter(|r| is_headline(&r.subject))
-                .filter_map(|r| {
-                    r.ratio_vs_revm_pinned.map(|ratio| (r.subject.clone(), 100.0 / ratio))
-                })
+                .filter_map(|r| r.ratio_vs_baseline.map(|ratio| (r.subject.clone(), 100.0 / ratio)))
                 .collect();
             if bars.is_empty() {
                 return None;
             }
             bars.sort_by(|a, b| a.0.cmp(&b.0));
-            bars.insert(0, ("revm_pinned".to_string(), 100.0));
+            bars.insert(0, (repo.baseline_subject.clone(), 100.0));
             let item = if wl.workload.is_empty() {
                 wl.group.clone()
             } else {
@@ -300,7 +308,13 @@ pub fn process_results(
     if !speed_items.is_empty() {
         if let Err(e) = charts::render_speed_bars(
             &commit_dir.join("compare_bars.png"),
-            &format!("{} relative speed @ {} (revm_pinned = 100%)", repo.name, record.short_sha()),
+            &format!(
+                "{} relative speed @ {} ({} = 100%)",
+                repo.name,
+                record.short_sha(),
+                repo.baseline_subject
+            ),
+            &repo.baseline_subject,
             &speed_items,
         ) {
             eprintln!("speed bars chart failed (continuing): {e:#}");
@@ -317,7 +331,7 @@ pub fn process_results(
             continue;
         }
         // Baseline first (stable color), then the rest alphabetically.
-        wl_rows.sort_by_key(|r| (r.subject != "revm_pinned", r.subject.clone()));
+        wl_rows.sort_by_key(|r| (r.subject != repo.baseline_subject, r.subject.clone()));
         let title = if workload.is_empty() { group.clone() } else { format!("{group}/{workload}") };
         if let Err(e) = charts::render_violin(
             &commit_dir.join(dist_file_name(&group, &workload)),
@@ -331,12 +345,11 @@ pub fn process_results(
     // 3. Regression check against the rolling median. Every row with a ratio
     //    is recorded (history is cheap); only headline-family rows alert.
     //    Skipped entirely on a re-run of the same sha (see guard above).
-    let mut regressed = Vec::new();
-    let mut recovered = Vec::new();
+    let mut events: Vec<Event> = Vec::new();
     if !is_rerun {
         for wl in &ratios {
             for ratio_row in &wl.rows {
-                let Some(ratio) = ratio_row.ratio_vs_revm_pinned else { continue };
+                let Some(ratio) = ratio_row.ratio_vs_baseline else { continue };
                 let key = criterion_results::row_key(&wl.group, &ratio_row.subject, &wl.workload);
                 let verdict = state.check_and_record(
                     &key,
@@ -344,15 +357,24 @@ pub fn process_results(
                     settings.regression_threshold_pct,
                     settings.rolling_window,
                 );
-                if !digest::is_headline_subject(&ratio_row.subject, &repo.headline_spec) {
+                if !is_headline(&ratio_row.subject) {
                     continue;
                 }
                 match verdict {
-                    Verdict::NewRegression { median, current, .. } => {
-                        regressed.push(AlertRow { row_key: key, median, current });
+                    Verdict::NewRegression { median, current, pct_over } => {
+                        events.push(Event::Regression {
+                            row_key: key,
+                            baseline_median: median,
+                            current,
+                            pct_over,
+                        });
                     }
                     Verdict::Recovered { median, current } => {
-                        recovered.push(AlertRow { row_key: key, median, current });
+                        events.push(Event::Recovery {
+                            row_key: key,
+                            baseline_median: median,
+                            current,
+                        });
                     }
                     Verdict::FirstRun | Verdict::Ok | Verdict::StillRegressed => {}
                 }
@@ -360,44 +382,10 @@ pub fn process_results(
         }
     }
 
-    let mut cards: Vec<RenderedCard> = Vec::new();
-    if !regressed.is_empty() || !recovered.is_empty() {
-        let mut groups_map: BTreeMap<String, Vec<&Row>> = BTreeMap::new();
-        for row in &rows {
-            groups_map.entry(row.group.clone()).or_default().push(row);
-        }
-        // Attach the comparison chart plus the distribution plots of the
-        // affected rows (capped to keep the card readable).
-        let mut images = Vec::new();
-        let bars_png = commit_dir.join("compare_bars.png");
-        if bars_png.is_file() {
-            images.push(ImageRef::new(bars_png, "相对速度（revm=100%）"));
-        }
-        for alert_row in regressed.iter().chain(&recovered).take(3) {
-            if let Some((group, _subject, workload)) =
-                split_row_key(&alert_row.row_key, &groups_map)
-            {
-                let dist = commit_dir.join(dist_file_name(group, workload));
-                if dist.is_file() && !images.iter().any(|i| i.path == dist) {
-                    images.push(ImageRef::new(dist, format!("{} 分布", alert_row.row_key)));
-                }
-            }
-        }
-        cards.push(cards::render_alert_card(&AlertCardParams {
-            repo_name: &repo.name,
-            github: &repo.github,
-            sha: &meta.sha,
-            regressed,
-            recovered,
-            images,
-            threshold_pct: settings.regression_threshold_pct,
-            window: settings.rolling_window,
-        })?);
-    }
-
-    // 4. Digest batching: every DIGEST_BATCH_SIZE commits, roll up a trend
-    //    card. A failed digest build is reported on stderr but doesn't fail
-    //    the run — the counter is left un-reset so the next commit retries.
+    // 4. Digest batching: every digest_batch_size commits, roll up the window
+    //    into digests/ and emit a digest event. A failed digest build is
+    //    reported on stderr but doesn't fail the run — the counter is left
+    //    un-reset so the next commit retries.
     if !is_rerun && state.bump_digest_counter(settings.digest_batch_size) {
         let records: Vec<CommitRecord> = store
             .load_recent_commit_records(settings.digest_batch_size as usize)?
@@ -406,41 +394,42 @@ pub fn process_results(
             .collect();
         match digest::build_digest(
             store,
-            &repo.github,
             &repo.name,
-            &repo.headline_spec,
+            &repo.headline_label(),
+            is_headline,
             settings.regression_threshold_pct,
             &records,
         ) {
             Ok(outcome) => {
-                cards.push(outcome.card);
+                let dir = outcome
+                    .dir
+                    .strip_prefix(store.root())
+                    .unwrap_or(&outcome.dir)
+                    .to_string_lossy()
+                    .into_owned();
+                events.push(Event::Digest { dir });
                 state.reset_digest_counter();
             }
             Err(e) => eprintln!("digest build failed (will retry next commit): {e:#}"),
         }
     }
 
-    // Durable copy of this run's cards, written BEFORE the state is saved:
-    // if the invoker loses the stdout (dropped connection, crashed relay),
-    // the cards are recoverable from disk instead of being gone forever —
-    // a retry of the same sha is idempotent and deliberately does NOT
-    // re-emit cards, so stdout alone would be a single chance. A crash
-    // between this write and the state save leaves last_seen_sha untouched,
-    // so the retry redoes the run and rewrites this file consistently.
+    // Durable copy of this run's events, written BEFORE the state is saved:
+    // the consumer can always recover the facts from disk even if it lost the
+    // stdout. A retry of the same sha deliberately does NOT overwrite this
+    // file (its event list would be empty). A crash between this write and
+    // the state save leaves last_seen_sha untouched, so the retry redoes the
+    // run and rewrites this file consistently.
     if !is_rerun {
-        let persisted = serde_json::json!({
-            "sha": meta.sha,
-            "date": meta.date,
-            "failed_targets": failed_targets,
-            "cards": cards,
-        });
-        std::fs::write(commit_dir.join("cards.json"), serde_json::to_string_pretty(&persisted)?)?;
+        std::fs::write(commit_dir.join("events.json"), serde_json::to_string_pretty(&events)?)?;
     }
 
     state.last_seen_sha = Some(meta.sha.clone());
     state.save(&store.state_path())?;
+    // Discovery pointer: always points at the newest completed run.
+    store.write_latest(&meta.sha, &commit_dir)?;
 
-    Ok(RunOutcome { commit_dir, failed_targets, cards })
+    Ok(RunOutcome { commit_dir, failed_targets, events })
 }
 
 // ---------------------------------------------------------------------------
@@ -489,7 +478,12 @@ pub fn run_commit_pipeline(
         }
         // Preserve the original run's failed-target markers instead of
         // silently erasing them from the regenerated record.
-        let record = CommitRecord::new(sha.to_string(), meta.date.clone(), meta.rustc.clone());
+        let record = CommitRecord::new(
+            sha.to_string(),
+            meta.date.clone(),
+            meta.rustc.clone(),
+            repo.baseline_subject.clone(),
+        );
         if let Ok(dir) = store.commit_dir(&record) {
             if let Ok(text) = std::fs::read_to_string(dir.join("raw.json")) {
                 if let Ok(existing) = serde_json::from_str::<CommitRecord>(&text) {

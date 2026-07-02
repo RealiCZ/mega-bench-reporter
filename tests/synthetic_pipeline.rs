@@ -3,8 +3,8 @@
 //! cargo, no benches — and asserts the storage layout, the simulated
 //! regression/recovery alert cards, and the 10-commit digest card.
 
-use mega_bench_reporter::cards::CardKind;
 use mega_bench_reporter::config::Config;
+use mega_bench_reporter::pipeline::Event;
 use mega_bench_reporter::pipeline::{process_results, CommitMeta};
 use mega_bench_reporter::state::State;
 use mega_bench_reporter::storage::RepoStore;
@@ -17,7 +17,8 @@ github = "megaeth-labs/mega-evm"
 branch = "main"
 clone_url = "https://github.com/megaeth-labs/mega-evm.git"
 bench_targets = ["mega_bench"]
-headline_spec = "rex5"
+baseline_subject = "revm_pinned"
+headline_subjects = ["rex5", "rex5_*"]
 "#;
 
 /// Writes one criterion benchmark dir (`<group>/<dir>/new/*.json`).
@@ -95,15 +96,17 @@ fn test_synthetic_ten_commit_run_with_regression_and_recovery() {
         process_results(repo, &settings, &store, &scratch, &meta(i), vec![]).unwrap()
     };
 
-    // Runs 0–4: stable baseline. No cards at all.
+    // Runs 0–4: stable baseline. No events at all.
     for i in 0..5 {
         let outcome = run(i, 2.0);
-        assert!(
-            outcome.cards.is_empty(),
-            "run {i} should be quiet, got {:?}",
-            outcome.cards.iter().map(|c| c.kind).collect::<Vec<_>>()
-        );
+        assert!(outcome.events.is_empty(), "run {i} should be quiet, got {:?}", outcome.events);
     }
+
+    // Discovery pointer follows the newest completed run.
+    let latest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(store.root().join("latest.json")).unwrap())
+            .unwrap();
+    assert_eq!(latest["sha"], meta(4).sha.as_str());
 
     // Storage layout after the stable runs.
     let commit_dirs: Vec<_> = std::fs::read_dir(store.root().join("commits"))
@@ -118,7 +121,7 @@ fn test_synthetic_ten_commit_run_with_regression_and_recovery() {
         &std::fs::read_to_string(first_dir.join("compare_table.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(table["headline_label"], "rex5");
+    assert_eq!(table["headline_label"], "rex5, rex5_*");
     assert!(table["subjects"].as_array().unwrap().iter().any(|s| s == "revm_pinned"));
     let salt_row = table["rows"]
         .as_array()
@@ -135,63 +138,62 @@ fn test_synthetic_ten_commit_run_with_regression_and_recovery() {
     let raw: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(first_dir.join("raw.json")).unwrap())
             .unwrap();
+    assert_eq!(raw["baseline_subject"], "revm_pinned");
+    assert_eq!(raw["groups"]["salt_dynamic_gas"]["rex5_salt/sstore_100"]["ratio_vs_baseline"], 2.0);
     assert_eq!(
-        raw["groups"]["salt_dynamic_gas"]["rex5_salt/sstore_100"]["ratio_vs_revm_pinned"],
-        2.0
-    );
-    assert_eq!(
-        raw["groups"]["oracle_real_data"]["rex5_oracle/oracle_sload_50"]["ratio_vs_revm_pinned"],
+        raw["groups"]["oracle_real_data"]["rex5_oracle/oracle_sload_50"]["ratio_vs_baseline"],
         serde_json::Value::Null
     );
 
-    // Run 5: the headline row jumps 15% over the rolling median → alert card.
+    // Run 5: the headline row jumps 15% over the rolling median → regression
+    // event (a fact — composing an alert card from it is the consumer's job).
     let outcome = run(5, 2.3);
-    assert_eq!(outcome.cards.len(), 1);
-    let alert = &outcome.cards[0];
-    assert_eq!(alert.kind, CardKind::RegressionAlert);
-    let text = serde_json::to_string(&alert.card).unwrap();
-    assert!(text.contains("salt_dynamic_gas/rex5_salt/sstore_100"));
-    assert!(text.contains("+15.0%"));
-    for attachment in &alert.attachments {
-        assert!(attachment.is_file(), "attachment missing: {}", attachment.display());
+    assert_eq!(outcome.events.len(), 1);
+    match &outcome.events[0] {
+        Event::Regression { row_key, baseline_median, current, pct_over } => {
+            assert_eq!(row_key, "salt_dynamic_gas/rex5_salt/sstore_100");
+            assert!((baseline_median - 2.0).abs() < 1e-9);
+            assert!((current - 2.3).abs() < 1e-9);
+            assert!((pct_over - 15.0).abs() < 0.1);
+        }
+        other => panic!("expected Regression, got {other:?}"),
     }
 
-    // The cards are persisted durably in the commit dir (recovery path for a
+    // The events are persisted durably in the commit dir (recovery path for a
     // lost stdout), and a retry of the same sha must NOT clobber them with
-    // its empty card list.
+    // its empty event list.
     let alert_dir = store.root().join("commits").join(format!("20260702-{}", &meta(5).sha[..7]));
     let read_persisted = || -> serde_json::Value {
-        serde_json::from_str(&std::fs::read_to_string(alert_dir.join("cards.json")).unwrap())
+        serde_json::from_str(&std::fs::read_to_string(alert_dir.join("events.json")).unwrap())
             .unwrap()
     };
-    assert_eq!(read_persisted()["cards"][0]["kind"], "regression_alert");
+    assert_eq!(read_persisted()[0]["type"], "regression");
     let retry = run(5, 2.3);
-    assert!(retry.cards.is_empty(), "idempotent rerun emits no cards on stdout");
+    assert!(retry.events.is_empty(), "idempotent rerun emits no events on stdout");
     assert_eq!(
-        read_persisted()["cards"][0]["kind"],
-        "regression_alert",
-        "rerun must not overwrite the persisted cards"
+        read_persisted()[0]["type"],
+        "regression",
+        "rerun must not overwrite the persisted events"
     );
 
-    // Run 6: still elevated — no re-alert (latched).
+    // Run 6: still elevated — no new event (latched).
     let outcome = run(6, 2.32);
-    assert!(outcome.cards.is_empty(), "still-regressed must not re-alert");
+    assert!(outcome.events.is_empty(), "still-regressed must not re-fire");
 
-    // Run 7: back to baseline → recovery card.
+    // Run 7: back to baseline → recovery event.
     let outcome = run(7, 2.0);
-    assert_eq!(outcome.cards.len(), 1);
-    assert_eq!(outcome.cards[0].kind, CardKind::Recovery);
+    assert_eq!(outcome.events.len(), 1);
+    assert!(matches!(outcome.events[0], Event::Recovery { .. }));
 
-    // Runs 8–9: quiet again; run 9 is the 10th commit → trend digest card.
+    // Runs 8–9: quiet again; run 9 is the 10th commit → digest event.
     let outcome = run(8, 2.0);
-    assert!(outcome.cards.is_empty());
+    assert!(outcome.events.is_empty());
     let outcome = run(9, 2.0);
-    assert_eq!(outcome.cards.len(), 1);
-    let digest = &outcome.cards[0];
-    assert_eq!(digest.kind, CardKind::TrendDigest);
-    let digest_text = serde_json::to_string(&digest.card).unwrap();
-    assert!(digest_text.contains("10"));
-    assert!(digest_text.contains("${image:trend.png}"));
+    assert_eq!(outcome.events.len(), 1);
+    match &outcome.events[0] {
+        Event::Digest { dir } => assert!(dir.starts_with("digests/"), "digest dir: {dir}"),
+        other => panic!("expected Digest, got {other:?}"),
+    }
 
     // Digest artifacts on disk.
     let digest_dirs: Vec<_> = std::fs::read_dir(store.root().join("digests"))
@@ -236,10 +238,10 @@ fn test_rerunning_same_sha_does_not_double_count() {
     process_results(repo, &settings, &store, &scratch, &meta(0), vec![]).unwrap();
     let state_after_first = State::load(&store.state_path()).unwrap();
 
-    // Same sha again (e.g. a relaying-agent retry): artifacts refresh, but the
+    // Same sha again (e.g. a consumer retry): artifacts refresh, but the
     // rolling window and digest counter must not move.
     let outcome = process_results(repo, &settings, &store, &scratch, &meta(0), vec![]).unwrap();
-    assert!(outcome.cards.is_empty());
+    assert!(outcome.events.is_empty());
     let state_after_rerun = State::load(&store.state_path()).unwrap();
     assert_eq!(state_after_first, state_after_rerun);
     assert_eq!(

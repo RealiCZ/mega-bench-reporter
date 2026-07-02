@@ -11,7 +11,16 @@ pub struct RepoConfig {
     pub branch: String,
     pub clone_url: String,
     pub bench_targets: Vec<String>,
-    pub headline_spec: String,
+    /// The subject every ratio is computed against (e.g. `revm_pinned`).
+    pub baseline_subject: String,
+    /// Subject patterns that headline this repo: exact names or trailing-`*`
+    /// prefixes (e.g. `["rex5", "rex5_*"]`). Headline rows drive regression
+    /// events, the ratio column, and digests.
+    pub headline_subjects: Vec<String>,
+    /// Optional display order for subjects in the comparison table; unlisted
+    /// subjects follow alphabetically. Defaults to baseline-first.
+    #[serde(default)]
+    pub subject_order: Option<Vec<String>>,
     /// Cargo package the bench targets live in; defaults to `name`.
     #[serde(default)]
     pub package: Option<String>,
@@ -28,6 +37,25 @@ pub struct RepoConfig {
 impl RepoConfig {
     pub fn package(&self) -> &str {
         self.package.as_deref().unwrap_or(&self.name)
+    }
+
+    /// Does `subject` match any headline pattern (exact, or trailing-`*`
+    /// prefix)?
+    pub fn is_headline(&self, subject: &str) -> bool {
+        self.headline_subjects.iter().any(|pattern| match pattern.strip_suffix('*') {
+            Some(prefix) => subject.starts_with(prefix),
+            None => subject == pattern,
+        })
+    }
+
+    /// Human-readable label for the headline family, e.g. `rex5, rex5_*`.
+    pub fn headline_label(&self) -> String {
+        self.headline_subjects.join(", ")
+    }
+
+    /// Resolved subject display order: configured list, or baseline-first.
+    pub fn subject_order(&self) -> Vec<String> {
+        self.subject_order.clone().unwrap_or_else(|| vec![self.baseline_subject.clone()])
     }
 }
 
@@ -171,7 +199,8 @@ github = "megaeth-labs/mega-evm"
 branch = "main"
 clone_url = "git@github.com:megaeth-labs/mega-evm.git"
 bench_targets = ["transact", "revm_bench", "mega_bench", "comp_cost", "block_bench"]
-headline_spec = "rex5"
+baseline_subject = "revm_pinned"
+headline_subjects = ["rex5", "rex5_*"]
 "#;
 
     #[test]
@@ -181,8 +210,13 @@ headline_spec = "rex5"
         let repo = cfg.repo("mega-evm").expect("found");
         assert_eq!(repo.github, "megaeth-labs/mega-evm");
         assert_eq!(repo.branch, "main");
-        assert_eq!(repo.headline_spec, "rex5");
+        assert_eq!(repo.baseline_subject, "revm_pinned");
         assert_eq!(repo.bench_targets.len(), 5);
+        assert!(repo.is_headline("rex5"));
+        assert!(repo.is_headline("rex5_salt"));
+        assert!(!repo.is_headline("rex4"));
+        assert!(!repo.is_headline("revm_pinned"));
+        assert_eq!(repo.subject_order(), vec!["revm_pinned".to_string()]);
     }
 
     #[test]
@@ -190,7 +224,7 @@ headline_spec = "rex5"
         let two = format!(
             "{SAMPLE}\n[[repos]]\nname = \"mega-reth\"\ngithub = \"megaeth-labs/mega-reth\"\n\
              branch = \"main\"\nclone_url = \"git@github.com:megaeth-labs/mega-reth.git\"\n\
-             bench_targets = []\nheadline_spec = \"rex5\"\n"
+             bench_targets = []\nbaseline_subject = \"reth_pinned\"\nheadline_subjects = [\"mega\"]\n"
         );
         let cfg = Config::parse(&two).expect("parses");
         assert_eq!(cfg.repos.len(), 2);
