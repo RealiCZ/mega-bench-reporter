@@ -106,9 +106,9 @@ share them, post as file messages.
 
 ## 5. Gold-standard filled example (verified end-to-end run)
 
-From the reporter's own verified regression test (minibench): `events.json` held one
-event — `row_key: "quick_group/rex5/noop"`, `baseline_median: 1.51`, `current: 2.03`,
-`pct_over: 34.4`.
+From the reporter's own verified end-to-end run (minibench, sha `cef2a4d`):
+`events.json` held one event — `row_key: "quick_group/rex5/noop"`,
+`baseline_median: 1.486`, `current: 2.060`, `pct_over: 38.6`.
 
 ```json
 {
@@ -116,12 +116,12 @@ event — `row_key: "quick_group/rex5/noop"`, `baseline_median: 1.51`, `current:
   "config": { "wide_screen_mode": true },
   "header": {
     "template": "red",
-    "title":    { "tag": "plain_text", "content": "⚠️ minibench 基准回归 @ 6859366" },
+    "title":    { "tag": "plain_text", "content": "⚠️ minibench 基准回归 @ cef2a4d" },
     "subtitle": { "tag": "plain_text", "content": "1 行超过阈值" }
   },
   "body": { "elements": [
     { "tag": "markdown",
-      "content": "**提交** [6859366](https://github.com/example/minibench/commit/6859366...)\n🔴 `quick_group/rex5/noop` 1.51× → 2.03× (**+34.4%** vs 滚动中位数)" },
+      "content": "**提交** [cef2a4d](https://github.com/example/minibench/commit/cef2a4d50b89ad795ad347d9c4aef15d3a36dd94)\n🔴 `quick_group/rex5/noop` 1.49× → 2.06× (**+38.6%** vs 滚动中位数)" },
     { "tag": "hr" },
     { "tag": "img", "img_key": "{{image_key from uploading compare_bars.png}}",
       "alt": { "tag": "plain_text", "content": "relative speed vs baseline" } }
