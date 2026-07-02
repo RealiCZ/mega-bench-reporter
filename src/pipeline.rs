@@ -110,7 +110,7 @@ const GIT_RETRY_BACKOFF_SECS: &[u64] = &[5, 15];
 /// A `credential.helper` snippet that feeds `$GITHUB_TOKEN` from the process
 /// environment to git for https remotes — the token never appears in argv, and
 /// without the env var set git falls back to anonymous access (fine for public
-/// repos). BB9 populates the env var from its own credential when needed (D7).
+/// repos). The invoking agent populates the env var when needed.
 const TOKEN_CREDENTIAL_HELPER: &str =
     "!f() { echo username=x-access-token; echo \"password=${GITHUB_TOKEN}\"; }; f";
 

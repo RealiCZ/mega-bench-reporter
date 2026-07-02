@@ -1,4 +1,4 @@
-//! Chart rendering with `plotters` (D5): comparison bar chart, violin
+//! Chart rendering with `plotters`: comparison bar chart, violin
 //! (distribution) plot, and the digest trend chart — all PNG, all using an
 //! embedded font so the binary has no system font/fontconfig dependency.
 //!
@@ -74,7 +74,7 @@ pub fn p95(samples: &[f64]) -> f64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
-/// The comparison table (the design doc's table view): one row per test item,
+/// The comparison table: one row per test item,
 /// one column per implementation, last column = the headline family's time
 /// ratio vs the baseline subject. Emitted as `compare_table.json` for the relaying
 /// agent to assemble into a native Lark table.
@@ -164,7 +164,7 @@ pub fn build_compare_table(
 
 /// One item of the speed bar chart: baseline plus each headline subject's
 /// relative speed (`100 × baseline_time / subject_time`; baseline = 100%,
-/// lower = more overhead — the design mock's revm=100% bar view).
+/// lower = more overhead).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpeedBarItem {
     pub item: String,

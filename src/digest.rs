@@ -1,4 +1,4 @@
-//! 10-commit trend digest (Task 1.5): rolls the last `DIGEST_BATCH_SIZE`
+//! Trend digest: rolls the last `digest_batch_size`
 //! commit records into `digests/<day>-<range>/{summary.json, trend.png}` plus
 //! a ready-to-post trend-digest card.
 

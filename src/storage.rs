@@ -1,4 +1,4 @@
-//! Categorized local storage under `<data-root>/<repo>/` (Task 1.3):
+//! Categorized local storage under `<data-root>/<repo>/`:
 //!
 //! ```text
 //! <data-root>/<repo>/

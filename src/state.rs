@@ -1,6 +1,6 @@
 //! `state.json`: rolling-median baseline per row, the "currently regressed"
 //! latch (so an alert fires once on the state *change*, not every run while a
-//! regression is active — Task 1.4), and the digest-batch counter (Task 1.5).
+//! regression is active), and the digest-batch counter.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};

@@ -1,4 +1,4 @@
-//! Task 1.7's synthetic dry run: drives the post-bench stage
+//! Synthetic dry run: drives the post-bench stage
 //! (`pipeline::process_results`) with fixture criterion trees — no git, no
 //! cargo, no benches — and asserts the storage layout, the simulated
 //! regression/recovery alert cards, and the 10-commit digest card.

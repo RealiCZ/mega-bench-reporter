@@ -1,5 +1,6 @@
-//! Repo-config list (D8): which repos are tracked, what to bench, headline spec.
-//! One entry today (mega-evm); the list shape is what leaves room for more.
+//! Repo-config list: which repos are tracked, what to bench, and how their
+//! subjects are interpreted. One entry today (mega-evm); the list shape is
+//! what leaves room for more.
 
 use serde::Deserialize;
 use std::path::Path;
@@ -117,7 +118,7 @@ impl Settings {
     }
 }
 
-/// Nightly flame-graph settings (D6). The workload set is config, not code, so
+/// Nightly flame-graph settings. The workload set is config, not code, so
 /// adjusting which benchmark ids get profiled is a config change.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct FlamegraphConfig {

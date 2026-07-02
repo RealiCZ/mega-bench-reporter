@@ -1,4 +1,4 @@
-//! Nightly flame-graph pipeline (Task 2.1): build the `profiling`-profile
+//! Nightly flame-graph pipeline: build the `profiling`-profile
 //! bench binary, sample each configured workload with the platform's profiler
 //! — `perf record`/`perf script` on Linux, the built-in `sample` tool on
 //! macOS (1 ms interval, same rate as the original samply-based
