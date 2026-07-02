@@ -1,6 +1,6 @@
-//! Throwaway visual check: renders one of each chart into OUT_DIR arg.
+//! Throwaway visual check: renders one of each chart type into OUT_DIR arg.
 use mega_bench_reporter::charts::*;
-use mega_bench_reporter::criterion_results::Row;
+use mega_bench_reporter::criterion_results::{RatioRow, Row, WorkloadRatios};
 use std::path::Path;
 
 fn main() {
@@ -8,19 +8,10 @@ fn main() {
     let out = Path::new(&out);
     std::fs::create_dir_all(out).unwrap();
 
-    let bars = vec![
-        CompareBar { label: "salt_dynamic_gas/sstore_100 · rex5_salt".into(), ratio: 2.07 },
-        CompareBar { label: "salt_dynamic_gas/sstore_100 · rex5".into(), ratio: 1.72 },
-        CompareBar { label: "oracle_real_data/oracle_sload_50 · rex5".into(), ratio: 0.97 },
-        CompareBar { label: "empty_transaction · rex5".into(), ratio: 1.18 },
-        CompareBar { label: "comp_cost/modexp · rex5".into(), ratio: 1.04 },
-    ];
-    render_compare_bar(&out.join("compare.png"), "mega-evm vs revm @ abc1234", &bars).unwrap();
-
-    let mk = |subject: &str, center: f64| Row {
-        group: "salt_dynamic_gas".into(),
+    let mk_row = |group: &str, subject: &str, workload: &str, center: f64| Row {
+        group: group.into(),
         subject: subject.into(),
-        workload: "sstore_100".into(),
+        workload: workload.into(),
         mean_ns: center,
         std_dev_ns: center * 0.015,
         samples_ns: (0..100)
@@ -30,11 +21,74 @@ fn main() {
             })
             .collect(),
     };
-    let rows = [mk("revm_pinned", 13970.0), mk("rex5", 24040.0), mk("rex5_salt", 28870.0)];
+    let ratio_row = |subject: &str, mean: f64, ratio: f64| RatioRow {
+        subject: subject.into(),
+        mean_ns: mean,
+        ratio_vs_revm_pinned: Some(ratio),
+    };
+
+    let rows = vec![
+        mk_row("salt_dynamic_gas", "revm_pinned", "sstore_100", 13970.0),
+        mk_row("salt_dynamic_gas", "rex4", "sstore_100", 20000.0),
+        mk_row("salt_dynamic_gas", "rex5", "sstore_100", 24040.0),
+        mk_row("salt_dynamic_gas", "rex5_salt", "sstore_100", 28870.0),
+        mk_row("oracle_real_data", "revm_pinned", "oracle_sload_50", 5000.0),
+        mk_row("oracle_real_data", "rex5_oracle", "oracle_sload_50", 3500.0),
+    ];
+    let ratios = vec![
+        WorkloadRatios {
+            group: "salt_dynamic_gas".into(),
+            workload: "sstore_100".into(),
+            rows: vec![
+                ratio_row("revm_pinned", 13970.0, 1.0),
+                ratio_row("rex4", 20000.0, 1.43),
+                ratio_row("rex5", 24040.0, 1.72),
+                ratio_row("rex5_salt", 28870.0, 2.07),
+            ],
+        },
+        WorkloadRatios {
+            group: "oracle_real_data".into(),
+            workload: "oracle_sload_50".into(),
+            rows: vec![
+                ratio_row("revm_pinned", 5000.0, 1.0),
+                ratio_row("rex5_oracle", 3500.0, 0.7),
+            ],
+        },
+    ];
+    let table = build_compare_table(&rows, &ratios, "rex5", |s| s.starts_with("rex5"));
+    render_compare_table(&out.join("compare_table.png"), "mega-evm vs revm @ abc1234", &table)
+        .unwrap();
+
+    let items = vec![
+        SpeedBarItem {
+            item: "salt_dynamic_gas/sstore_100".into(),
+            bars: vec![
+                ("revm_pinned".into(), 100.0),
+                ("rex5".into(), 58.0),
+                ("rex5_salt".into(), 48.0),
+            ],
+        },
+        SpeedBarItem {
+            item: "oracle_real_data/oracle_sload_50".into(),
+            bars: vec![("revm_pinned".into(), 100.0), ("rex5_oracle".into(), 143.0)],
+        },
+    ];
+    render_speed_bars(
+        &out.join("compare_bars.png"),
+        "mega-evm relative speed (revm_pinned = 100%)",
+        &items,
+    )
+    .unwrap();
+
+    let violin_rows = [
+        mk_row("salt_dynamic_gas", "revm_pinned", "sstore_100", 13970.0),
+        mk_row("salt_dynamic_gas", "rex5", "sstore_100", 24040.0),
+        mk_row("salt_dynamic_gas", "rex5_salt", "sstore_100", 28870.0),
+    ];
     render_violin(
         &out.join("dist.png"),
         "salt_dynamic_gas/sstore_100 — per-call distribution",
-        &rows.iter().collect::<Vec<_>>(),
+        &violin_rows.iter().collect::<Vec<_>>(),
     )
     .unwrap();
 
@@ -54,6 +108,7 @@ fn main() {
                 Some(2.04),
                 Some(2.02),
             ],
+            alerts: (0..10).map(|i| i == 4).collect(),
         },
         TrendSeries {
             label: "empty_transaction/rex5".into(),
@@ -69,6 +124,7 @@ fn main() {
                 Some(1.17),
                 Some(1.18),
             ],
+            alerts: Vec::new(),
         },
     ];
     render_trend(&out.join("trend.png"), "mega-evm 10-commit headline trend", &commits, &series)

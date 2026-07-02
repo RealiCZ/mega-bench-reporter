@@ -114,6 +114,28 @@ pub fn build_summary(records: &[CommitRecord], headline_spec: &str) -> DigestSum
     }
 }
 
+/// Marks the points of a ratio series that sit more than `threshold_pct`
+/// above the median of the points before them — the trend chart's red rings.
+/// A window-local approximation of the live check (which uses the rolling
+/// state), good enough for a visual cue.
+fn alert_markers(ratios: &[Option<f64>], threshold_pct: f64) -> Vec<bool> {
+    let mut seen: Vec<f64> = Vec::new();
+    ratios
+        .iter()
+        .map(|r| {
+            let Some(r) = *r else { return false };
+            let alert = match median_of(&seen) {
+                Some(m) if m > 0.0 => (r - m) / m * 100.0 > threshold_pct,
+                _ => false,
+            };
+            if !alert {
+                seen.push(r);
+            }
+            alert
+        })
+        .collect()
+}
+
 pub struct DigestOutcome {
     pub dir: PathBuf,
     pub card: RenderedCard,
@@ -126,6 +148,7 @@ pub fn build_digest(
     github: &str,
     repo_name: &str,
     headline_spec: &str,
+    regression_threshold_pct: f64,
     records: &[CommitRecord],
 ) -> anyhow::Result<DigestOutcome> {
     if records.is_empty() {
@@ -151,7 +174,11 @@ pub fn build_digest(
         .rows
         .iter()
         .take(TREND_MAX_SERIES)
-        .map(|row| TrendSeries { label: row.row_key.clone(), ratios: row.ratios.clone() })
+        .map(|row| TrendSeries {
+            label: row.row_key.clone(),
+            ratios: row.ratios.clone(),
+            alerts: alert_markers(&row.ratios, regression_threshold_pct),
+        })
         .collect();
     let trend_path = dir.join("trend.png");
     charts::render_trend(
@@ -276,7 +303,8 @@ mod tests {
         let store = RepoStore::new(tmp.path(), "mega-evm");
         let records = window();
         let outcome =
-            build_digest(&store, "megaeth-labs/mega-evm", "mega-evm", "rex5", &records).unwrap();
+            build_digest(&store, "megaeth-labs/mega-evm", "mega-evm", "rex5", 10.0, &records)
+                .unwrap();
 
         // Directory named after the last commit's day + the sha range.
         assert_eq!(
@@ -303,6 +331,6 @@ mod tests {
             &[("g", "revm_pinned/w", 1.0, Some(1.0))],
             &[],
         )];
-        assert!(build_digest(&store, "o/r", "r", "rex5", &records).is_err());
+        assert!(build_digest(&store, "o/r", "r", "rex5", 10.0, &records).is_err());
     }
 }

@@ -9,6 +9,7 @@
 use crate::criterion_results::{Row, WorkloadRatios};
 use plotters::prelude::*;
 use plotters::style::register_font;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Once;
 
@@ -47,112 +48,6 @@ fn map_err<E: std::fmt::Display>(e: E) -> anyhow::Error {
     anyhow::anyhow!("chart rendering: {e}")
 }
 
-/// One bar of the comparison chart: a workload's ratio for one subject.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CompareBar {
-    /// Bar label, e.g. `salt_dynamic_gas/sstore_100 · rex5_salt`.
-    pub label: String,
-    /// `× vs revm_pinned` (time ratio — higher is slower).
-    pub ratio: f64,
-}
-
-/// Flattens ratio tables into bars for `subjects` (typically the headline-spec
-/// family, e.g. `rex5`, `rex5_salt`, …). Baseline rows (ratio 1.0) and rows
-/// without a baseline are omitted.
-pub fn compare_bars(ratios: &[WorkloadRatios], subjects: &[String]) -> Vec<CompareBar> {
-    let mut bars = Vec::new();
-    for wl in ratios {
-        for row in &wl.rows {
-            if !subjects.contains(&row.subject) {
-                continue;
-            }
-            let Some(ratio) = row.ratio_vs_revm_pinned else { continue };
-            let workload = if wl.workload.is_empty() {
-                wl.group.clone()
-            } else {
-                format!("{}/{}", wl.group, wl.workload)
-            };
-            bars.push(CompareBar { label: format!("{workload} · {}", row.subject), ratio });
-        }
-    }
-    bars
-}
-
-/// Horizontal bar chart: one bar per `(workload, subject)`, x = `× vs
-/// revm_pinned`, with a reference line at 1.0×.
-pub fn render_compare_bar(path: &Path, title: &str, bars: &[CompareBar]) -> anyhow::Result<()> {
-    ensure_font();
-    if bars.is_empty() {
-        anyhow::bail!("no bars to render (no rows with a revm_pinned baseline?)");
-    }
-    let n = bars.len();
-    let height = (80 + n * 30).clamp(240, 1600) as u32;
-    let root = BitMapBackend::new(path, (1100, height)).into_drawing_area();
-    root.fill(&WHITE).map_err(map_err)?;
-
-    let max_ratio = bars.iter().map(|b| b.ratio).fold(1.0_f64, f64::max);
-    let x_max = max_ratio * 1.18;
-    let labels: Vec<&str> = bars.iter().map(|b| b.label.as_str()).collect();
-
-    let mut chart = ChartBuilder::on(&root)
-        .caption(title, ("sans-serif", 22))
-        .margin(15)
-        .x_label_area_size(45)
-        .y_label_area_size(360)
-        .build_cartesian_2d(0.0..x_max, -0.6..(n as f64 - 0.4))
-        .map_err(map_err)?;
-
-    chart
-        .configure_mesh()
-        .disable_y_mesh()
-        .light_line_style(TRANSPARENT)
-        .bold_line_style(BLACK.mix(0.12))
-        .y_labels(n * 2 + 1)
-        .y_label_formatter(&|v: &f64| integer_tick_label(*v, &labels))
-        .x_desc("× vs revm_pinned (time — lower is better)")
-        .label_style(("sans-serif", 15))
-        .axis_desc_style(("sans-serif", 16))
-        .draw()
-        .map_err(map_err)?;
-
-    // Bars are drawn top-down: bar 0 at the top row.
-    let y_of = |i: usize| (n - 1 - i) as f64;
-    chart
-        .draw_series(bars.iter().enumerate().map(|(i, bar)| {
-            let color = if bar.ratio <= 1.05 {
-                RGBColor(44, 160, 44) // at or under baseline: green
-            } else if bar.ratio <= 2.0 {
-                RGBColor(255, 165, 0) // moderate overhead: amber
-            } else {
-                RGBColor(214, 39, 40) // heavy overhead: red
-            };
-            Rectangle::new(
-                [(0.0, y_of(i) - 0.35), (bar.ratio, y_of(i) + 0.35)],
-                color.mix(0.85).filled(),
-            )
-        }))
-        .map_err(map_err)?;
-    chart
-        .draw_series(bars.iter().enumerate().map(|(i, bar)| {
-            Text::new(
-                format!("{:.2}×", bar.ratio),
-                (bar.ratio + x_max * 0.01, y_of(i) - 0.12),
-                ("sans-serif", 14).into_font().color(&BLACK),
-            )
-        }))
-        .map_err(map_err)?;
-    // 1.0× (parity with revm_pinned) reference line.
-    chart
-        .draw_series(LineSeries::new(
-            [(1.0, -0.6), (1.0, n as f64 - 0.4)],
-            BLACK.mix(0.45).stroke_width(1),
-        ))
-        .map_err(map_err)?;
-
-    root.present().map_err(map_err)?;
-    Ok(())
-}
-
 /// Maps near-integer tick positions to `labels[n - 1 - i]` (top-down order),
 /// everything else to an empty label.
 fn integer_tick_label(v: f64, labels: &[&str]) -> String {
@@ -166,6 +61,410 @@ fn integer_tick_label(v: f64, labels: &[&str]) -> String {
     } else {
         String::new()
     }
+}
+
+/// p95 of a sample set (nearest-rank).
+pub fn p95(samples: &[f64]) -> f64 {
+    if samples.is_empty() {
+        return f64::NAN;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((sorted.len() as f64 * 0.95).ceil() as usize).saturating_sub(1);
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+/// The comparison table (the Lark doc's 对比图 table view): one row per test
+/// item, one column per implementation, last column = the headline family's
+/// time ratio vs `revm_pinned`, color-banded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompareTable {
+    /// Column order: baselines first, then specs, then variants.
+    pub subjects: Vec<String>,
+    pub rows: Vec<CompareTableRow>,
+    /// Label of the ratio column, e.g. `rex5`.
+    pub headline_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompareTableRow {
+    /// `group[/workload]`.
+    pub item: String,
+    /// p95 per-call µs per subject column (`None` = subject absent).
+    pub p95_us: Vec<Option<f64>>,
+    /// Worst (max) headline-family time ratio vs revm_pinned for this item.
+    pub headline_ratio: Option<f64>,
+}
+
+/// Fixed display order for well-known subjects; everything else goes after,
+/// alphabetically.
+const SUBJECT_ORDER: &[&str] = &[
+    "revm_pinned",
+    "revm_latest",
+    "op_revm_pinned",
+    "op_revm_latest",
+    "equivalence",
+    "mini_rex",
+    "rex",
+    "rex1",
+    "rex2",
+    "rex3",
+    "rex4",
+    "rex5",
+];
+
+fn subject_rank(subject: &str) -> (usize, String) {
+    match SUBJECT_ORDER.iter().position(|s| *s == subject) {
+        Some(i) => (i, String::new()),
+        None => (SUBJECT_ORDER.len(), subject.to_string()),
+    }
+}
+
+/// Assembles the comparison table from parsed rows + ratio tables.
+/// `is_headline` decides which subjects feed the ratio column.
+pub fn build_compare_table(
+    rows: &[Row],
+    ratios: &[WorkloadRatios],
+    headline_label: &str,
+    is_headline: impl Fn(&str) -> bool,
+) -> CompareTable {
+    let mut subjects: Vec<String> = rows
+        .iter()
+        .map(|r| r.subject.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    subjects.sort_by_key(|s| subject_rank(s));
+
+    // (group, workload) -> subject -> p95 µs.
+    let mut p95_by_item: BTreeMap<(String, String), BTreeMap<String, f64>> = BTreeMap::new();
+    for row in rows {
+        p95_by_item
+            .entry((row.group.clone(), row.workload.clone()))
+            .or_default()
+            .insert(row.subject.clone(), p95(&row.samples_ns) / 1000.0);
+    }
+
+    let table_rows = ratios
+        .iter()
+        .map(|wl| {
+            let item = if wl.workload.is_empty() {
+                wl.group.clone()
+            } else {
+                format!("{}/{}", wl.group, wl.workload)
+            };
+            let p95_map = p95_by_item.get(&(wl.group.clone(), wl.workload.clone()));
+            let p95_us = subjects.iter().map(|s| p95_map.and_then(|m| m.get(s)).copied()).collect();
+            let headline_ratio = wl
+                .rows
+                .iter()
+                .filter(|r| is_headline(&r.subject))
+                .filter_map(|r| r.ratio_vs_revm_pinned)
+                .fold(None, |acc: Option<f64>, r| Some(acc.map_or(r, |a| a.max(r))));
+            CompareTableRow { item, p95_us, headline_ratio }
+        })
+        .collect();
+
+    CompareTable { subjects, rows: table_rows, headline_label: headline_label.to_string() }
+}
+
+/// Ratio-column color bands — the time-ratio equivalents of the design mock's
+/// speedup bands (green ≥0.93×, amber 0.80–0.93×, red <0.80×).
+fn ratio_band_color(ratio: f64) -> RGBColor {
+    if ratio <= 1.075 {
+        RGBColor(212, 237, 218) // light green
+    } else if ratio <= 1.25 {
+        RGBColor(255, 243, 205) // light amber
+    } else {
+        RGBColor(248, 215, 218) // light red
+    }
+}
+
+fn format_p95(us: f64) -> String {
+    if us >= 100.0 {
+        format!("{us:.0}")
+    } else if us >= 10.0 {
+        format!("{us:.1}")
+    } else {
+        format!("{us:.2}")
+    }
+}
+
+/// Renders the comparison table as a PNG (drawn cell by cell — plotters has no
+/// table primitive).
+pub fn render_compare_table(path: &Path, title: &str, table: &CompareTable) -> anyhow::Result<()> {
+    ensure_font();
+    if table.rows.is_empty() {
+        anyhow::bail!("no rows to render a comparison table for");
+    }
+    let item_col_w: i32 = (table.rows.iter().map(|r| r.item.len()).max().unwrap_or(10) as i32 * 8
+        + 24)
+        .clamp(180, 420);
+    let subj_col_w: i32 = 106;
+    let ratio_col_w: i32 = 96;
+    let row_h: i32 = 30;
+    let header_h: i32 = 36;
+    let title_h: i32 = 40;
+    let legend_h: i32 = 34;
+    let margin: i32 = 12;
+
+    let width =
+        (margin * 2 + item_col_w + subj_col_w * table.subjects.len() as i32 + ratio_col_w) as u32;
+    let height =
+        (margin * 2 + title_h + header_h + row_h * table.rows.len() as i32 + legend_h) as u32;
+    let root = BitMapBackend::new(path, (width, height)).into_drawing_area();
+    root.fill(&WHITE).map_err(map_err)?;
+
+    root.draw(&Text::new(
+        title.to_string(),
+        (margin, margin),
+        ("sans-serif", 22).into_font().color(&BLACK),
+    ))
+    .map_err(map_err)?;
+
+    let top = margin + title_h;
+    let subj_x0 = margin + item_col_w;
+    let ratio_x = subj_x0 + subj_col_w * table.subjects.len() as i32;
+
+    // Header band.
+    root.draw(&Rectangle::new(
+        [(margin, top), (ratio_x + ratio_col_w, top + header_h)],
+        RGBColor(238, 241, 246).filled(),
+    ))
+    .map_err(map_err)?;
+    root.draw(&Text::new(
+        "test item (p95 µs/call — lower is faster)".to_string(),
+        (margin + 8, top + 10),
+        ("sans-serif", 15).into_font().color(&BLACK),
+    ))
+    .map_err(map_err)?;
+    for (i, subject) in table.subjects.iter().enumerate() {
+        root.draw(&Text::new(
+            subject.clone(),
+            (subj_x0 + subj_col_w * i as i32 + 6, top + 10),
+            ("sans-serif", 14).into_font().color(&BLACK),
+        ))
+        .map_err(map_err)?;
+    }
+    root.draw(&Text::new(
+        format!("{} ×", table.headline_label),
+        (ratio_x + 8, top + 10),
+        ("sans-serif", 15).into_font().color(&BLACK),
+    ))
+    .map_err(map_err)?;
+
+    for (r, row) in table.rows.iter().enumerate() {
+        let y0 = top + header_h + row_h * r as i32;
+        if r % 2 == 1 {
+            root.draw(&Rectangle::new(
+                [(margin, y0), (ratio_x + ratio_col_w, y0 + row_h)],
+                RGBColor(248, 249, 251).filled(),
+            ))
+            .map_err(map_err)?;
+        }
+        root.draw(&Text::new(
+            row.item.clone(),
+            (margin + 8, y0 + 8),
+            ("sans-serif", 14).into_font().color(&BLACK),
+        ))
+        .map_err(map_err)?;
+        for (c, value) in row.p95_us.iter().enumerate() {
+            let cell = value.map(format_p95).unwrap_or_else(|| "–".to_string());
+            root.draw(&Text::new(
+                cell,
+                (subj_x0 + subj_col_w * c as i32 + 6, y0 + 8),
+                ("sans-serif", 14).into_font().color(&RGBColor(60, 64, 72)),
+            ))
+            .map_err(map_err)?;
+        }
+        match row.headline_ratio {
+            Some(ratio) => {
+                root.draw(&Rectangle::new(
+                    [(ratio_x, y0), (ratio_x + ratio_col_w, y0 + row_h)],
+                    ratio_band_color(ratio).filled(),
+                ))
+                .map_err(map_err)?;
+                root.draw(&Text::new(
+                    format!("{ratio:.2}×"),
+                    (ratio_x + 8, y0 + 8),
+                    ("sans-serif", 15).into_font().color(&BLACK),
+                ))
+                .map_err(map_err)?;
+            }
+            None => {
+                root.draw(&Text::new(
+                    "–".to_string(),
+                    (ratio_x + 8, y0 + 8),
+                    ("sans-serif", 15).into_font().color(&RGBColor(60, 64, 72)),
+                ))
+                .map_err(map_err)?;
+            }
+        }
+    }
+
+    let legend_y = top + header_h + row_h * table.rows.len() as i32 + 8;
+    for (i, (color, label)) in [
+        (RGBColor(212, 237, 218), "<=1.075x"),
+        (RGBColor(255, 243, 205), "<=1.25x"),
+        (RGBColor(248, 215, 218), ">1.25x"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let x = margin + i as i32 * 130;
+        root.draw(&Rectangle::new([(x, legend_y), (x + 16, legend_y + 16)], color.filled()))
+            .map_err(map_err)?;
+        root.draw(&Text::new(
+            label.to_string(),
+            (x + 22, legend_y + 2),
+            ("sans-serif", 13).into_font().color(&BLACK),
+        ))
+        .map_err(map_err)?;
+    }
+    root.draw(&Text::new(
+        format!("{} time ratio vs revm_pinned (lower is better)", table.headline_label),
+        (margin + 3 * 130, legend_y + 2),
+        ("sans-serif", 13).into_font().color(&BLACK),
+    ))
+    .map_err(map_err)?;
+
+    root.present().map_err(map_err)?;
+    Ok(())
+}
+
+/// One item of the speed bar chart: baseline plus each headline subject's
+/// relative speed (`100 × baseline_time / subject_time`; revm_pinned = 100%,
+/// lower = more overhead — the design mock's revm=100% bar view).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpeedBarItem {
+    pub item: String,
+    /// `(subject, percent)`, baseline first.
+    pub bars: Vec<(String, f64)>,
+}
+
+/// Grouped horizontal bar chart, one group per test item (horizontal because
+/// real item names like `salt_dynamic_gas/sstore_100` are far too long for
+/// the mock's vertical layout).
+pub fn render_speed_bars(path: &Path, title: &str, items: &[SpeedBarItem]) -> anyhow::Result<()> {
+    ensure_font();
+    if items.is_empty() {
+        anyhow::bail!("no items to render speed bars for");
+    }
+    // Legend order = subject order of first appearance.
+    let mut legend_subjects: Vec<String> = Vec::new();
+    for item in items {
+        for (subject, _) in &item.bars {
+            if !legend_subjects.contains(subject) {
+                legend_subjects.push(subject.clone());
+            }
+        }
+    }
+    let subject_color = |subject: &str| -> RGBColor {
+        if subject == "revm_pinned" {
+            RGBColor(144, 153, 176) // neutral gray-blue baseline
+        } else {
+            let i = legend_subjects.iter().position(|s| s == subject).unwrap_or(0);
+            series_color(i)
+        }
+    };
+
+    let band = legend_subjects.len().max(1) as f64 + 1.0; // bars + gap per item
+    let total = items.len() as f64 * band - 1.0;
+    // Reserve empty bands below the last item so the legend box never overlaps
+    // a bar; scale the x range so >100% bars keep room for their value labels.
+    let legend_space = legend_subjects.len() as f64 + 1.2;
+    let max_percent =
+        items.iter().flat_map(|i| i.bars.iter().map(|(_, p)| *p)).fold(100.0_f64, f64::max);
+    let x_max = (max_percent * 1.15).max(118.0);
+    let height =
+        (170 + (items.len() + 1) * (legend_subjects.len() * 22 + 14)).clamp(300, 2200) as u32;
+    let root = BitMapBackend::new(path, (1100, height)).into_drawing_area();
+    root.fill(&WHITE).map_err(map_err)?;
+
+    let labels: Vec<&str> = items.iter().map(|i| i.item.as_str()).collect();
+    let mut chart = ChartBuilder::on(&root)
+        .caption(title, ("sans-serif", 22))
+        .margin(15)
+        .x_label_area_size(45)
+        .y_label_area_size(340)
+        .build_cartesian_2d(0.0..x_max, (-0.6 - legend_space)..(total + 0.6))
+        .map_err(map_err)?;
+
+    let band_center = |i: usize| -> f64 {
+        // Item 0 at the top.
+        let base = (items.len() - 1 - i) as f64 * band;
+        base + (legend_subjects.len() as f64 - 1.0) / 2.0
+    };
+    chart
+        .configure_mesh()
+        .disable_y_mesh()
+        .light_line_style(TRANSPARENT)
+        .bold_line_style(BLACK.mix(0.12))
+        .y_labels(((total + legend_space) as usize) * 2 + 3)
+        .y_label_formatter(&|v: &f64| {
+            for (i, label) in labels.iter().enumerate() {
+                if (v - band_center(i)).abs() <= 0.26 {
+                    return label.to_string();
+                }
+            }
+            String::new()
+        })
+        .x_desc("relative speed, revm_pinned = 100% (lower = more overhead)")
+        .label_style(("sans-serif", 14))
+        .axis_desc_style(("sans-serif", 16))
+        .draw()
+        .map_err(map_err)?;
+
+    for (i, item) in items.iter().enumerate() {
+        let base = (items.len() - 1 - i) as f64 * band;
+        for (b, (subject, percent)) in item.bars.iter().enumerate() {
+            // Bar 0 (baseline) at the top of the band.
+            let y = base + (legend_subjects.len() - 1 - b.min(legend_subjects.len() - 1)) as f64;
+            let color = subject_color(subject);
+            chart
+                .draw_series(std::iter::once(Rectangle::new(
+                    [(0.0, y - 0.42), (*percent, y + 0.42)],
+                    color.mix(0.9).filled(),
+                )))
+                .map_err(map_err)?;
+            chart
+                .draw_series(std::iter::once(Text::new(
+                    format!("{percent:.0}%"),
+                    (percent + 1.2, y - 0.18),
+                    ("sans-serif", 13).into_font().color(&BLACK),
+                )))
+                .map_err(map_err)?;
+        }
+    }
+
+    // 100% reference line.
+    chart
+        .draw_series(LineSeries::new(
+            [(100.0, -0.6 - legend_space), (100.0, total + 0.6)],
+            BLACK.mix(0.45).stroke_width(1),
+        ))
+        .map_err(map_err)?;
+
+    // Legend entries (empty series, label only).
+    for subject in &legend_subjects {
+        let color = subject_color(subject);
+        chart
+            .draw_series(LineSeries::new(std::iter::empty::<(f64, f64)>(), color.filled()))
+            .map_err(map_err)?
+            .label(subject.clone())
+            .legend(move |(x, y)| Rectangle::new([(x, y - 5), (x + 10, y + 5)], color.filled()));
+    }
+    chart
+        .configure_series_labels()
+        .position(SeriesLabelPosition::LowerLeft)
+        .background_style(WHITE.mix(0.85))
+        .border_style(BLACK.mix(0.4))
+        .label_font(("sans-serif", 14))
+        .draw()
+        .map_err(map_err)?;
+
+    root.present().map_err(map_err)?;
+    Ok(())
 }
 
 /// Gaussian KDE over `grid` with Silverman's rule-of-thumb bandwidth — the
@@ -291,6 +590,10 @@ pub fn render_violin(path: &Path, title: &str, rows: &[&Row]) -> anyhow::Result<
 pub struct TrendSeries {
     pub label: String,
     pub ratios: Vec<Option<f64>>,
+    /// Same length as `ratios` (or empty = no markers): `true` marks a point
+    /// that tripped the regression threshold vs the window's prior median —
+    /// drawn as a red ring on the trend chart.
+    pub alerts: Vec<bool>,
 }
 
 /// Digest trend chart: headline-row ratios over the last N commits,
@@ -367,6 +670,21 @@ pub fn render_trend(
         chart
             .draw_series(points.iter().map(|(x, y)| Circle::new((*x, *y), 3, color.filled())))
             .map_err(map_err)?;
+        // Red ring on the points that tripped the regression threshold.
+        let alert_points: Vec<(f64, f64)> = s
+            .ratios
+            .iter()
+            .enumerate()
+            .filter(|(x, _)| s.alerts.get(*x).copied().unwrap_or(false))
+            .filter_map(|(x, r)| r.map(|r| (x as f64, r)))
+            .collect();
+        chart
+            .draw_series(
+                alert_points
+                    .iter()
+                    .map(|(x, y)| Circle::new((*x, *y), 7, RGBColor(214, 39, 40).stroke_width(2))),
+            )
+            .map_err(map_err)?;
     }
 
     chart
@@ -399,7 +717,23 @@ mod tests {
     }
 
     #[test]
-    fn test_compare_bars_selects_headline_subjects() {
+    fn test_p95_nearest_rank() {
+        let samples: Vec<f64> = (1..=100).map(|i| i as f64).collect();
+        assert_eq!(p95(&samples), 95.0);
+        assert_eq!(p95(&[7.0]), 7.0);
+        assert!(p95(&[]).is_nan());
+    }
+
+    fn sample_ratio_rows() -> (Vec<Row>, Vec<WorkloadRatios>) {
+        let mk = |subject: &str, mean: f64| Row {
+            group: "salt_dynamic_gas".into(),
+            subject: subject.into(),
+            workload: "sstore_100".into(),
+            mean_ns: mean,
+            std_dev_ns: mean * 0.01,
+            samples_ns: fake_samples(mean, 50),
+        };
+        let rows = vec![mk("revm_pinned", 14000.0), mk("rex4", 20000.0), mk("rex5_salt", 28000.0)];
         let ratios = vec![WorkloadRatios {
             group: "salt_dynamic_gas".into(),
             workload: "sstore_100".into(),
@@ -421,29 +755,51 @@ mod tests {
                 },
             ],
         }];
-        let bars = compare_bars(&ratios, &["rex5".to_string(), "rex5_salt".to_string()]);
-        assert_eq!(bars.len(), 1);
-        assert_eq!(bars[0].label, "salt_dynamic_gas/sstore_100 · rex5_salt");
-        assert!((bars[0].ratio - 2.0).abs() < 1e-9);
+        (rows, ratios)
     }
 
     #[test]
-    fn test_render_compare_bar_writes_png() {
+    fn test_build_compare_table_orders_subjects_and_picks_worst_headline_ratio() {
+        let (rows, ratios) = sample_ratio_rows();
+        let table = build_compare_table(&rows, &ratios, "rex5", |s| s.starts_with("rex5"));
+        assert_eq!(table.subjects, vec!["revm_pinned", "rex4", "rex5_salt"]);
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[0].item, "salt_dynamic_gas/sstore_100");
+        // Worst headline ratio (only rex5_salt matches the filter).
+        assert_eq!(table.rows[0].headline_ratio, Some(2.0));
+        assert!(table.rows[0].p95_us.iter().all(|v| v.is_some()));
+    }
+
+    #[test]
+    fn test_render_compare_table_writes_png() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("compare.png");
-        let bars = vec![
-            CompareBar { label: "salt_dynamic_gas/sstore_100 · rex5_salt".into(), ratio: 2.07 },
-            CompareBar { label: "empty_transaction · rex5".into(), ratio: 1.18 },
-            CompareBar { label: "oracle_real_data/oracle_sload_50 · rex5".into(), ratio: 0.97 },
-        ];
-        render_compare_bar(&path, "mega-evm vs revm @ abc1234", &bars).unwrap();
+        let path = tmp.path().join("compare_table.png");
+        let (rows, ratios) = sample_ratio_rows();
+        let table = build_compare_table(&rows, &ratios, "rex5", |s| s.starts_with("rex5"));
+        render_compare_table(&path, "mega-evm vs revm @ abc1234", &table).unwrap();
         assert_png(&path);
     }
 
     #[test]
-    fn test_render_compare_bar_empty_errors() {
+    fn test_render_speed_bars_writes_png() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(render_compare_bar(&tmp.path().join("x.png"), "t", &[]).is_err());
+        let path = tmp.path().join("compare_bars.png");
+        let items = vec![
+            SpeedBarItem {
+                item: "salt_dynamic_gas/sstore_100".into(),
+                bars: vec![
+                    ("revm_pinned".into(), 100.0),
+                    ("rex5".into(), 57.0),
+                    ("rex5_salt".into(), 48.0),
+                ],
+            },
+            SpeedBarItem {
+                item: "oracle_real_data/oracle_sload_50".into(),
+                bars: vec![("revm_pinned".into(), 100.0), ("rex5_oracle".into(), 143.0)],
+            },
+        ];
+        render_speed_bars(&path, "relative speed (revm_pinned = 100%)", &items).unwrap();
+        assert_png(&path);
     }
 
     #[test]
@@ -508,11 +864,13 @@ mod tests {
             TrendSeries {
                 label: "salt_dynamic_gas/rex5_salt/sstore_100".into(),
                 ratios: (0..10).map(|i| Some(2.0 + 0.02 * i as f64)).collect(),
+                alerts: (0..10).map(|i| i == 6).collect(),
             },
             TrendSeries {
                 label: "empty_transaction/rex5".into(),
                 // One missing commit (row absent that run) must not break the line.
                 ratios: (0..10).map(|i| if i == 4 { None } else { Some(1.2) }).collect(),
+                alerts: Vec::new(),
             },
         ];
         render_trend(&path, "mega-evm 10-commit trend", &commits, &series).unwrap();

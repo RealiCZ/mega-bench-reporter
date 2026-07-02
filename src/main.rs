@@ -28,6 +28,10 @@ enum Command {
         /// Full commit sha to bench.
         #[arg(long)]
         sha: String,
+        /// Reuse the checkout's existing criterion tree instead of benching
+        /// (dev/regen mode, e.g. re-rendering charts).
+        #[arg(long)]
+        skip_bench: bool,
         /// Path to the repos config file.
         #[arg(long, default_value = "repos.toml")]
         config: PathBuf,
@@ -38,7 +42,7 @@ enum Command {
         #[arg(long)]
         work_root: Option<PathBuf>,
     },
-    /// Nightly flame-graph pipeline (Linux only: shells out to `perf`).
+    /// Nightly flame-graph pipeline (Linux: `perf`; macOS: `sample`).
     Flamegraph {
         /// Repo name — must match a `[[repos]]` entry in the config.
         #[arg(long)]
@@ -86,12 +90,15 @@ fn canonical_data_root(data_root: PathBuf) -> anyhow::Result<PathBuf> {
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let output = match cli.command {
-        Command::Run { repo, sha, config, data_root, work_root } => {
+        Command::Run { repo, sha, skip_bench, config, data_root, work_root } => {
             let cfg = Config::load(&config)?;
             let repo_cfg = cfg.repo(&repo)?;
+            let settings = cfg.settings(repo_cfg);
             let data_root = canonical_data_root(data_root)?;
             let work_root = work_root.unwrap_or_else(|| data_root.join("_checkouts"));
-            let outcome = pipeline::run_commit_pipeline(repo_cfg, &sha, &data_root, &work_root)?;
+            let outcome = pipeline::run_commit_pipeline(
+                repo_cfg, &settings, &sha, &data_root, &work_root, skip_bench,
+            )?;
             CliOutput {
                 repo,
                 sha,

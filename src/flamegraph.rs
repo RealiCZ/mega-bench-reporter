@@ -1,12 +1,13 @@
 //! Nightly flame-graph pipeline (Task 2.1): build the `profiling`-profile
-//! bench binary, run each configured workload under `perf record` (Linux
-//! only — `perf` is shelled out, it is not a Rust library), then fold and
-//! render via the `inferno` crate as a library (no `inferno-*` CLI binaries to
-//! install on the server).
+//! bench binary, sample each configured workload with the platform's profiler
+//! — `perf record`/`perf script` on Linux, the built-in `sample` tool on
+//! macOS (1 ms interval, same rate as the original samply-based
+//! proof-of-concept) — then fold and render via the `inferno` crate as a
+//! library (no `inferno-*` CLI binaries to install anywhere).
 //!
-//! Layering mirrors `pipeline.rs`: subprocess helpers (cargo/perf) are thin
-//! and Linux-bound; folding, differential folding, and SVG rendering are pure
-//! library calls, testable anywhere.
+//! Layering mirrors `pipeline.rs`: subprocess helpers (cargo/perf/sample) are
+//! thin and OS-bound; folding, demangling, differential folding, and SVG
+//! rendering are pure library calls, testable anywhere.
 
 use crate::cards::{self, FlamegraphCardParams, RenderedCard};
 use crate::config::{FlameWorkloadPair, RepoConfig};
@@ -47,6 +48,56 @@ pub fn collapse_perf_script(perf_script: impl std::io::BufRead) -> anyhow::Resul
         .collapse(perf_script, &mut folded)
         .map_err(|e| anyhow::anyhow!("collapsing perf script output: {e}"))?;
     Ok(folded)
+}
+
+/// Folds macOS `sample` call-tree output into collapsed stack lines.
+pub fn collapse_sample_output(sample_output: impl std::io::BufRead) -> anyhow::Result<Vec<u8>> {
+    use inferno::collapse::sample::{Folder, Options};
+    use inferno::collapse::Collapse;
+    let mut folded = Vec::new();
+    Folder::from(Options::default())
+        .collapse(sample_output, &mut folded)
+        .map_err(|e| anyhow::anyhow!("collapsing sample output: {e}"))?;
+    Ok(folded)
+}
+
+/// Demangles every Rust symbol in collapsed stack lines (`f1;f2 count`) so
+/// flame graphs show `mega_evm::interpreter::run` instead of `_ZN8mega_evm…`.
+/// Frames that aren't mangled pass through untouched.
+pub fn demangle_folded(folded: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(folded);
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let Some((stack, count)) = line.rsplit_once(' ') else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        let frames: Vec<String> = stack
+            .split(';')
+            .map(|frame| {
+                // macOS sample frames come as `module`symbol`; demangle the
+                // symbol part and keep the module prefix.
+                let (prefix, symbol) = match frame.rsplit_once('`') {
+                    Some((module, symbol)) => (Some(module), symbol),
+                    None => (None, frame),
+                };
+                match rustc_demangle::try_demangle(symbol) {
+                    // `{:#}` drops the trailing hash disambiguator.
+                    Ok(demangled) => match prefix {
+                        Some(module) => format!("{module}`{demangled:#}"),
+                        None => format!("{demangled:#}"),
+                    },
+                    Err(_) => frame.to_string(),
+                }
+            })
+            .collect();
+        out.push_str(&frames.join(";"));
+        out.push(' ');
+        out.push_str(count);
+        out.push('\n');
+    }
+    out.into_bytes()
 }
 
 /// Renders collapsed stacks into a flame-graph SVG.
@@ -168,10 +219,25 @@ fn verify_benchmark_id(bench_bin: &Path, benchmark_id: &str) -> anyhow::Result<(
     Ok(())
 }
 
-/// Profiles one benchmark id under `perf record` (criterion `--profile-time`
-/// mode, `--exact` so variant rows like `.../x8` are not swept in) and returns
-/// the collapsed stacks.
+/// Profiles one benchmark id (criterion `--profile-time` mode, `--exact` so
+/// variant rows like `.../x8` are not swept in) with the platform profiler and
+/// returns demangled collapsed stacks.
 fn profile_workload(
+    bench_bin: &Path,
+    benchmark_id: &str,
+    profile_secs: u64,
+    scratch: &Path,
+) -> anyhow::Result<Vec<u8>> {
+    let folded = match std::env::consts::OS {
+        "linux" => profile_with_perf(bench_bin, benchmark_id, profile_secs, scratch)?,
+        "macos" => profile_with_sample(bench_bin, benchmark_id, profile_secs, scratch)?,
+        other => anyhow::bail!("flamegraph profiling is not supported on {other}"),
+    };
+    Ok(demangle_folded(&folded))
+}
+
+/// Linux: `perf record` + `perf script` + inferno perf collapsing.
+fn profile_with_perf(
     bench_bin: &Path,
     benchmark_id: &str,
     profile_secs: u64,
@@ -228,6 +294,71 @@ fn profile_workload(
         anyhow::bail!("perf script failed for '{benchmark_id}' ({status})");
     }
     std::fs::remove_file(&perf_data).ok();
+    Ok(folded)
+}
+
+/// macOS: run the bench and attach the built-in `sample` profiler to it
+/// (default 1 ms interval; no root, no extra tooling), then inferno's sample
+/// collapsing. Criterion's ~3 s warm-up runs the same workload, so sampling
+/// from process start still measures the intended code.
+fn profile_with_sample(
+    bench_bin: &Path,
+    benchmark_id: &str,
+    profile_secs: u64,
+    scratch: &Path,
+) -> anyhow::Result<Vec<u8>> {
+    let sample_file = scratch.join(format!("{}.sample.txt", workload_file_stem(benchmark_id)));
+    let mut bench_child = Command::new(bench_bin)
+        .args(["--bench", "--exact", "--profile-time"])
+        .arg(profile_secs.to_string())
+        .arg(benchmark_id)
+        // Our stdout is reserved for the final JSON document.
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn {}: {e}", bench_bin.display()))?;
+
+    let mut sample_child = match Command::new("sample")
+        .arg(bench_child.id().to_string())
+        .arg(profile_secs.to_string())
+        .args(["-mayDie", "-f"])
+        .arg(&sample_file)
+        // `sample` chats on stdout; keep it off our JSON channel.
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = bench_child.kill();
+            let _ = bench_child.wait();
+            anyhow::bail!("failed to spawn macOS sample profiler: {e}");
+        }
+    };
+
+    // Drain the bench's stdout to stderr while the profiler runs alongside.
+    let mut bench_stdout = bench_child.stdout.take().expect("stdout piped");
+    let copied = std::io::copy(&mut bench_stdout, &mut std::io::stderr());
+    if copied.is_err() {
+        let _ = bench_child.kill();
+        let _ = bench_child.wait();
+        let _ = sample_child.kill();
+        let _ = sample_child.wait();
+        copied?;
+    }
+    let bench_status = bench_child.wait()?;
+    let sample_status = sample_child.wait()?;
+    if !bench_status.success() {
+        anyhow::bail!("bench run failed for '{benchmark_id}' ({bench_status})");
+    }
+    if !sample_status.success() {
+        anyhow::bail!("sample profiler failed for '{benchmark_id}' ({sample_status})");
+    }
+
+    let file = std::fs::File::open(&sample_file)
+        .map_err(|e| anyhow::anyhow!("sample output {} missing: {e}", sample_file.display()))?;
+    let folded = collapse_sample_output(BufReader::new(file))?;
+    std::fs::remove_file(&sample_file).ok();
     Ok(folded)
 }
 
@@ -361,6 +492,42 @@ mega_bench 1234 100.000002: 250000 cycles:\n\
             text.contains("mega_bench;main;evm_run 500000"),
             "unexpected folded output: {text}"
         );
+    }
+
+    #[test]
+    fn test_collapse_sample_output_fixture() {
+        // Minimal macOS `sample` call-tree output.
+        let output = "\
+Analysis of sampling mega_bench (pid 12345) every 1 millisecond
+Process:         mega_bench [12345]
+
+Call graph:
+    2000 Thread_260629
+      2000 start  (in dyld) + 1903  [0x1806c3f3c]
+        2000 main  (in mega_bench) + 40  [0x1000e0]
+          1500 evm_run  (in mega_bench) + 100  [0x100120]
+            500 sstore  (in mega_bench) + 4  [0x100200]
+
+Total number in stack (recursive counted multiple, when >=5):
+
+Sort by top of stack, same collapsed (when >= 5):
+        evm_run  (in mega_bench)        1000
+";
+        let folded = collapse_sample_output(Cursor::new(output.as_bytes())).unwrap();
+        let text = String::from_utf8(folded).unwrap();
+        // inferno folds sample frames as module`function, rooted at the thread.
+        assert!(
+            text.contains("mega_bench`main;mega_bench`evm_run;mega_bench`sstore 500"),
+            "unexpected folded output: {text}"
+        );
+    }
+
+    #[test]
+    fn test_demangle_folded_rust_symbols() {
+        // Bare (perf-style) and module-prefixed (macOS sample-style) frames.
+        let folded = b"main;_ZN8mega_evm3run17h1234567890abcdefE;mega_bench`_ZN8mega_evm3run17h1234567890abcdefE;raw_frame 42\n".to_vec();
+        let text = String::from_utf8(demangle_folded(&folded)).unwrap();
+        assert_eq!(text, "main;mega_evm::run;mega_bench`mega_evm::run;raw_frame 42\n");
     }
 
     #[test]

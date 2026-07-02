@@ -83,6 +83,7 @@ fn test_synthetic_ten_commit_run_with_regression_and_recovery() {
     let data_root = tmp.path().join("data");
     let cfg = Config::parse(CONFIG).unwrap();
     let repo = cfg.repo("mega-evm").unwrap();
+    let settings = cfg.settings(repo);
     let store = RepoStore::new(&data_root, "mega-evm");
 
     let scratch = tmp.path().join("criterion");
@@ -91,7 +92,7 @@ fn test_synthetic_ten_commit_run_with_regression_and_recovery() {
             std::fs::remove_dir_all(&scratch).unwrap();
         }
         write_criterion_tree(&scratch, salt_ratio);
-        process_results(repo, &store, &scratch, &meta(i), vec![]).unwrap()
+        process_results(repo, &settings, &store, &scratch, &meta(i), vec![]).unwrap()
     };
 
     // Runs 0–4: stable baseline. No cards at all.
@@ -112,7 +113,8 @@ fn test_synthetic_ten_commit_run_with_regression_and_recovery() {
     assert_eq!(commit_dirs.len(), 5, "one commits/ dir per run: {commit_dirs:?}");
     let first_dir = store.root().join("commits").join(format!("20260701-{}", &meta(0).sha[..7]));
     assert!(first_dir.join("raw.json").is_file());
-    assert!(first_dir.join("compare.png").is_file());
+    assert!(first_dir.join("compare_table.png").is_file());
+    assert!(first_dir.join("compare_bars.png").is_file());
     assert!(first_dir.join("dist_salt_dynamic_gas_sstore_100.png").is_file());
     assert!(first_dir.join("dist_empty_transaction.png").is_file());
     // Baseline-less group gets no violin with a single row, and no ratio.
@@ -197,16 +199,17 @@ fn test_rerunning_same_sha_does_not_double_count() {
     let data_root = tmp.path().join("data");
     let cfg = Config::parse(CONFIG).unwrap();
     let repo = cfg.repo("mega-evm").unwrap();
+    let settings = cfg.settings(repo);
     let store = RepoStore::new(&data_root, "mega-evm");
 
     let scratch = tmp.path().join("criterion");
     write_criterion_tree(&scratch, 2.0);
-    process_results(repo, &store, &scratch, &meta(0), vec![]).unwrap();
+    process_results(repo, &settings, &store, &scratch, &meta(0), vec![]).unwrap();
     let state_after_first = State::load(&store.state_path()).unwrap();
 
     // Same sha again (e.g. a relaying-agent retry): artifacts refresh, but the
     // rolling window and digest counter must not move.
-    let outcome = process_results(repo, &store, &scratch, &meta(0), vec![]).unwrap();
+    let outcome = process_results(repo, &settings, &store, &scratch, &meta(0), vec![]).unwrap();
     assert!(outcome.cards.is_empty());
     let state_after_rerun = State::load(&store.state_path()).unwrap();
     assert_eq!(state_after_first, state_after_rerun);
@@ -223,12 +226,14 @@ fn test_failed_targets_are_marked_not_silently_dropped() {
     let data_root = tmp.path().join("data");
     let cfg = Config::parse(CONFIG).unwrap();
     let repo = cfg.repo("mega-evm").unwrap();
+    let settings = cfg.settings(repo);
     let store = RepoStore::new(&data_root, "mega-evm");
 
     let scratch = tmp.path().join("criterion");
     write_criterion_tree(&scratch, 2.0);
     let outcome =
-        process_results(repo, &store, &scratch, &meta(0), vec!["block_bench".into()]).unwrap();
+        process_results(repo, &settings, &store, &scratch, &meta(0), vec!["block_bench".into()])
+            .unwrap();
 
     let raw: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(outcome.commit_dir.join("raw.json")).unwrap(),

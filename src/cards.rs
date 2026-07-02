@@ -190,8 +190,11 @@ pub struct AlertCardParams<'a> {
     pub regressed: Vec<AlertRow>,
     /// Rows that just recovered back under it.
     pub recovered: Vec<AlertRow>,
-    /// Charts to embed: the comparison bar plus dist plots of affected rows.
+    /// Charts to embed: the comparison charts plus dist plots of affected rows.
     pub images: Vec<ImageRef>,
+    /// The threshold/window that produced this alert (footer text).
+    pub threshold_pct: f64,
+    pub window: usize,
 }
 
 pub fn render_alert_card(params: &AlertCardParams<'_>) -> anyhow::Result<RenderedCard> {
@@ -254,8 +257,7 @@ pub fn render_alert_card(params: &AlertCardParams<'_>) -> anyhow::Result<Rendere
             "footer",
             format!(
                 "mega-bench-reporter · 阈值 +{:.0}% vs 滚动中位数（窗口 {}）",
-                crate::state::REGRESSION_THRESHOLD_PCT,
-                crate::state::ROLLING_WINDOW
+                params.threshold_pct, params.window
             ),
         ),
     ]);
@@ -406,8 +408,13 @@ mod tests {
             sha: "abcdef0123456789",
             regressed,
             recovered,
+            threshold_pct: 10.0,
+            window: 20,
             images: vec![
-                ImageRef::new("/data/mega-evm/commits/20260702-abcdef0/compare.png", "对比图"),
+                ImageRef::new(
+                    "/data/mega-evm/commits/20260702-abcdef0/compare_table.png",
+                    "对比图",
+                ),
                 ImageRef::new(
                     "/data/mega-evm/commits/20260702-abcdef0/dist_salt_dynamic_gas_sstore_100.png",
                     "分布图",
@@ -441,7 +448,7 @@ mod tests {
         assert!(!text.contains("{{"), "unsubstituted placeholder in {text}");
         assert!(!text.contains("__images__"));
         // Both chart images expanded, in order, with ${image:} keys + attachments.
-        assert!(text.contains("${image:compare.png}"));
+        assert!(text.contains("${image:compare_table.png}"));
         assert!(text.contains("${image:dist_salt_dynamic_gas_sstore_100.png}"));
         assert_eq!(rendered.attachments.len(), 2);
     }
@@ -565,6 +572,8 @@ mod tests {
                 current: 1.2,
             }],
             recovered: vec![],
+            threshold_pct: 10.0,
+            window: 20,
             images: vec![],
         };
         let rendered = render_alert_card(&params).unwrap();
@@ -582,6 +591,8 @@ mod tests {
             sha: "abcdef0123456789",
             regressed: vec![AlertRow { row_key: "g/s/w".into(), median: 1.0, current: 1.2 }],
             recovered: vec![],
+            threshold_pct: 10.0,
+            window: 20,
             images: vec![],
         };
         let rendered = render_alert_card(&params).unwrap();

@@ -4,7 +4,7 @@
 use serde::Deserialize;
 use std::path::Path;
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct RepoConfig {
     pub name: String,
     pub github: String,
@@ -15,6 +15,10 @@ pub struct RepoConfig {
     /// Cargo package the bench targets live in; defaults to `name`.
     #[serde(default)]
     pub package: Option<String>,
+    /// Per-repo tuning overrides; anything unset falls back to `[defaults]`,
+    /// then to the built-in values.
+    #[serde(flatten)]
+    pub tuning: Tuning,
     /// Nightly flame-graph settings; absent = the `flamegraph` subcommand is
     /// not available for this repo.
     #[serde(default)]
@@ -24,6 +28,52 @@ pub struct RepoConfig {
 impl RepoConfig {
     pub fn package(&self) -> &str {
         self.package.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// The tunable knobs, all optional at both the `[defaults]` and per-repo
+/// level. Resolution order: repo value → `[defaults]` value → built-in.
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+pub struct Tuning {
+    /// Alert when a headline row rises more than this % over its rolling
+    /// median (built-in: 10).
+    pub regression_threshold_pct: Option<f64>,
+    /// How many healthy runs feed the rolling median (built-in: 20).
+    pub rolling_window: Option<usize>,
+    /// Commits per trend digest (built-in: 10).
+    pub digest_batch_size: Option<u32>,
+    /// Cargo profile for `cargo bench` runs. Unset = cargo's default bench
+    /// profile — the same invocation mega-evm's CI uses. Set to `"profiling"`
+    /// to bench the debug-symbol build the flamegraph pipeline uses.
+    pub bench_profile: Option<String>,
+}
+
+/// Fully-resolved settings for one repo.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Settings {
+    pub regression_threshold_pct: f64,
+    pub rolling_window: usize,
+    pub digest_batch_size: u32,
+    pub bench_profile: Option<String>,
+}
+
+impl Settings {
+    fn resolve(repo: &Tuning, defaults: &Tuning) -> Self {
+        Self {
+            regression_threshold_pct: repo
+                .regression_threshold_pct
+                .or(defaults.regression_threshold_pct)
+                .unwrap_or(crate::state::REGRESSION_THRESHOLD_PCT),
+            rolling_window: repo
+                .rolling_window
+                .or(defaults.rolling_window)
+                .unwrap_or(crate::state::ROLLING_WINDOW),
+            digest_batch_size: repo
+                .digest_batch_size
+                .or(defaults.digest_batch_size)
+                .unwrap_or(crate::state::DIGEST_BATCH_SIZE),
+            bench_profile: repo.bench_profile.clone().or_else(|| defaults.bench_profile.clone()),
+        }
     }
 }
 
@@ -60,8 +110,11 @@ fn default_retention_days() -> u32 {
     30
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct Config {
+    /// Global tuning defaults, overridable per repo.
+    #[serde(default)]
+    pub defaults: Tuning,
     #[serde(rename = "repos")]
     pub repos: Vec<RepoConfig>,
 }
@@ -86,6 +139,12 @@ impl Config {
             .iter()
             .find(|r| r.name == name)
             .ok_or_else(|| anyhow::anyhow!("no repo named '{name}' in config"))
+    }
+
+    /// Resolved settings for a repo: per-repo overrides over `[defaults]`
+    /// over built-ins.
+    pub fn settings(&self, repo: &RepoConfig) -> Settings {
+        Settings::resolve(&repo.tuning, &self.defaults)
     }
 }
 
@@ -136,5 +195,32 @@ headline_spec = "rex5"
     fn test_empty_repos_list_errors() {
         let err = Config::parse("repos = []").unwrap_err();
         assert!(err.to_string().contains("no [[repos]] entries"));
+    }
+
+    #[test]
+    fn test_settings_built_in_defaults_when_nothing_configured() {
+        let cfg = Config::parse(SAMPLE).expect("parses");
+        let settings = cfg.settings(cfg.repo("mega-evm").unwrap());
+        assert_eq!(settings.regression_threshold_pct, crate::state::REGRESSION_THRESHOLD_PCT);
+        assert_eq!(settings.rolling_window, crate::state::ROLLING_WINDOW);
+        assert_eq!(settings.digest_batch_size, crate::state::DIGEST_BATCH_SIZE);
+        assert_eq!(settings.bench_profile, None);
+    }
+
+    #[test]
+    fn test_settings_defaults_section_and_per_repo_override() {
+        let text = format!(
+            "[defaults]\nregression_threshold_pct = 15.0\nrolling_window = 30\n\
+             bench_profile = \"profiling\"\n\n{SAMPLE}\nregression_threshold_pct = 5.0\n\
+             digest_batch_size = 5\n"
+        );
+        let cfg = Config::parse(&text).expect("parses");
+        let settings = cfg.settings(cfg.repo("mega-evm").unwrap());
+        // Per-repo override wins.
+        assert_eq!(settings.regression_threshold_pct, 5.0);
+        assert_eq!(settings.digest_batch_size, 5);
+        // [defaults] fills what the repo leaves unset.
+        assert_eq!(settings.rolling_window, 30);
+        assert_eq!(settings.bench_profile.as_deref(), Some("profiling"));
     }
 }

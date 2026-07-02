@@ -1,6 +1,20 @@
 # Tracked-repo list (D8). A list from day one: adding a repo is a new
 # [[repos]] entry, not a code change.
 
+# Global tuning defaults; every [[repos]] entry may override any of these
+# per-repo by setting the same key inside its own section. The values shown
+# here are the built-in defaults — the section can be omitted entirely.
+[defaults]
+# Alert when a headline row rises more than this % over its rolling median.
+regression_threshold_pct = 10.0
+# How many healthy (non-regressed) runs feed the rolling median.
+rolling_window = 20
+# Commits per trend digest.
+digest_batch_size = 10
+# Cargo profile for `cargo bench`. Unset = cargo's default bench profile,
+# which is exactly what mega-evm's CI (benchmark.yml) uses.
+# bench_profile = "profiling"
+
 [[repos]]
 name = "mega-evm"
 github = "megaeth-labs/mega-evm"

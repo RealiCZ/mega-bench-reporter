@@ -32,6 +32,7 @@ inferno = { version = "0.12", default-features = false, features = ["multithread
 
 # misc
 anyhow = "1"
+rustc-demangle = "0.1"
 tempfile = "3"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }

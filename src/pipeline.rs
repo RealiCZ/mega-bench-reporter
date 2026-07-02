@@ -8,12 +8,12 @@
 
 use crate::cards::{self, AlertCardParams, AlertRow, ImageRef, RenderedCard};
 use crate::charts;
-use crate::config::RepoConfig;
+use crate::config::{RepoConfig, Settings};
 use crate::criterion_results::{self, Row};
 use crate::digest;
-use crate::state::{State, Verdict, DIGEST_BATCH_SIZE};
+use crate::state::{State, Verdict};
 use crate::storage::{CommitRecord, RepoStore};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -146,16 +146,25 @@ pub fn commit_meta(checkout: &Path, sha: &str) -> anyhow::Result<CommitMeta> {
     Ok(CommitMeta { sha: sha.to_string(), date, rustc })
 }
 
-/// Runs one bench target: `cargo bench -p <pkg> --bench <target> --profile
-/// profiling -- --output-format bencher`. The `profiling` profile (debug
-/// symbols, inherits release) is shared with the flame-graph pipeline — one
-/// build serves both. Output streams through to stderr for BB9's process logs;
-/// the data we parse is criterion's `target/criterion` tree, written as a side
-/// effect of any bench run.
-pub fn bench_target(checkout: &Path, repo: &RepoConfig, target: &str) -> anyhow::Result<()> {
-    let mut child = Command::new("cargo")
-        .current_dir(checkout)
-        .args(["bench", "-p", repo.package(), "--bench", target, "--profile", "profiling", "--"])
+/// Runs one bench target. With no configured `bench_profile` this is exactly
+/// the invocation the tracked repo's CI uses (mega-evm's benchmark.yml):
+/// `cargo bench -p <pkg> --bench <target> -- --output-format bencher` — so the
+/// numbers stay comparable with the per-PR `/benchmark` flow. Output streams
+/// to stderr for the relaying agent's process logs; the data we parse is
+/// criterion's `target/criterion` tree, written as a side effect of any run.
+pub fn bench_target(
+    checkout: &Path,
+    repo: &RepoConfig,
+    target: &str,
+    bench_profile: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(checkout).args(["bench", "-p", repo.package(), "--bench", target]);
+    if let Some(profile) = bench_profile {
+        cmd.args(["--profile", profile]);
+    }
+    let mut child = cmd
+        .arg("--")
         .arg("--output-format")
         .arg("bencher")
         // Our own stdout carries exactly one JSON document per invocation, so
@@ -216,6 +225,7 @@ fn split_row_key<'a>(
 /// parse → record → charts → rolling-median regression check → digest batch.
 pub fn process_results(
     repo: &RepoConfig,
+    settings: &Settings,
     store: &RepoStore,
     criterion_dir: &Path,
     meta: &CommitMeta,
@@ -245,26 +255,54 @@ pub fn process_results(
     record.failed_targets = failed_targets.clone();
     let commit_dir = store.write_commit_record(&record)?;
 
-    // 2. Charts. Headline family = the configured spec + its variants that
-    //    actually appear in this run's rows.
-    let headline_subjects: Vec<String> = rows
-        .iter()
-        .map(|r| r.subject.clone())
-        .filter(|s| digest::is_headline_subject(s, &repo.headline_spec))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let bars = charts::compare_bars(&ratios, &headline_subjects);
-    if !bars.is_empty() {
-        // Charts are derived artifacts: a rendering failure is logged, not
-        // fatal — raw.json is already on disk and the state update below must
-        // still happen.
-        if let Err(e) = charts::render_compare_bar(
-            &commit_dir.join("compare.png"),
+    // 2. Charts. Comparison table (test item x implementation p95 + headline
+    //    ratio column) and the revm=100% speed bars — the two views the design
+    //    doc's 对比图 asks for. Charts are derived artifacts: a rendering
+    //    failure is logged, not fatal — raw.json is already on disk and the
+    //    state update below must still happen.
+    let is_headline = |s: &str| digest::is_headline_subject(s, &repo.headline_spec);
+    let table = charts::build_compare_table(&rows, &ratios, &repo.headline_spec, is_headline);
+    if !table.rows.is_empty() {
+        if let Err(e) = charts::render_compare_table(
+            &commit_dir.join("compare_table.png"),
             &format!("{} vs revm_pinned @ {}", repo.name, record.short_sha()),
-            &bars,
+            &table,
         ) {
-            eprintln!("compare chart failed (continuing): {e:#}");
+            eprintln!("compare table chart failed (continuing): {e:#}");
+        }
+    }
+
+    let speed_items: Vec<charts::SpeedBarItem> = ratios
+        .iter()
+        .filter_map(|wl| {
+            let mut bars: Vec<(String, f64)> = wl
+                .rows
+                .iter()
+                .filter(|r| is_headline(&r.subject))
+                .filter_map(|r| {
+                    r.ratio_vs_revm_pinned.map(|ratio| (r.subject.clone(), 100.0 / ratio))
+                })
+                .collect();
+            if bars.is_empty() {
+                return None;
+            }
+            bars.sort_by(|a, b| a.0.cmp(&b.0));
+            bars.insert(0, ("revm_pinned".to_string(), 100.0));
+            let item = if wl.workload.is_empty() {
+                wl.group.clone()
+            } else {
+                format!("{}/{}", wl.group, wl.workload)
+            };
+            Some(charts::SpeedBarItem { item, bars })
+        })
+        .collect();
+    if !speed_items.is_empty() {
+        if let Err(e) = charts::render_speed_bars(
+            &commit_dir.join("compare_bars.png"),
+            &format!("{} relative speed @ {} (revm_pinned = 100%)", repo.name, record.short_sha()),
+            &speed_items,
+        ) {
+            eprintln!("speed bars chart failed (continuing): {e:#}");
         }
     }
 
@@ -299,7 +337,12 @@ pub fn process_results(
             for ratio_row in &wl.rows {
                 let Some(ratio) = ratio_row.ratio_vs_revm_pinned else { continue };
                 let key = criterion_results::row_key(&wl.group, &ratio_row.subject, &wl.workload);
-                let verdict = state.check_and_record(&key, ratio);
+                let verdict = state.check_and_record(
+                    &key,
+                    ratio,
+                    settings.regression_threshold_pct,
+                    settings.rolling_window,
+                );
                 if !digest::is_headline_subject(&ratio_row.subject, &repo.headline_spec) {
                     continue;
                 }
@@ -325,9 +368,14 @@ pub fn process_results(
         // Attach the comparison chart plus the distribution plots of the
         // affected rows (capped to keep the card readable).
         let mut images = Vec::new();
-        let compare = commit_dir.join("compare.png");
-        if compare.is_file() {
-            images.push(ImageRef::new(compare, "对比 revm_pinned 倍率"));
+        for (file, alt) in [
+            ("compare_table.png", "对比表（p95 µs + 倍率）"),
+            ("compare_bars.png", "相对速度（revm=100%）"),
+        ] {
+            let path = commit_dir.join(file);
+            if path.is_file() {
+                images.push(ImageRef::new(path, alt));
+            }
         }
         for alert_row in regressed.iter().chain(&recovered).take(3) {
             if let Some((group, _subject, workload)) =
@@ -346,19 +394,28 @@ pub fn process_results(
             regressed,
             recovered,
             images,
+            threshold_pct: settings.regression_threshold_pct,
+            window: settings.rolling_window,
         })?);
     }
 
     // 4. Digest batching: every DIGEST_BATCH_SIZE commits, roll up a trend
     //    card. A failed digest build is reported on stderr but doesn't fail
     //    the run — the counter is left un-reset so the next commit retries.
-    if !is_rerun && state.bump_digest_counter() {
+    if !is_rerun && state.bump_digest_counter(settings.digest_batch_size) {
         let records: Vec<CommitRecord> = store
-            .load_recent_commit_records(DIGEST_BATCH_SIZE as usize)?
+            .load_recent_commit_records(settings.digest_batch_size as usize)?
             .into_iter()
             .map(|(_, r)| r)
             .collect();
-        match digest::build_digest(store, &repo.github, &repo.name, &repo.headline_spec, &records) {
+        match digest::build_digest(
+            store,
+            &repo.github,
+            &repo.name,
+            &repo.headline_spec,
+            settings.regression_threshold_pct,
+            &records,
+        ) {
             Ok(outcome) => {
                 cards.push(outcome.card);
                 state.reset_digest_counter();
@@ -383,9 +440,11 @@ pub fn process_results(
 /// criterion tree to [`process_results`].
 pub fn run_commit_pipeline(
     repo: &RepoConfig,
+    settings: &Settings,
     sha: &str,
     data_root: &Path,
     work_root: &Path,
+    skip_bench: bool,
 ) -> anyhow::Result<RunOutcome> {
     let store = RepoStore::new(data_root, &repo.name);
     // Held for the whole run: concurrent invocations share the checkout, the
@@ -395,24 +454,38 @@ pub fn run_commit_pipeline(
     checkout_commit(&checkout, repo, sha)?;
     let meta = commit_meta(&checkout, sha)?;
 
-    // Stale results from a previous commit's run must not leak into this one.
     let criterion_dir = criterion_results::criterion_dir_for(&checkout);
-    if criterion_dir.exists() {
-        std::fs::remove_dir_all(&criterion_dir)?;
-    }
-
     let mut failed_targets = Vec::new();
-    for target in &repo.bench_targets {
-        if let Err(e) = bench_target(&checkout, repo, target) {
-            eprintln!("bench target '{target}' failed: {e:#}");
-            failed_targets.push(target.clone());
+    if skip_bench {
+        // Dev/regen mode: reuse whatever criterion tree the checkout already
+        // has (e.g. re-render charts without re-benching).
+        if !criterion_dir.is_dir() {
+            anyhow::bail!(
+                "--skip-bench: no existing criterion tree at {}",
+                criterion_dir.display()
+            );
+        }
+    } else {
+        // Stale results from a previous commit's run must not leak into this one.
+        if criterion_dir.exists() {
+            std::fs::remove_dir_all(&criterion_dir)?;
+        }
+        for target in &repo.bench_targets {
+            if let Err(e) = bench_target(&checkout, repo, target, settings.bench_profile.as_deref())
+            {
+                eprintln!("bench target '{target}' failed: {e:#}");
+                failed_targets.push(target.clone());
+            }
+        }
+        if failed_targets.len() == repo.bench_targets.len() {
+            anyhow::bail!(
+                "all {} bench targets failed — no data to report",
+                repo.bench_targets.len()
+            );
         }
     }
-    if failed_targets.len() == repo.bench_targets.len() {
-        anyhow::bail!("all {} bench targets failed — no data to report", repo.bench_targets.len());
-    }
 
-    process_results(repo, &store, &criterion_dir, &meta, failed_targets)
+    process_results(repo, settings, &store, &criterion_dir, &meta, failed_targets)
 }
 
 #[cfg(test)]

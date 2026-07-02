@@ -7,8 +7,8 @@ It never calls the Lark API and holds no Lark credentials; a triggering agent (e
 ## Requirements
 
 - `git` and a Rust toolchain (`cargo`, `rustc`) on the machine — the tool shells out to both to build and bench the tracked repo.
-- Whatever the tracked repo itself needs to build (for mega-evm: git submodules are handled automatically; Foundry only if the checkout needs to rebuild system contracts).
-- `perf` (Linux) for the `flamegraph` subcommand only; the per-commit `run` subcommand has no perf dependency and works anywhere.
+- Whatever the tracked repo itself needs to build (for mega-evm: git submodules are handled automatically, and Foundry must be installed — its CI installs it before benching).
+- For the `flamegraph` subcommand: `perf` on Linux; on macOS the built-in `sample` tool is used (nothing to install). The per-commit `run` subcommand works anywhere.
 - No Python, no gnuplot, no system fonts: charts are rendered with `plotters` using an embedded font, and flame graphs with the `inferno` crate as a library.
 
 ## Build
@@ -33,13 +33,13 @@ mega-bench-reporter run \
 What one `run` does:
 
 1. Clones (first run) or fetches the tracked repo into `<work-root>/<repo>` (default work root: `<data-root>/_checkouts`) and checks out the sha, submodules included.
-2. Runs `cargo bench -p <package> --bench <target> --profile profiling` for every configured bench target; a failing target is recorded in `raw.json` (`failed_targets`) and skipped, not fatal — unless every target fails.
+2. Runs `cargo bench -p <package> --bench <target> -- --output-format bencher` for every configured bench target — the exact invocation mega-evm's CI (benchmark.yml) uses, so numbers stay comparable with the per-PR `/benchmark` flow (`bench_profile` in the config adds `--profile <p>`). A failing target is recorded in `raw.json` (`failed_targets`) and skipped, not fatal — unless every target fails.
 3. Parses criterion's `target/criterion/**/new/*.json` tree and computes each row's `ratio_vs_revm_pinned` (time ratio against the `revm_pinned` row of the same group/workload; > 1 means mega-evm is slower).
-4. Writes `commits/<YYYYMMDD>-<shortsha>/{raw.json, compare.png, dist_*.png}` under `<data-root>/<repo>/`.
+4. Writes `commits/<YYYYMMDD>-<shortsha>/{raw.json, compare_table.png, compare_bars.png, dist_*.png}` under `<data-root>/<repo>/`.
 5. Checks every headline-spec row against its rolling median and renders a regression-alert (or recovery) card on state change.
 6. Every 10th commit, rolls the last 10 records into `digests/<YYYYMMDD>-<range>/{summary.json, trend.png}` plus a trend-digest card.
 
-### Nightly flame graph (Linux only)
+### Nightly flame graph (Linux / macOS)
 
 ```bash
 mega-bench-reporter flamegraph \
@@ -48,7 +48,9 @@ mega-bench-reporter flamegraph \
   --data-root /srv/mega-bench/data
 ```
 
-Checks out the tracked branch's current HEAD, builds the bench binary once (`cargo bench --no-run --profile profiling`), profiles each configured workload pair under `perf record` (criterion `--profile-time` mode, `--exact` id matching), folds and renders SVGs via `inferno`, writes `flame/<YYYYMMDD>/`, prunes days past retention, and renders a flamegraph card.
+Checks out the tracked branch's current HEAD, builds the bench binary once (`cargo bench --no-run --profile profiling`), profiles each configured workload (criterion `--profile-time` mode, `--exact` id matching) with the platform profiler — `perf record` on Linux, the built-in `sample` tool on macOS (1 ms interval, no root) — folds, demangles, and renders SVGs plus one differential SVG per baseline/feature pair via `inferno`, writes `flame/<YYYYMMDD>/`, prunes days past retention, and renders a flamegraph card.
+
+For development, `run --skip-bench` re-renders charts and records from the checkout's existing criterion tree without re-benching.
 
 ### GitHub access
 
@@ -85,6 +87,13 @@ Relaying rules for the posting agent:
 ## Configuration (`repos.toml`)
 
 ```toml
+# Global tuning defaults; every [[repos]] entry may override any of them.
+[defaults]
+regression_threshold_pct = 10.0   # alert when a headline row rises this % over its rolling median
+rolling_window = 20               # healthy runs feeding the rolling median
+digest_batch_size = 10            # commits per trend digest
+# bench_profile = "profiling"     # unset = cargo's default bench profile (matches mega-evm CI)
+
 [[repos]]
 name = "mega-evm"                       # repo key; also the cargo package name unless `package` is set
 github = "megaeth-labs/mega-evm"        # owner/repo, used for commit links in cards
@@ -110,11 +119,12 @@ The list shape is deliberate: adding a second tracked repo is a new `[[repos]]` 
 <data-root>/<repo>/
   commits/<YYYYMMDD>-<shortsha>/
     raw.json              # source of truth: { commit, date, rustc, failed_targets?, groups: { <group>: { <subject>[/<workload>]: { ns, ratio_vs_revm_pinned } } } }
-    compare.png           # headline-family ratios, one bar per (workload, subject)
+    compare_table.png     # test item x implementation p95 µs table, last column = headline ratio (color-banded)
+    compare_bars.png      # relative speed per item, revm_pinned = 100% (lower = more overhead)
     dist_<group>[_<workload>].png   # per-call time distribution (violin), one per group/workload with >= 2 subjects; "/" in workloads becomes "_"
   digests/<YYYYMMDD>-<first>..<last>/
-    summary.json          # last-10-commits headline series, table-ready (first/last/median per row)
-    trend.png             # headline ratios over the window
+    summary.json          # last-N-commits headline series, table-ready (first/last/median per row)
+    trend.png             # headline ratios over the window, red rings on threshold-tripping points
   flame/<YYYYMMDD>/
     <workload>.svg        # one per profiled benchmark id
     <workload>_diff.svg   # differential, feature vs baseline
@@ -123,8 +133,8 @@ The list shape is deliberate: adding a second tracked repo is a new `[[repos]]` 
 
 ## Regression semantics
 
-- Ratios are compared against the row's rolling median (window: last 20 healthy runs) — noise-robust, no fixed absolute baseline.
-- A headline-spec row rising more than 10% above its rolling median triggers a regression-alert card the same run.
+- Ratios are compared against the row's rolling median (window: last `rolling_window` healthy runs) — noise-robust, no fixed absolute baseline.
+- A headline-spec row rising more than `regression_threshold_pct` above its rolling median triggers a regression-alert card the same run. Both knobs (and `digest_batch_size`) live in `repos.toml`.
 - The alert is latched: while the row stays regressed no further card is sent; when it drops back under the threshold a recovery card is sent once.
 - Regressed values never enter the rolling window, so a sustained regression stays measured against the pre-regression baseline instead of silently becoming the new normal; accepting a new level = deleting that row's entry from `state.json`.
 - Re-running the most recently processed sha refreshes artifacts without touching regression state (retry-safe).
@@ -136,6 +146,10 @@ The list shape is deliberate: adding a second tracked repo is a new `[[repos]]` 
 The three Lark card layouts live in `templates/*.json` and are embedded into the binary at compile time.
 Changing a card's look is a template edit plus a test run — never code string-building, never a change to the relaying agent.
 Template language: `{{key}}` substitution inside string values, plus a `{"tag": "__images__", "group": "<name>"}` marker element that expands to one `img` element per registered image.
+
+## Agent skill
+
+`skill/SKILL.md` (plus `skill/references/`) documents everything an operating agent needs: how to invoke the CLI, the output contract and card relaying rules, where the data lives, what every metric means, and the alert conditions.
 
 ## Development
 

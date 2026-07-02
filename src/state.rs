@@ -6,16 +6,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 
-/// How many recent ratio values feed the rolling median. Independent of the
-/// 10-commit digest batch size — this just needs to be big enough to smooth
-/// single-run noise, not tied to reporting cadence.
+/// Built-in default for how many recent ratio values feed the rolling median;
+/// configurable via `rolling_window` in the config file. Independent of the
+/// digest batch size — this just needs to be big enough to smooth single-run
+/// noise, not tied to reporting cadence.
 pub const ROLLING_WINDOW: usize = 20;
 
-/// Matches design.md's Alerting thresholds: 10% vs the trailing rolling
-/// median, distinct from the PR table's 15%/30% (per-commit is more sensitive).
+/// Built-in default regression threshold (% over the trailing rolling
+/// median); configurable via `regression_threshold_pct` in the config file.
+/// Distinct from the PR table's 15%/30% — per-commit is more sensitive.
 pub const REGRESSION_THRESHOLD_PCT: f64 = 10.0;
 
-/// Commits per digest — the trend card rolls up every 10th commit.
+/// Built-in default commits-per-digest; configurable via `digest_batch_size`
+/// in the config file.
 pub const DIGEST_BATCH_SIZE: u32 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -116,14 +119,20 @@ impl State {
     /// `StillRegressed` (quiet after the one alert) until it is actually
     /// fixed, or until the operator accepts the new level by clearing the
     /// row's entry in `state.json`.
-    pub fn check_and_record(&mut self, row_key: &str, ratio: f64) -> Verdict {
+    pub fn check_and_record(
+        &mut self,
+        row_key: &str,
+        ratio: f64,
+        threshold_pct: f64,
+        window: usize,
+    ) -> Verdict {
         let entry = self.rows.entry(row_key.to_string()).or_default();
         let verdict = if entry.recent_ratios.is_empty() {
             Verdict::FirstRun
         } else {
             let baseline_median = median(&entry.recent_ratios);
             let pct_over = (ratio - baseline_median) / baseline_median * 100.0;
-            if pct_over > REGRESSION_THRESHOLD_PCT {
+            if pct_over > threshold_pct {
                 if entry.currently_regressed {
                     Verdict::StillRegressed
                 } else {
@@ -138,7 +147,7 @@ impl State {
         entry.currently_regressed = verdict.is_regressed();
         if !verdict.is_regressed() {
             entry.recent_ratios.push_back(ratio);
-            if entry.recent_ratios.len() > ROLLING_WINDOW {
+            while entry.recent_ratios.len() > window {
                 entry.recent_ratios.pop_front();
             }
         }
@@ -146,11 +155,11 @@ impl State {
     }
 
     /// Bumps the digest counter; returns `true` when it has reached
-    /// `DIGEST_BATCH_SIZE` (caller should build+send a digest, then call
+    /// `batch_size` (caller should build+send a digest, then call
     /// `reset_digest_counter`).
-    pub fn bump_digest_counter(&mut self) -> bool {
+    pub fn bump_digest_counter(&mut self, batch_size: u32) -> bool {
         self.commits_since_digest += 1;
-        self.commits_since_digest >= DIGEST_BATCH_SIZE
+        self.commits_since_digest >= batch_size
     }
 
     pub fn reset_digest_counter(&mut self) {
@@ -165,7 +174,12 @@ mod tests {
     #[test]
     fn test_first_run_establishes_baseline_no_alert() {
         let mut state = State::default();
-        let verdict = state.check_and_record("salt_dynamic_gas/rex5_salt/sstore_100", 2.0);
+        let verdict = state.check_and_record(
+            "salt_dynamic_gas/rex5_salt/sstore_100",
+            2.0,
+            REGRESSION_THRESHOLD_PCT,
+            ROLLING_WINDOW,
+        );
         assert_eq!(verdict, Verdict::FirstRun);
         assert!(!verdict.is_regressed());
         assert_eq!(state.rows["salt_dynamic_gas/rex5_salt/sstore_100"].recent_ratios.len(), 1);
@@ -177,10 +191,10 @@ mod tests {
         let key = "g/rex5/w";
         // Build up a stable history around ratio 2.0.
         for _ in 0..5 {
-            state.check_and_record(key, 2.0);
+            state.check_and_record(key, 2.0, REGRESSION_THRESHOLD_PCT, ROLLING_WINDOW);
         }
         // 15% jump — over the 10% threshold.
-        let v1 = state.check_and_record(key, 2.3);
+        let v1 = state.check_and_record(key, 2.3, REGRESSION_THRESHOLD_PCT, ROLLING_WINDOW);
         match v1 {
             Verdict::NewRegression { median, current, pct_over } => {
                 assert!((median - 2.0).abs() < 1e-9);
@@ -190,7 +204,7 @@ mod tests {
             other => panic!("expected NewRegression, got {other:?}"),
         }
         // Still elevated next run — must NOT re-alert (StillRegressed, not NewRegression).
-        let v2 = state.check_and_record(key, 2.35);
+        let v2 = state.check_and_record(key, 2.35, REGRESSION_THRESHOLD_PCT, ROLLING_WINDOW);
         assert_eq!(v2, Verdict::StillRegressed);
         assert!(v2.is_regressed());
     }
@@ -200,9 +214,9 @@ mod tests {
         let mut state = State::default();
         let key = "g/rex5/w";
         for _ in 0..5 {
-            state.check_and_record(key, 2.0);
+            state.check_and_record(key, 2.0, REGRESSION_THRESHOLD_PCT, ROLLING_WINDOW);
         }
-        let v = state.check_and_record(key, 1.5);
+        let v = state.check_and_record(key, 1.5, REGRESSION_THRESHOLD_PCT, ROLLING_WINDOW);
         assert_eq!(v, Verdict::Ok);
     }
 
@@ -211,7 +225,12 @@ mod tests {
         // A row_key never seen before (e.g. a brand new workload) is FirstRun,
         // not treated as a 0% -> N% "regression".
         let mut state = State::default();
-        let v = state.check_and_record("new/workload/never/seen", 999.0);
+        let v = state.check_and_record(
+            "new/workload/never/seen",
+            999.0,
+            REGRESSION_THRESHOLD_PCT,
+            ROLLING_WINDOW,
+        );
         assert_eq!(v, Verdict::FirstRun);
     }
 
@@ -220,19 +239,19 @@ mod tests {
         let mut state = State::default();
         let key = "g/rex5/w";
         for _ in 0..5 {
-            state.check_and_record(key, 2.0);
+            state.check_and_record(key, 2.0, REGRESSION_THRESHOLD_PCT, ROLLING_WINDOW);
         }
-        let regressed = state.check_and_record(key, 2.3);
+        let regressed = state.check_and_record(key, 2.3, REGRESSION_THRESHOLD_PCT, ROLLING_WINDOW);
         assert!(regressed.is_regressed());
         // Drops back near baseline.
-        let v = state.check_and_record(key, 2.0);
+        let v = state.check_and_record(key, 2.0, REGRESSION_THRESHOLD_PCT, ROLLING_WINDOW);
         match v {
             Verdict::Recovered { .. } => {}
             other => panic!("expected Recovered, got {other:?}"),
         }
         assert!(!v.is_regressed());
         // Next run at the same level: no repeated recovery notice, just Ok.
-        let v2 = state.check_and_record(key, 2.0);
+        let v2 = state.check_and_record(key, 2.0, REGRESSION_THRESHOLD_PCT, ROLLING_WINDOW);
         assert_eq!(v2, Verdict::Ok);
     }
 
@@ -244,22 +263,28 @@ mod tests {
         let mut state = State::default();
         let key = "g/rex5/w";
         for _ in 0..5 {
-            state.check_and_record(key, 2.0);
+            state.check_and_record(key, 2.0, REGRESSION_THRESHOLD_PCT, ROLLING_WINDOW);
         }
-        assert!(matches!(state.check_and_record(key, 3.0), Verdict::NewRegression { .. }));
+        assert!(matches!(
+            state.check_and_record(key, 3.0, REGRESSION_THRESHOLD_PCT, ROLLING_WINDOW),
+            Verdict::NewRegression { .. }
+        ));
         for run in 0..30 {
-            let v = state.check_and_record(key, 3.0);
+            let v = state.check_and_record(key, 3.0, REGRESSION_THRESHOLD_PCT, ROLLING_WINDOW);
             assert_eq!(v, Verdict::StillRegressed, "run {run} must stay regressed");
         }
         // The baseline is still the pre-regression 2.0 median, so an actual
         // fix back to 2.05 recovers against the ORIGINAL baseline.
-        match state.check_and_record(key, 2.05) {
+        match state.check_and_record(key, 2.05, REGRESSION_THRESHOLD_PCT, ROLLING_WINDOW) {
             Verdict::Recovered { median, .. } => assert!((median - 2.0).abs() < 1e-9),
             other => panic!("expected Recovered, got {other:?}"),
         }
         // And the window was not polluted by the regressed era: a fresh +15%
         // over the old level alerts again.
-        assert!(matches!(state.check_and_record(key, 2.35), Verdict::NewRegression { .. }));
+        assert!(matches!(
+            state.check_and_record(key, 2.35, REGRESSION_THRESHOLD_PCT, ROLLING_WINDOW),
+            Verdict::NewRegression { .. }
+        ));
     }
 
     #[test]
@@ -278,7 +303,12 @@ mod tests {
         let mut state = State::default();
         let key = "g/s/w";
         for i in 0..30 {
-            state.check_and_record(key, 1.0 + i as f64 * 0.01);
+            state.check_and_record(
+                key,
+                1.0 + i as f64 * 0.01,
+                REGRESSION_THRESHOLD_PCT,
+                ROLLING_WINDOW,
+            );
         }
         assert_eq!(state.rows[key].recent_ratios.len(), ROLLING_WINDOW);
     }
@@ -287,9 +317,12 @@ mod tests {
     fn test_digest_counter_batches_at_ten_then_resets() {
         let mut state = State::default();
         for i in 0..9 {
-            assert!(!state.bump_digest_counter(), "should not fire before 10 (i={i})");
+            assert!(
+                !state.bump_digest_counter(DIGEST_BATCH_SIZE),
+                "should not fire before 10 (i={i})"
+            );
         }
-        assert!(state.bump_digest_counter(), "10th commit should fire the digest");
+        assert!(state.bump_digest_counter(DIGEST_BATCH_SIZE), "10th commit should fire the digest");
         state.reset_digest_counter();
         assert_eq!(state.commits_since_digest, 0);
     }
@@ -299,7 +332,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("state.json");
         let mut state = State::default();
-        state.check_and_record("g/s/w", 1.5);
+        state.check_and_record("g/s/w", 1.5, REGRESSION_THRESHOLD_PCT, ROLLING_WINDOW);
         state.last_seen_sha = Some("abc123".into());
         state.commits_since_digest = 3;
         state.save(&path).unwrap();
