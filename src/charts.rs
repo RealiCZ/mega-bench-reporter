@@ -42,6 +42,11 @@ const PALETTE: &[RGBColor] = &[
 /// Status color for regression markers — reserved, never a series color.
 const ALERT_RED: RGBColor = RGBColor(0xd0, 0x3b, 0x3b);
 
+/// All charts render at 2× and are displayed downscaled: plotters' bitmap
+/// text has no hinting/subpixel positioning, so small glyphs come out ragged
+/// at 1:1 — supersampling is what keeps text crisp in chat/browser embeds.
+const SS: i32 = 2;
+
 fn series_color(i: usize) -> RGBColor {
     PALETTE[i % PALETTE.len()]
 }
@@ -212,23 +217,24 @@ pub fn render_speed_bars(
     let max_percent =
         items.iter().flat_map(|i| i.bars.iter().map(|(_, p)| *p)).fold(100.0_f64, f64::max);
     let x_max = (max_percent * 1.15).max(118.0);
+    let ss = SS as u32;
     let height =
-        (170 + (items.len() + 1) * (legend_subjects.len() * 22 + 14)).clamp(300, 2200) as u32;
+        (170 + (items.len() + 1) * (legend_subjects.len() * 22 + 14)).clamp(300, 2200) as u32 * ss;
     // Reserve room below the last item for the legend box, in *data units*
     // derived from its pixel size — stays correct when the height clamp above
     // shrinks the pixels-per-band.
-    let legend_px = 22.0 * legend_subjects.len() as f64 + 18.0;
-    let plot_px = (height as f64 - 130.0).max(100.0);
+    let legend_px = (22.0 * legend_subjects.len() as f64 + 18.0) * SS as f64;
+    let plot_px = (height as f64 - 130.0 * SS as f64).max(100.0);
     let legend_space = (legend_px * (total + 1.0) / (plot_px - legend_px).max(100.0)).max(1.2);
-    let root = BitMapBackend::new(path, (1100, height)).into_drawing_area();
+    let root = BitMapBackend::new(path, (1100 * ss, height)).into_drawing_area();
     root.fill(&WHITE).map_err(map_err)?;
 
     let labels: Vec<&str> = items.iter().map(|i| i.item.as_str()).collect();
     let mut chart = ChartBuilder::on(&root)
-        .caption(title, ("sans-serif", 22))
-        .margin(15)
-        .x_label_area_size(45)
-        .y_label_area_size(340)
+        .caption(title, ("sans-serif", 22 * SS))
+        .margin(15 * SS)
+        .x_label_area_size(45 * SS)
+        .y_label_area_size(340 * SS)
         .build_cartesian_2d(0.0..x_max, (-0.6 - legend_space)..(total + 0.6))
         .map_err(map_err)?;
 
@@ -254,8 +260,8 @@ pub fn render_speed_bars(
         .x_desc(
             format!("relative speed, {baseline_subject} = 100% (lower = more overhead)").as_str(),
         )
-        .label_style(("sans-serif", 14))
-        .axis_desc_style(("sans-serif", 16))
+        .label_style(("sans-serif", 14 * SS))
+        .axis_desc_style(("sans-serif", 16 * SS))
         .draw()
         .map_err(map_err)?;
 
@@ -275,7 +281,7 @@ pub fn render_speed_bars(
                 .draw_series(std::iter::once(Text::new(
                     format!("{percent:.0}%"),
                     (percent + 1.2, y - 0.18),
-                    ("sans-serif", 13).into_font().color(&BLACK),
+                    ("sans-serif", 13 * SS).into_font().color(&BLACK),
                 )))
                 .map_err(map_err)?;
         }
@@ -285,7 +291,7 @@ pub fn render_speed_bars(
     chart
         .draw_series(LineSeries::new(
             [(100.0, -0.6 - legend_space), (100.0, total + 0.6)],
-            BLACK.mix(0.45).stroke_width(1),
+            BLACK.mix(0.45).stroke_width(ss),
         ))
         .map_err(map_err)?;
 
@@ -296,14 +302,16 @@ pub fn render_speed_bars(
             .draw_series(LineSeries::new(std::iter::empty::<(f64, f64)>(), color.filled()))
             .map_err(map_err)?
             .label(subject.clone())
-            .legend(move |(x, y)| Rectangle::new([(x, y - 5), (x + 10, y + 5)], color.filled()));
+            .legend(move |(x, y)| {
+                Rectangle::new([(x, y - 5 * SS), (x + 10 * SS, y + 5 * SS)], color.filled())
+            });
     }
     chart
         .configure_series_labels()
         .position(SeriesLabelPosition::LowerLeft)
         .background_style(WHITE.mix(0.85))
         .border_style(BLACK.mix(0.4))
-        .label_font(("sans-serif", 14))
+        .label_font(("sans-serif", 14 * SS))
         .draw()
         .map_err(map_err)?;
 
@@ -364,15 +372,16 @@ pub fn render_violin(path: &Path, title: &str, rows: &[&Row]) -> anyhow::Result<
         .collect();
     let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
 
-    let height = (120 + n * 110).clamp(260, 1200) as u32;
-    let root = BitMapBackend::new(path, (1100, height)).into_drawing_area();
+    let ss = SS as u32;
+    let height = (120 + n * 110).clamp(260, 1200) as u32 * ss;
+    let root = BitMapBackend::new(path, (1100 * ss, height)).into_drawing_area();
     root.fill(&WHITE).map_err(map_err)?;
 
     let mut chart = ChartBuilder::on(&root)
-        .caption(title, ("sans-serif", 22))
-        .margin(15)
-        .x_label_area_size(45)
-        .y_label_area_size(330)
+        .caption(title, ("sans-serif", 22 * SS))
+        .margin(15 * SS)
+        .x_label_area_size(45 * SS)
+        .y_label_area_size(330 * SS)
         .build_cartesian_2d(x_lo..x_hi, -0.6..(n as f64 - 0.4))
         .map_err(map_err)?;
 
@@ -384,8 +393,8 @@ pub fn render_violin(path: &Path, title: &str, rows: &[&Row]) -> anyhow::Result<
         .y_labels(n * 2 + 1)
         .y_label_formatter(&|v: &f64| integer_tick_label(*v, &label_refs))
         .x_desc("per-call time (µs)")
-        .label_style(("sans-serif", 15))
-        .axis_desc_style(("sans-serif", 16))
+        .label_style(("sans-serif", 15 * SS))
+        .axis_desc_style(("sans-serif", 16 * SS))
         .draw()
         .map_err(map_err)?;
 
@@ -412,12 +421,12 @@ pub fn render_violin(path: &Path, title: &str, rows: &[&Row]) -> anyhow::Result<
         // min–max whisker and a mean tick.
         let mean = samples.iter().sum::<f64>() / samples.len() as f64;
         chart
-            .draw_series(LineSeries::new([(lo, y), (hi, y)], color.stroke_width(1)))
+            .draw_series(LineSeries::new([(lo, y), (hi, y)], color.stroke_width(ss)))
             .map_err(map_err)?;
         chart
             .draw_series(LineSeries::new(
                 [(mean, y - half * 0.7), (mean, y + half * 0.7)],
-                color.stroke_width(2),
+                color.stroke_width(2 * ss),
             ))
             .map_err(map_err)?;
     }
@@ -485,10 +494,6 @@ pub fn render_trend(
             .total_cmp(&last_value(&series[a]).unwrap_or(f64::NEG_INFINITY))
     });
 
-    // Rendered at 2× and displayed downscaled: plotters' bitmap text has no
-    // hinting/subpixel positioning, so small glyphs come out ragged at 1:1 —
-    // supersampling is what makes the text crisp in chat/browser embeds.
-    const SS: i32 = 2;
     let ss = SS as u32;
 
     // Legend panel sits outside the plot; width fits the longest label.
