@@ -95,44 +95,59 @@ fn main() {
     )
     .unwrap();
 
-    let commits: Vec<String> = (0..10).map(|i| format!("{:07x}", 0x1234567 + i * 0x1111)).collect();
+    // Mirrors the shape of a real 5-commit digest: a dense 1.9-2.0 cluster,
+    // one improving row, one alert ring, one gap.
+    let commits: Vec<String> = (0..5).map(|i| format!("{:07x}", 0x1234567 + i * 0x1111)).collect();
+    let mk = |label: &str, ratios: Vec<Option<f64>>, alerts: Vec<bool>| TrendSeries {
+        label: label.into(),
+        ratios,
+        alerts,
+    };
     let series = vec![
-        TrendSeries {
-            label: "salt_dynamic_gas/rex5_salt/sstore_100".into(),
-            ratios: vec![
-                Some(2.02),
-                Some(2.05),
-                Some(2.01),
-                Some(2.04),
-                Some(2.35),
-                Some(2.36),
-                Some(2.05),
-                Some(2.03),
-                Some(2.04),
-                Some(2.02),
-            ],
-            alerts: (0..10).map(|i| i == 4).collect(),
-        },
-        TrendSeries {
-            label: "empty_transaction/rex5".into(),
-            ratios: vec![
-                Some(1.18),
-                Some(1.19),
-                Some(1.17),
-                None,
-                Some(1.18),
-                Some(1.20),
-                Some(1.19),
-                Some(1.18),
-                Some(1.17),
-                Some(1.18),
-            ],
-            alerts: Vec::new(),
-        },
+        mk(
+            "salt_dynamic_gas/rex5_salt/sstore_100",
+            vec![Some(2.37), Some(2.32), Some(2.34), Some(2.28), Some(2.44)],
+            vec![false, false, false, false, true],
+        ),
+        mk(
+            "empty_transaction/rex5",
+            vec![Some(2.03), Some(2.08), Some(2.01), Some(2.09), Some(2.05)],
+            Vec::new(),
+        ),
+        mk(
+            "simple_ether_transfer/rex5",
+            vec![Some(2.50), Some(1.98), Some(1.86), Some(1.87), Some(1.88)],
+            Vec::new(),
+        ),
+        mk(
+            "salt_dynamic_gas/rex5/sstore_100",
+            vec![Some(1.99), Some(1.93), Some(1.95), Some(1.94), Some(1.95)],
+            Vec::new(),
+        ),
+        mk(
+            "sstore_heavy/rex5/sstore_100",
+            vec![Some(1.99), Some(1.97), Some(1.94), Some(1.93), Some(1.94)],
+            Vec::new(),
+        ),
+        mk(
+            "subcall_1000_transfer_1wei/rex5",
+            vec![Some(1.98), Some(1.96), None, Some(1.92), Some(1.93)],
+            Vec::new(),
+        ),
+        mk(
+            "subcall_1000_no_value/rex5",
+            vec![Some(1.87), Some(1.76), Some(1.76), Some(1.79), Some(1.81)],
+            Vec::new(),
+        ),
+        mk(
+            "sstore_heavy/rex5/sstore_sload_100",
+            vec![Some(1.79), Some(1.76), Some(1.77), Some(1.73), Some(1.73)],
+            Vec::new(),
+        ),
     ];
     render_trend(
         &out.join("trend.png"),
-        "mega-evm 10-commit headline trend",
+        "mega-evm headline (rex5, rex5_*) — last 5 commits",
         "revm_pinned",
         &commits,
         &series,

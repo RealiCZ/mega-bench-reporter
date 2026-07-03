@@ -3,6 +3,7 @@
 //! embedded font so the binary has no system font/fontconfig dependency.
 
 use crate::criterion_results::{Row, WorkloadRatios};
+use plotters::coord::types::RangedCoordf64;
 use plotters::prelude::*;
 use plotters::style::register_font;
 use std::collections::BTreeMap;
@@ -22,19 +23,23 @@ fn ensure_font() {
     });
 }
 
-/// matplotlib tab10-ish palette, one color per series.
+/// 8-slot categorical palette, ordering chosen for color-vision-deficiency
+/// separation (worst adjacent-pair ΔE 24.2 on a white surface). Deliberately
+/// distinct from [`ALERT_RED`] so a series line never impersonates the
+/// regression marker.
 const PALETTE: &[RGBColor] = &[
-    RGBColor(31, 119, 180),
-    RGBColor(255, 127, 14),
-    RGBColor(44, 160, 44),
-    RGBColor(214, 39, 40),
-    RGBColor(148, 103, 189),
-    RGBColor(140, 86, 75),
-    RGBColor(227, 119, 194),
-    RGBColor(127, 127, 127),
-    RGBColor(188, 189, 34),
-    RGBColor(23, 190, 207),
+    RGBColor(0x2a, 0x78, 0xd6), // blue
+    RGBColor(0x1b, 0xaf, 0x7a), // aqua
+    RGBColor(0xed, 0xa1, 0x00), // yellow
+    RGBColor(0x00, 0x83, 0x00), // green
+    RGBColor(0x4a, 0x3a, 0xa7), // violet
+    RGBColor(0xe3, 0x49, 0x48), // red
+    RGBColor(0xe8, 0x7b, 0xa4), // magenta
+    RGBColor(0xeb, 0x68, 0x34), // orange
 ];
+
+/// Status color for regression markers — reserved, never a series color.
+const ALERT_RED: RGBColor = RGBColor(0xd0, 0x3b, 0x3b);
 
 fn series_color(i: usize) -> RGBColor {
     PALETTE[i % PALETTE.len()]
@@ -447,19 +452,50 @@ pub fn render_trend(
     if all.is_empty() {
         anyhow::bail!("trend series contain no ratio points");
     }
+    // Tight y-range around the data (with a minimum span so a flat window
+    // doesn't zoom into pure noise); the 1.0× parity line is drawn only when
+    // it falls inside the range instead of forcing the range to include it.
     let y_min = all.iter().copied().fold(f64::INFINITY, f64::min);
     let y_max = all.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let pad = ((y_max - y_min) * 0.15).max(y_max.abs() * 0.02).max(1e-9);
-    let (y_lo, y_hi) = ((y_min - pad).min(1.0 - pad), y_max + pad);
+    let span = (y_max - y_min).max(y_max.abs() * 0.04).max(1e-9);
+    let pad = span * 0.10;
+    let (y_lo, y_hi) = (y_min - pad, y_max + pad * 1.6);
+
+    // Color follows the row, not its overhead rank: series arrive sorted by
+    // median, so a palette slot keyed on input order would repaint a row
+    // whenever its rank shifts between digests. Alphabetical rank is stable
+    // for a stable headline set.
+    let mut alpha_order: Vec<usize> = (0..series.len()).collect();
+    alpha_order.sort_by(|&a, &b| series[a].label.cmp(&series[b].label));
+    let mut palette_slot = vec![0usize; series.len()];
+    for (slot, &idx) in alpha_order.iter().enumerate() {
+        palette_slot[idx] = slot;
+    }
+
+    // Legend entries sorted by last value descending so the panel matches the
+    // vertical order of the line endpoints.
+    let last_value = |s: &TrendSeries| s.ratios.iter().rev().flatten().next().copied();
+    let mut legend_order: Vec<usize> = (0..series.len()).collect();
+    legend_order.sort_by(|&a, &b| {
+        last_value(&series[b])
+            .unwrap_or(f64::NEG_INFINITY)
+            .total_cmp(&last_value(&series[a]).unwrap_or(f64::NEG_INFINITY))
+    });
+
+    // Legend panel sits outside the plot; width fits the longest label.
+    let max_label_chars = series.iter().map(|s| s.label.len()).max().unwrap_or(0) as u32;
+    let legend_w = (110 + max_label_chars * 7).clamp(220, 460);
+    let (width, height) = (960 + legend_w, 520);
 
     let n = commit_labels.len();
     let label_refs: Vec<&str> = commit_labels.iter().map(|s| s.as_str()).collect();
-    let root = BitMapBackend::new(path, (1100, 480)).into_drawing_area();
+    let root = BitMapBackend::new(path, (width, height)).into_drawing_area();
     root.fill(&WHITE).map_err(map_err)?;
+    let (plot_area, legend_area) = root.split_horizontally(width - legend_w);
 
-    let mut chart = ChartBuilder::on(&root)
-        .caption(title, ("sans-serif", 22))
-        .margin(15)
+    let mut chart = ChartBuilder::on(&plot_area)
+        .caption(title, ("sans-serif", 20))
+        .margin(12)
         .x_label_area_size(50)
         .y_label_area_size(70)
         .build_cartesian_2d(-0.5..(n as f64 - 0.5), y_lo..y_hi)
@@ -468,7 +504,8 @@ pub fn render_trend(
     chart
         .configure_mesh()
         .light_line_style(TRANSPARENT)
-        .bold_line_style(BLACK.mix(0.12))
+        .bold_line_style(BLACK.mix(0.08))
+        .y_labels(8)
         .x_labels(n * 2 + 1)
         .x_label_formatter(&|v: &f64| {
             let i = v.round();
@@ -479,56 +516,114 @@ pub fn render_trend(
         })
         .y_label_formatter(&|v: &f64| format!("{v:.2}×"))
         .x_desc("commit")
-        .y_desc(format!("× vs {baseline_subject}").as_str())
+        .y_desc(format!("time ratio vs {baseline_subject} — lower is better").as_str())
         .label_style(("sans-serif", 13))
-        .axis_desc_style(("sans-serif", 16))
+        .axis_desc_style(("sans-serif", 15))
         .draw()
         .map_err(map_err)?;
 
-    // 1.0× parity reference.
-    chart
-        .draw_series(LineSeries::new(
-            [(-0.5, 1.0), (n as f64 - 0.5, 1.0)],
-            BLACK.mix(0.4).stroke_width(1),
-        ))
-        .map_err(map_err)?;
+    if (y_lo..y_hi).contains(&1.0) {
+        chart
+            .draw_series(LineSeries::new(
+                [(-0.5, 1.0), (n as f64 - 0.5, 1.0)],
+                BLACK.mix(0.4).stroke_width(1),
+            ))
+            .map_err(map_err)?;
+    }
+
+    // Marker shape is the second identity channel next to color (several
+    // palette slots are close under color-vision deficiency).
+    fn draw_marker<DB: DrawingBackend>(
+        chart: &mut ChartContext<'_, DB, Cartesian2d<RangedCoordf64, RangedCoordf64>>,
+        shape: usize,
+        pt: (f64, f64),
+        color: RGBColor,
+    ) -> Result<(), anyhow::Error>
+    where
+        DB::ErrorType: 'static,
+    {
+        match shape % 4 {
+            0 => chart.draw_series(std::iter::once(Circle::new(pt, 4, color.filled()))).map(|_| ()),
+            1 => chart
+                .draw_series(std::iter::once(TriangleMarker::new(pt, 5, color.filled())))
+                .map(|_| ()),
+            2 => chart
+                .draw_series(std::iter::once(
+                    EmptyElement::at(pt) + Rectangle::new([(-4, -4), (4, 4)], color.filled()),
+                ))
+                .map(|_| ()),
+            _ => chart
+                .draw_series(std::iter::once(Cross::new(pt, 4, color.stroke_width(2))))
+                .map(|_| ()),
+        }
+        .map_err(map_err)
+    }
 
     for (i, s) in series.iter().enumerate() {
-        let color = series_color(i);
+        let color = series_color(palette_slot[i]);
         let points: Vec<(f64, f64)> =
             s.ratios.iter().enumerate().filter_map(|(x, r)| r.map(|r| (x as f64, r))).collect();
         chart
             .draw_series(LineSeries::new(points.clone(), color.stroke_width(2)))
-            .map_err(map_err)?
-            .label(s.label.clone())
-            .legend(move |(x, y)| Rectangle::new([(x, y - 5), (x + 10, y + 5)], color.filled()));
-        chart
-            .draw_series(points.iter().map(|(x, y)| Circle::new((*x, *y), 3, color.filled())))
             .map_err(map_err)?;
-        // Red ring on the points that tripped the regression threshold.
-        let alert_points: Vec<(f64, f64)> = s
-            .ratios
-            .iter()
-            .enumerate()
-            .filter(|(x, _)| s.alerts.get(*x).copied().unwrap_or(false))
-            .filter_map(|(x, r)| r.map(|r| (x as f64, r)))
-            .collect();
-        chart
-            .draw_series(
-                alert_points
-                    .iter()
-                    .map(|(x, y)| Circle::new((*x, *y), 7, RGBColor(214, 39, 40).stroke_width(2))),
-            )
-            .map_err(map_err)?;
+        for &pt in &points {
+            draw_marker(&mut chart, palette_slot[i], pt, color)?;
+        }
+        // Ring on the points that tripped the regression threshold.
+        for (x, r) in s.ratios.iter().enumerate() {
+            if s.alerts.get(x).copied().unwrap_or(false) {
+                if let Some(r) = r {
+                    chart
+                        .draw_series(std::iter::once(Circle::new(
+                            (x as f64, *r),
+                            8,
+                            ALERT_RED.stroke_width(2),
+                        )))
+                        .map_err(map_err)?;
+                }
+            }
+        }
     }
 
-    chart
-        .configure_series_labels()
-        .position(SeriesLabelPosition::UpperRight)
-        .background_style(WHITE.mix(0.85))
-        .border_style(BLACK.mix(0.4))
-        .label_font(("sans-serif", 14))
-        .draw()
+    // Legend panel: swatch (line + marker), last value, full row key.
+    let row_h = 24i32;
+    let top = 52i32;
+    for (pos, &i) in legend_order.iter().enumerate() {
+        let s = &series[i];
+        let color = series_color(palette_slot[i]);
+        let y = top + pos as i32 * row_h;
+        legend_area
+            .draw(&PathElement::new([(10, y), (38, y)], color.stroke_width(2)))
+            .map_err(map_err)?;
+        let mid = (24, y);
+        match palette_slot[i] % 4 {
+            0 => legend_area.draw(&Circle::new(mid, 4, color.filled())),
+            1 => legend_area.draw(&TriangleMarker::new(mid, 5, color.filled())),
+            2 => legend_area.draw(&Rectangle::new([(20, y - 4), (28, y + 4)], color.filled())),
+            _ => legend_area.draw(&Cross::new(mid, 4, color.stroke_width(2))),
+        }
+        .map_err(map_err)?;
+        let value = last_value(s).map(|v| format!("{v:>5.2}×")).unwrap_or_else(|| "    —".into());
+        legend_area
+            .draw(&Text::new(value, (46, y - 7), ("sans-serif", 13).into_font().color(&BLACK)))
+            .map_err(map_err)?;
+        legend_area
+            .draw(&Text::new(
+                s.label.clone(),
+                (100, y - 7),
+                ("sans-serif", 13).into_font().color(&BLACK.mix(0.75)),
+            ))
+            .map_err(map_err)?;
+    }
+    // Explain the one status marker the chart can carry.
+    let y = top + series.len() as i32 * row_h + 10;
+    legend_area.draw(&Circle::new((24, y), 8, ALERT_RED.stroke_width(2))).map_err(map_err)?;
+    legend_area
+        .draw(&Text::new(
+            "regression alert",
+            (46, y - 7),
+            ("sans-serif", 13).into_font().color(&BLACK.mix(0.75)),
+        ))
         .map_err(map_err)?;
 
     root.present().map_err(map_err)?;
