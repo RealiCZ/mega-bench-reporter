@@ -138,6 +138,16 @@ impl RepoStore {
         ))
     }
 
+    /// Ad-hoc (manual `trend` subcommand) window dir — same naming scheme as
+    /// digests, under `trends/` so the automatic digests stay untouched.
+    pub fn trend_dir(&self, day: &str, first_sha: &str, last_sha: &str) -> PathBuf {
+        self.root.join("trends").join(format!(
+            "{day}-{}..{}",
+            short_sha(first_sha),
+            short_sha(last_sha)
+        ))
+    }
+
     pub fn flame_dir(&self, day: &str) -> PathBuf {
         self.root.join("flame").join(day)
     }
