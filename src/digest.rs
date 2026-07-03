@@ -241,19 +241,27 @@ pub struct TrendOutcome {
     pub commits: Vec<String>,
 }
 
+/// Row/output selection for [`build_adhoc_trend`].
+pub struct TrendRequest<'a> {
+    /// Row keys to chart (exact or trailing `*`); empty = the headline family.
+    pub row_patterns: &'a [String],
+    /// Explicit output directory; `None` = `trends/<day>-<first>..<last>`.
+    pub out: Option<PathBuf>,
+}
+
 /// The manual counterpart of the digest: charts an arbitrary window of
-/// already-stored records into `trends/` (or `out`). Read-only — no bench,
-/// no state, no events, no digest counter.
+/// already-stored records into `trends/` (or `request.out`). Read-only — no
+/// bench, no state, no events, no digest counter.
 pub fn build_adhoc_trend(
     store: &RepoStore,
     repo_name: &str,
     headline_label: &str,
     is_headline: impl Fn(&str) -> bool,
-    row_patterns: &[String],
     regression_threshold_pct: f64,
     records: &[CommitRecord],
-    out: Option<PathBuf>,
+    request: TrendRequest<'_>,
 ) -> anyhow::Result<TrendOutcome> {
+    let TrendRequest { row_patterns, out } = request;
     if records.is_empty() {
         anyhow::bail!("no stored commit records in the requested window");
     }
@@ -393,10 +401,9 @@ mod tests {
             "mega-evm",
             "rex5, rex5_*",
             rex5_family,
-            &["salt_dynamic_gas/rex4/*".to_string()],
             10.0,
             &records,
-            None,
+            TrendRequest { row_patterns: &["salt_dynamic_gas/rex4/*".to_string()], out: None },
         )
         .unwrap();
         assert_eq!(rex4.rows, vec!["salt_dynamic_gas/rex4/sstore_100".to_string()]);
@@ -411,10 +418,9 @@ mod tests {
             "mega-evm",
             "rex5, rex5_*",
             rex5_family,
-            &[],
             10.0,
             &records,
-            None,
+            TrendRequest { row_patterns: &[], out: None },
         )
         .unwrap();
         assert_eq!(headline.rows.len(), 2);
@@ -425,10 +431,9 @@ mod tests {
             "mega-evm",
             "rex5, rex5_*",
             rex5_family,
-            &["nope/*".to_string()],
             10.0,
             &records,
-            None,
+            TrendRequest { row_patterns: &["nope/*".to_string()], out: None },
         )
         .is_err());
     }

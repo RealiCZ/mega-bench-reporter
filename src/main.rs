@@ -176,10 +176,9 @@ fn run() -> anyhow::Result<()> {
                 &repo,
                 &repo_cfg.headline_label(),
                 |s| repo_cfg.is_headline(s),
-                &rows,
                 settings.regression_threshold_pct,
                 &window,
-                out,
+                digest::TrendRequest { row_patterns: &rows, out },
             )?;
             println!(
                 "{}",
