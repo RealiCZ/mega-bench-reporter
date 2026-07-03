@@ -37,6 +37,29 @@ Exactly one JSON document (logs go to stderr); the same facts are durable on dis
 }
 ```
 
+## Manual trend chart (read-only)
+
+```
+mega-bench-reporter trend --repo <name> --config repos.toml --data-root <dir> \
+    [--last N] [--from <sha-prefix>] [--to <sha-prefix>] [--row <key>]... [--out <dir>]
+```
+
+Charts an arbitrary window of **already-stored** commits — nothing is benched,
+no state or events are touched, and the automatic digest counter is unaffected.
+Use it to answer "show me the last 30 commits" or "how has this one row moved"
+without waiting for the next digest.
+
+- Window: the most recent `--last` N records (default 20), or an explicit
+  inclusive `--from`/`--to` sha-prefix range (overrides `--last`; either end
+  may be omitted).
+- Rows: defaults to the configured headline family; `--row` (repeatable,
+  exact key or trailing `*`, e.g. `--row 'salt_dynamic_gas/*'`) charts any
+  stored row instead, including non-headline ones.
+- Output: `summary.json` + `trend.png` (same shape as a digest) under
+  `<data-root>/<repo>/trends/<day>-<first7>..<last7>/`, or `--out <dir>`.
+- stdout: one JSON document — `{repo, output_dir, commits, rows}`.
+- Needs no lock and is safe to run while a bench run is in progress.
+
 ## Nightly flamegraph (archive only)
 
 ```bash

@@ -21,6 +21,8 @@ A consuming agent (e.g. BB9) polls a single pointer file, reads the data, and co
 5. Check headline rows against their rolling medians and record regression/recovery events; every Nth commit, roll a digest (`summary.json` + `trend.png`).
 6. Atomically update `latest.json` — the pointer consumers poll.
 
+**On demand** (`trend --repo <name> --last 30`, or `--from <sha> --to <sha>`, `--row <key>`): charts any window of already-stored commits into `trends/` — read-only, independent of the automatic digest.
+
 **Nightly** (`flamegraph --repo <name>`): profile the configured workloads (Linux `perf` / macOS `sample`), render per-workload flame graphs + differentials via `inferno` into `flame/<day>/`, prune past retention.
 Archive only — no events, plain cron is enough.
 
@@ -54,6 +56,8 @@ stdout is one JSON summary — `{repo, sha, output_dir, failed_targets, events}`
   digests/<YYYYMMDD>-<first>..<last>/
     summary.json          # headline ratio series over the window
     trend.png             # trend chart, red rings on threshold-tripping points
+  trends/<YYYYMMDD>-<first>..<last>/
+    ...                   # manual `trend` runs, same shape as a digest
   flame/<YYYYMMDD>/       # nightly flame graphs (SVG + differential), archive-only
   state.json              # rolling windows, event latches, digest counter
 ```

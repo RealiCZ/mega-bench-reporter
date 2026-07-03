@@ -17,6 +17,7 @@ consuming agent's job, following these docs.
 |---|---|
 | `mega-bench-reporter run --repo <name> --sha <sha> --config repos.toml --data-root <dir>` | per-commit pipeline: bench → parse → charts + table JSON → store → events (regression/recovery/digest) |
 | `mega-bench-reporter flamegraph --repo <name> --config repos.toml --data-root <dir>` | nightly flame-graph archive into `flame/<day>/` — no events, nothing to relay |
+| `mega-bench-reporter trend --repo <name> --config repos.toml --data-root <dir> [--last N \| --from <sha> --to <sha>] [--row <key>]...` | manual trend chart over any stored-commit window into `trends/` — read-only, independent of the automatic digest |
 
 Ground rules: exit 0 = success; stdout = one JSON summary (facts are durable on disk
 regardless); stderr = logs; runs take tens of minutes — no short timeouts; a per-repo
