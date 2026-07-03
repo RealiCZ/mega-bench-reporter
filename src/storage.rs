@@ -153,11 +153,13 @@ impl RepoStore {
     }
 
     /// Writes `raw.json`, creating the commit directory; returns the directory
-    /// so chart renderers can drop their PNGs next to it.
+    /// so chart renderers can drop their PNGs next to it. Atomic: the `trend`
+    /// subcommand reads records without taking the repo lock, and a torn
+    /// raw.json would be silently skipped from its window.
     pub fn write_commit_record(&self, record: &CommitRecord) -> anyhow::Result<PathBuf> {
         let dir = self.commit_dir(record)?;
         std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("raw.json"), serde_json::to_string_pretty(record)?)?;
+        write_atomic(&dir.join("raw.json"), &serde_json::to_string_pretty(record)?)?;
         Ok(dir)
     }
 
@@ -209,11 +211,7 @@ impl RepoStore {
                 .format(&Rfc3339)
                 .unwrap_or_default(),
         });
-        let path = self.root.join("latest.json");
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(&latest)?)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        write_atomic(&self.root.join("latest.json"), &serde_json::to_string_pretty(&latest)?)
     }
 
     /// Exclusive per-repo advisory lock: two invocations for the same repo
@@ -255,6 +253,15 @@ impl RepoStore {
         pruned.sort();
         Ok(pruned)
     }
+}
+
+/// Write-to-temp + rename so concurrent readers never observe a torn file
+/// and a crash mid-write can't leave a truncated one behind.
+fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// `today - keep_days` as `YYYYMMDD`.
@@ -329,6 +336,8 @@ mod tests {
         let dir = store.write_commit_record(&r).unwrap();
         assert_eq!(dir, tmp.path().join("mega-evm/commits/20260702-abcdef0"));
         assert!(dir.join("raw.json").is_file());
+        // Atomic write: no temp file may survive next to the record.
+        assert!(!dir.join("raw.json.tmp").exists());
 
         let loaded = store.load_commit_records().unwrap();
         assert_eq!(loaded.len(), 1);

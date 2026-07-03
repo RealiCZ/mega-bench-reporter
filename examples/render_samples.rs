@@ -55,9 +55,14 @@ fn main() {
             ],
         },
     ];
-    let table = build_compare_table(&rows, &ratios, "rex5", &["revm_pinned".to_string()], |s| {
-        s.starts_with("rex5")
-    });
+    let table = build_compare_table(
+        &rows,
+        &ratios,
+        "rex5",
+        "revm_pinned",
+        &["revm_pinned".to_string()],
+        |s| s.starts_with("rex5"),
+    );
     std::fs::write(out.join("compare_table.json"), serde_json::to_string_pretty(&table).unwrap())
         .unwrap();
 

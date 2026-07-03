@@ -314,6 +314,7 @@ pub fn process_results(
         &rows,
         &ratios,
         &repo.headline_label(),
+        &repo.baseline_subject,
         &subject_order,
         is_headline,
     );

@@ -111,11 +111,13 @@ fn subject_rank(subject: &str, order: &[String]) -> (usize, String) {
 /// Assembles the comparison table from parsed rows + ratio tables.
 /// `is_headline` decides which subjects feed the ratio column;
 /// `subject_order` pins the leading columns (unlisted subjects follow
-/// alphabetically).
+/// alphabetically) and is display-only — `baseline_subject` is the
+/// configured ratio baseline regardless of column order.
 pub fn build_compare_table(
     rows: &[Row],
     ratios: &[WorkloadRatios],
     headline_label: &str,
+    baseline_subject: &str,
     subject_order: &[String],
     is_headline: impl Fn(&str) -> bool,
 ) -> CompareTable {
@@ -160,7 +162,7 @@ pub fn build_compare_table(
         subjects,
         rows: table_rows,
         headline_label: headline_label.to_string(),
-        baseline_subject: subject_order.first().cloned().unwrap_or_default(),
+        baseline_subject: baseline_subject.to_string(),
     }
 }
 
@@ -724,16 +726,37 @@ mod tests {
     #[test]
     fn test_build_compare_table_orders_subjects_and_picks_worst_headline_ratio() {
         let (rows, ratios) = sample_ratio_rows();
-        let table =
-            build_compare_table(&rows, &ratios, "rex5", &["revm_pinned".to_string()], |s| {
-                s.starts_with("rex5")
-            });
+        let table = build_compare_table(
+            &rows,
+            &ratios,
+            "rex5",
+            "revm_pinned",
+            &["revm_pinned".to_string()],
+            |s| s.starts_with("rex5"),
+        );
         assert_eq!(table.subjects, vec!["revm_pinned", "rex4", "rex5_salt"]);
         assert_eq!(table.rows.len(), 1);
         assert_eq!(table.rows[0].item, "salt_dynamic_gas/sstore_100");
         // Worst headline ratio (only rex5_salt matches the filter).
         assert_eq!(table.rows[0].headline_ratio, Some(2.0));
         assert!(table.rows[0].p95_us.iter().all(|v| v.is_some()));
+    }
+
+    #[test]
+    fn test_build_compare_table_baseline_label_independent_of_display_order() {
+        // subject_order is display-only: a configured order that doesn't lead
+        // with the baseline must not relabel the table's baseline_subject.
+        let (rows, ratios) = sample_ratio_rows();
+        let table = build_compare_table(
+            &rows,
+            &ratios,
+            "rex5",
+            "revm_pinned",
+            &["rex5_salt".to_string(), "rex4".to_string()],
+            |s| s.starts_with("rex5"),
+        );
+        assert_eq!(table.baseline_subject, "revm_pinned");
+        assert_eq!(table.subjects, vec!["rex5_salt", "rex4", "revm_pinned"]);
     }
 
     #[test]
