@@ -6,6 +6,7 @@ use crate::criterion_results::{Row, WorkloadRatios};
 use plotters::coord::types::RangedCoordf64;
 use plotters::prelude::*;
 use plotters::style::register_font;
+use plotters::style::text_anchor::{HPos, Pos, VPos};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Once;
@@ -482,10 +483,16 @@ pub fn render_trend(
             .total_cmp(&last_value(&series[a]).unwrap_or(f64::NEG_INFINITY))
     });
 
+    // Rendered at 2× and displayed downscaled: plotters' bitmap text has no
+    // hinting/subpixel positioning, so small glyphs come out ragged at 1:1 —
+    // supersampling is what makes the text crisp in chat/browser embeds.
+    const SS: i32 = 2;
+    let ss = SS as u32;
+
     // Legend panel sits outside the plot; width fits the longest label.
     let max_label_chars = series.iter().map(|s| s.label.len()).max().unwrap_or(0) as u32;
-    let legend_w = (110 + max_label_chars * 7).clamp(220, 460);
-    let (width, height) = (960 + legend_w, 520);
+    let legend_w = (110 + max_label_chars * 7).clamp(220, 460) * ss;
+    let (width, height) = (960 * ss + legend_w, 520 * ss);
 
     let n = commit_labels.len();
     let label_refs: Vec<&str> = commit_labels.iter().map(|s| s.as_str()).collect();
@@ -494,10 +501,10 @@ pub fn render_trend(
     let (plot_area, legend_area) = root.split_horizontally(width - legend_w);
 
     let mut chart = ChartBuilder::on(&plot_area)
-        .caption(title, ("sans-serif", 20))
-        .margin(12)
-        .x_label_area_size(50)
-        .y_label_area_size(70)
+        .caption(title, ("sans-serif", 20 * SS))
+        .margin(12 * SS)
+        .x_label_area_size(50 * SS)
+        .y_label_area_size(70 * SS)
         .build_cartesian_2d(-0.5..(n as f64 - 0.5), y_lo..y_hi)
         .map_err(map_err)?;
 
@@ -517,8 +524,8 @@ pub fn render_trend(
         .y_label_formatter(&|v: &f64| format!("{v:.2}×"))
         .x_desc("commit")
         .y_desc(format!("time ratio vs {baseline_subject} — lower is better").as_str())
-        .label_style(("sans-serif", 13))
-        .axis_desc_style(("sans-serif", 15))
+        .label_style(("sans-serif", 13 * SS))
+        .axis_desc_style(("sans-serif", 15 * SS))
         .draw()
         .map_err(map_err)?;
 
@@ -526,7 +533,7 @@ pub fn render_trend(
         chart
             .draw_series(LineSeries::new(
                 [(-0.5, 1.0), (n as f64 - 0.5, 1.0)],
-                BLACK.mix(0.4).stroke_width(1),
+                BLACK.mix(0.4).stroke_width(SS as u32),
             ))
             .map_err(map_err)?;
     }
@@ -543,17 +550,24 @@ pub fn render_trend(
         DB::ErrorType: 'static,
     {
         match shape % 4 {
-            0 => chart.draw_series(std::iter::once(Circle::new(pt, 4, color.filled()))).map(|_| ()),
+            0 => chart
+                .draw_series(std::iter::once(Circle::new(pt, 4 * SS, color.filled())))
+                .map(|_| ()),
             1 => chart
-                .draw_series(std::iter::once(TriangleMarker::new(pt, 5, color.filled())))
+                .draw_series(std::iter::once(TriangleMarker::new(pt, 5 * SS, color.filled())))
                 .map(|_| ()),
             2 => chart
                 .draw_series(std::iter::once(
-                    EmptyElement::at(pt) + Rectangle::new([(-4, -4), (4, 4)], color.filled()),
+                    EmptyElement::at(pt)
+                        + Rectangle::new([(-4 * SS, -4 * SS), (4 * SS, 4 * SS)], color.filled()),
                 ))
                 .map(|_| ()),
             _ => chart
-                .draw_series(std::iter::once(Cross::new(pt, 4, color.stroke_width(2))))
+                .draw_series(std::iter::once(Cross::new(
+                    pt,
+                    4 * SS as u32,
+                    color.stroke_width(2 * SS as u32),
+                )))
                 .map(|_| ()),
         }
         .map_err(map_err)
@@ -564,7 +578,7 @@ pub fn render_trend(
         let points: Vec<(f64, f64)> =
             s.ratios.iter().enumerate().filter_map(|(x, r)| r.map(|r| (x as f64, r))).collect();
         chart
-            .draw_series(LineSeries::new(points.clone(), color.stroke_width(2)))
+            .draw_series(LineSeries::new(points.clone(), color.stroke_width(2 * SS as u32)))
             .map_err(map_err)?;
         for &pt in &points {
             draw_marker(&mut chart, palette_slot[i], pt, color)?;
@@ -576,8 +590,8 @@ pub fn render_trend(
                     chart
                         .draw_series(std::iter::once(Circle::new(
                             (x as f64, *r),
-                            8,
-                            ALERT_RED.stroke_width(2),
+                            8 * SS,
+                            ALERT_RED.stroke_width(2 * SS as u32),
                         )))
                         .map_err(map_err)?;
                 }
@@ -586,43 +600,62 @@ pub fn render_trend(
     }
 
     // Legend panel: swatch (line + marker), last value, full row key.
-    let row_h = 24i32;
-    let top = 52i32;
+    let row_h = 24 * SS;
+    let top = 52 * SS;
     for (pos, &i) in legend_order.iter().enumerate() {
         let s = &series[i];
         let color = series_color(palette_slot[i]);
         let y = top + pos as i32 * row_h;
         legend_area
-            .draw(&PathElement::new([(10, y), (38, y)], color.stroke_width(2)))
+            .draw(&PathElement::new(
+                [(10 * SS, y), (38 * SS, y)],
+                color.stroke_width(2 * SS as u32),
+            ))
             .map_err(map_err)?;
-        let mid = (24, y);
+        let mid = (24 * SS, y);
         match palette_slot[i] % 4 {
-            0 => legend_area.draw(&Circle::new(mid, 4, color.filled())),
-            1 => legend_area.draw(&TriangleMarker::new(mid, 5, color.filled())),
-            2 => legend_area.draw(&Rectangle::new([(20, y - 4), (28, y + 4)], color.filled())),
-            _ => legend_area.draw(&Cross::new(mid, 4, color.stroke_width(2))),
+            0 => legend_area.draw(&Circle::new(mid, 4 * SS, color.filled())),
+            1 => legend_area.draw(&TriangleMarker::new(mid, 5 * SS, color.filled())),
+            2 => legend_area.draw(&Rectangle::new(
+                [(20 * SS, y - 4 * SS), (28 * SS, y + 4 * SS)],
+                color.filled(),
+            )),
+            _ => {
+                legend_area.draw(&Cross::new(mid, 4 * SS as u32, color.stroke_width(2 * SS as u32)))
+            }
         }
         .map_err(map_err)?;
-        let value = last_value(s).map(|v| format!("{v:>5.2}×")).unwrap_or_else(|| "    —".into());
+        // Right-anchored value column: a proportional font can't be aligned
+        // with space padding.
+        let value = last_value(s).map(|v| format!("{v:.2}×")).unwrap_or_else(|| "—".into());
         legend_area
-            .draw(&Text::new(value, (46, y - 7), ("sans-serif", 13).into_font().color(&BLACK)))
+            .draw(&Text::new(
+                value,
+                (92 * SS, y - 7 * SS),
+                ("sans-serif", 13 * SS)
+                    .into_font()
+                    .color(&BLACK)
+                    .pos(Pos::new(HPos::Right, VPos::Top)),
+            ))
             .map_err(map_err)?;
         legend_area
             .draw(&Text::new(
                 s.label.clone(),
-                (100, y - 7),
-                ("sans-serif", 13).into_font().color(&BLACK.mix(0.75)),
+                (100 * SS, y - 7 * SS),
+                ("sans-serif", 13 * SS).into_font().color(&BLACK.mix(0.75)),
             ))
             .map_err(map_err)?;
     }
     // Explain the one status marker the chart can carry.
-    let y = top + series.len() as i32 * row_h + 10;
-    legend_area.draw(&Circle::new((24, y), 8, ALERT_RED.stroke_width(2))).map_err(map_err)?;
+    let y = top + series.len() as i32 * row_h + 10 * SS;
+    legend_area
+        .draw(&Circle::new((24 * SS, y), 8 * SS, ALERT_RED.stroke_width(2 * SS as u32)))
+        .map_err(map_err)?;
     legend_area
         .draw(&Text::new(
             "regression alert",
-            (46, y - 7),
-            ("sans-serif", 13).into_font().color(&BLACK.mix(0.75)),
+            (46 * SS, y - 7 * SS),
+            ("sans-serif", 13 * SS).into_font().color(&BLACK.mix(0.75)),
         ))
         .map_err(map_err)?;
 
