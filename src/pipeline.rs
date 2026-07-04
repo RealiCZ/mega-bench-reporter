@@ -164,6 +164,10 @@ pub fn process_results(
         }
     }
 
+    // One run-wide subject→color mapping so every chart of this commit agrees.
+    let subject_colors =
+        charts::SubjectColors::new(&repo.baseline_subject, rows.iter().map(|r| r.subject.clone()));
+
     let speed_items: Vec<charts::SpeedBarItem> = ratios
         .iter()
         .filter_map(|wl| {
@@ -195,8 +199,8 @@ pub fn process_results(
                 record.short_sha(),
                 repo.baseline_subject
             ),
-            &repo.baseline_subject,
             &speed_items,
+            &subject_colors,
         ) {
             eprintln!("speed bars chart failed (continuing): {e:#}");
         }
@@ -218,6 +222,7 @@ pub fn process_results(
             &commit_dir.join(dist_file_name(&group, &workload)),
             &format!("{title} — per-call distribution"),
             &wl_rows,
+            &subject_colors,
         ) {
             eprintln!("violin chart for {title} failed (continuing): {e:#}");
         }

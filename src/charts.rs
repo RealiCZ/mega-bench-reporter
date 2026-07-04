@@ -52,6 +52,54 @@ fn series_color(i: usize) -> RGBColor {
     PALETTE[i % PALETTE.len()]
 }
 
+/// Neutral color reserved for the baseline subject in subject-keyed charts —
+/// the reference everything is measured against, visually de-emphasized so
+/// palette colors always mean "an implementation under comparison".
+const BASELINE_GRAY: RGBColor = RGBColor(144, 153, 176);
+
+/// Stable subject→color assignment shared by every subject-keyed chart of a
+/// run (speed bars and violins): the baseline gets [`BASELINE_GRAY`], every
+/// other subject gets a palette slot by alphabetical rank across the run's
+/// FULL subject set. Built once per run from all parsed rows, so `rex5_salt`
+/// wears the same color in the speed bars and in every violin even though
+/// each chart shows a different subject subset. (The trend chart is keyed on
+/// rows, not subjects — many rows share a subject — so it keeps its own
+/// per-row-key scheme.)
+#[derive(Debug, Clone)]
+pub struct SubjectColors {
+    baseline: String,
+    slots: std::collections::BTreeMap<String, usize>,
+}
+
+impl SubjectColors {
+    pub fn new<I, S>(baseline_subject: &str, subjects: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let non_baseline: std::collections::BTreeSet<String> =
+            subjects.into_iter().map(Into::into).filter(|s| s != baseline_subject).collect();
+        let slots = non_baseline.into_iter().enumerate().map(|(i, s)| (s, i)).collect();
+        Self { baseline: baseline_subject.to_string(), slots }
+    }
+
+    pub fn color(&self, subject: &str) -> RGBColor {
+        if subject == self.baseline {
+            BASELINE_GRAY
+        } else if let Some(&slot) = self.slots.get(subject) {
+            series_color(slot)
+        } else {
+            // A subject outside the set this mapping was built from —
+            // deterministic, but callers should build from the full set.
+            series_color(self.slots.len())
+        }
+    }
+
+    pub fn baseline(&self) -> &str {
+        &self.baseline
+    }
+}
+
 fn map_err<E: std::fmt::Display>(e: E) -> anyhow::Error {
     anyhow::anyhow!("chart rendering: {e}")
 }
@@ -83,18 +131,22 @@ pub struct SpeedBarItem {
 
 /// Grouped horizontal bar chart, one group per test item (horizontal because
 /// real item names like `salt_dynamic_gas/sstore_100` are far too long for
-/// the mock's vertical layout).
+/// the mock's vertical layout). The subject legend sits in its own panel to
+/// the right of the plot, like the trend chart's, so it never competes with
+/// bars for space.
 pub fn render_speed_bars(
     path: &Path,
     title: &str,
-    baseline_subject: &str,
     items: &[SpeedBarItem],
+    colors: &SubjectColors,
 ) -> anyhow::Result<()> {
     ensure_font();
     if items.is_empty() {
         anyhow::bail!("no items to render speed bars for");
     }
-    // Legend order = subject order of first appearance.
+    let baseline_subject = colors.baseline();
+    // Legend order = subject order of first appearance (baseline first, the
+    // way the pipeline feeds bars); also fixes each band's bar slot count.
     let mut legend_subjects: Vec<String> = Vec::new();
     for item in items {
         for (subject, _) in &item.bars {
@@ -103,14 +155,6 @@ pub fn render_speed_bars(
             }
         }
     }
-    let subject_color = |subject: &str| -> RGBColor {
-        if subject == baseline_subject {
-            RGBColor(144, 153, 176) // neutral gray-blue baseline
-        } else {
-            let i = legend_subjects.iter().position(|s| s == subject).unwrap_or(0);
-            series_color(i)
-        }
-    };
 
     let band = legend_subjects.len().max(1) as f64 + 1.0; // bars + gap per item
     let total = items.len() as f64 * band - 1.0;
@@ -119,23 +163,21 @@ pub fn render_speed_bars(
     let x_max = (max_percent * 1.15).max(118.0);
     let ss = SS as u32;
     let height =
-        (170 + (items.len() + 1) * (legend_subjects.len() * 22 + 14)).clamp(300, 2200) as u32 * ss;
-    // Reserve room below the last item for the legend box, in *data units*
-    // derived from its pixel size — stays correct when the height clamp above
-    // shrinks the pixels-per-band.
-    let legend_px = (22.0 * legend_subjects.len() as f64 + 18.0) * SS as f64;
-    let plot_px = (height as f64 - 130.0 * SS as f64).max(100.0);
-    let legend_space = (legend_px * (total + 1.0) / (plot_px - legend_px).max(100.0)).max(1.2);
-    let root = BitMapBackend::new(path, (1100 * ss, height)).into_drawing_area();
+        (150 + items.len() * (legend_subjects.len() * 22 + 14)).clamp(300, 2200) as u32 * ss;
+    // Legend panel outside the plot; width fits the longest subject name.
+    let max_subject_chars = legend_subjects.iter().map(|s| s.len()).max().unwrap_or(0) as u32;
+    let legend_w = (60 + max_subject_chars * 8).clamp(140, 320) * ss;
+    let root = BitMapBackend::new(path, (1100 * ss + legend_w, height)).into_drawing_area();
     root.fill(&WHITE).map_err(map_err)?;
+    let (plot_area, legend_area) = root.split_horizontally(1100 * ss);
 
     let labels: Vec<&str> = items.iter().map(|i| i.item.as_str()).collect();
-    let mut chart = ChartBuilder::on(&root)
+    let mut chart = ChartBuilder::on(&plot_area)
         .caption(title, ("sans-serif", 22 * SS))
         .margin(15 * SS)
         .x_label_area_size(45 * SS)
         .y_label_area_size(340 * SS)
-        .build_cartesian_2d(0.0..x_max, (-0.6 - legend_space)..(total + 0.6))
+        .build_cartesian_2d(0.0..x_max, -0.6..(total + 0.6))
         .map_err(map_err)?;
 
     let band_center = |i: usize| -> f64 {
@@ -148,7 +190,7 @@ pub fn render_speed_bars(
         .disable_y_mesh()
         .light_line_style(TRANSPARENT)
         .bold_line_style(BLACK.mix(0.12))
-        .y_labels(((total + legend_space) as usize) * 4 + 5)
+        .y_labels((total as usize) * 4 + 5)
         .y_label_formatter(&|v: &f64| {
             for (i, label) in labels.iter().enumerate() {
                 if (v - band_center(i)).abs() <= 0.26 {
@@ -170,7 +212,7 @@ pub fn render_speed_bars(
         for (b, (subject, percent)) in item.bars.iter().enumerate() {
             // Bar 0 (baseline) at the top of the band.
             let y = base + (legend_subjects.len() - 1 - b.min(legend_subjects.len() - 1)) as f64;
-            let color = subject_color(subject);
+            let color = colors.color(subject);
             chart
                 .draw_series(std::iter::once(Rectangle::new(
                     [(0.0, y - 0.42), (*percent, y + 0.42)],
@@ -190,30 +232,31 @@ pub fn render_speed_bars(
     // 100% reference line.
     chart
         .draw_series(LineSeries::new(
-            [(100.0, -0.6 - legend_space), (100.0, total + 0.6)],
+            [(100.0, -0.6), (100.0, total + 0.6)],
             BLACK.mix(0.45).stroke_width(ss),
         ))
         .map_err(map_err)?;
 
-    // Legend entries (empty series, label only).
-    for subject in &legend_subjects {
-        let color = subject_color(subject);
-        chart
-            .draw_series(LineSeries::new(std::iter::empty::<(f64, f64)>(), color.filled()))
-            .map_err(map_err)?
-            .label(subject.clone())
-            .legend(move |(x, y)| {
-                Rectangle::new([(x, y - 5 * SS), (x + 10 * SS, y + 5 * SS)], color.filled())
-            });
+    // Legend panel: color swatch + subject name, one row per subject.
+    let row_h = 24 * SS;
+    let top = 52 * SS;
+    for (pos, subject) in legend_subjects.iter().enumerate() {
+        let color = colors.color(subject);
+        let y = top + pos as i32 * row_h;
+        legend_area
+            .draw(&Rectangle::new(
+                [(10 * SS, y - 5 * SS), (24 * SS, y + 5 * SS)],
+                color.mix(0.9).filled(),
+            ))
+            .map_err(map_err)?;
+        legend_area
+            .draw(&Text::new(
+                subject.clone(),
+                (32 * SS, y - 7 * SS),
+                ("sans-serif", 13 * SS).into_font().color(&BLACK.mix(0.75)),
+            ))
+            .map_err(map_err)?;
     }
-    chart
-        .configure_series_labels()
-        .position(SeriesLabelPosition::LowerLeft)
-        .background_style(WHITE.mix(0.85))
-        .border_style(BLACK.mix(0.4))
-        .label_font(("sans-serif", 14 * SS))
-        .draw()
-        .map_err(map_err)?;
 
     root.present().map_err(map_err)?;
     Ok(())
@@ -242,8 +285,15 @@ fn gaussian_kde(samples: &[f64], grid: &[f64]) -> Vec<f64> {
 }
 
 /// Horizontal violin plot for one `(group, workload)`: one violin per subject,
-/// x = per-call time in µs, with min–max whiskers and a mean tick.
-pub fn render_violin(path: &Path, title: &str, rows: &[&Row]) -> anyhow::Result<()> {
+/// x = per-call time in µs, with min–max whiskers and a mean tick. Violin
+/// colors come from the run-wide [`SubjectColors`] so they agree with the
+/// speed-bar chart.
+pub fn render_violin(
+    path: &Path,
+    title: &str,
+    rows: &[&Row],
+    colors: &SubjectColors,
+) -> anyhow::Result<()> {
     ensure_font();
     if rows.is_empty() {
         anyhow::bail!("no rows to render a violin for");
@@ -300,7 +350,7 @@ pub fn render_violin(path: &Path, title: &str, rows: &[&Row]) -> anyhow::Result<
 
     let y_of = |i: usize| (n - 1 - i) as f64;
     for (i, samples) in samples_us.iter().enumerate() {
-        let color = series_color(i);
+        let color = colors.color(&rows[i].subject);
         let y = y_of(i);
 
         let lo = samples.iter().copied().fold(f64::INFINITY, f64::min);
@@ -585,6 +635,28 @@ mod tests {
         (0..n).map(|i| center_ns * (1.0 + 0.02 * ((i as f64 * 2.399).sin()))).collect()
     }
 
+    fn sample_colors() -> SubjectColors {
+        SubjectColors::new(
+            "revm_pinned",
+            ["revm_pinned", "rex4", "rex5", "rex5_salt", "rex5_oracle", "s"],
+        )
+    }
+
+    #[test]
+    fn test_subject_colors_baseline_reserved_and_stable_across_subsets() {
+        let colors = sample_colors();
+        assert_eq!(colors.baseline(), "revm_pinned");
+        assert_eq!(colors.color("revm_pinned"), BASELINE_GRAY);
+        // Non-baseline subjects take palette slots by alphabetical rank over
+        // the FULL set — independent of which chart asks.
+        assert_eq!(colors.color("rex4"), PALETTE[0]);
+        assert_eq!(colors.color("rex5"), PALETTE[1]);
+        assert_eq!(colors.color("rex5_oracle"), PALETTE[2]);
+        assert_eq!(colors.color("rex5_salt"), PALETTE[3]);
+        // The baseline never occupies a palette slot.
+        assert!(PALETTE.iter().all(|c| *c != BASELINE_GRAY));
+    }
+
     #[test]
     fn test_render_speed_bars_writes_png() {
         let tmp = tempfile::tempdir().unwrap();
@@ -603,7 +675,7 @@ mod tests {
                 bars: vec![("revm_pinned".into(), 100.0), ("rex5_oracle".into(), 143.0)],
             },
         ];
-        render_speed_bars(&path, "relative speed (revm_pinned = 100%)", "revm_pinned", &items)
+        render_speed_bars(&path, "relative speed (revm_pinned = 100%)", &items, &sample_colors())
             .unwrap();
         assert_png(&path);
     }
@@ -628,7 +700,13 @@ mod tests {
             std_dev_ns: 240.0,
             samples_ns: fake_samples(28000.0, 100),
         };
-        render_violin(&path, "salt_dynamic_gas/sstore_100", &[&baseline, &feature]).unwrap();
+        render_violin(
+            &path,
+            "salt_dynamic_gas/sstore_100",
+            &[&baseline, &feature],
+            &sample_colors(),
+        )
+        .unwrap();
         assert_png(&path);
     }
 
@@ -644,7 +722,7 @@ mod tests {
             std_dev_ns: 0.0,
             samples_ns: vec![1000.0; 50],
         };
-        render_violin(&path, "degenerate", &[&row]).unwrap();
+        render_violin(&path, "degenerate", &[&row], &sample_colors()).unwrap();
         assert_png(&path);
     }
 

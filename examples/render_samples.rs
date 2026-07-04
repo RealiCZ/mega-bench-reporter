@@ -67,6 +67,12 @@ fn main() {
     std::fs::write(out.join("compare_table.json"), serde_json::to_string_pretty(&table).unwrap())
         .unwrap();
 
+    // Built from the whole run's subject set, exactly like the pipeline does.
+    let colors = SubjectColors::new(
+        "revm_pinned",
+        rows.iter().map(|r| r.subject.clone()).chain(["rex5_oracle".to_string()]),
+    );
+
     let items = vec![
         SpeedBarItem {
             item: "salt_dynamic_gas/sstore_100".into(),
@@ -84,8 +90,8 @@ fn main() {
     render_speed_bars(
         &out.join("compare_bars.png"),
         "mega-evm relative speed (revm_pinned = 100%)",
-        "revm_pinned",
         &items,
+        &colors,
     )
     .unwrap();
 
@@ -98,6 +104,7 @@ fn main() {
         &out.join("dist.png"),
         "salt_dynamic_gas/sstore_100 — per-call distribution",
         &violin_rows.iter().collect::<Vec<_>>(),
+        &colors,
     )
     .unwrap();
 
