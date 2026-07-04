@@ -143,6 +143,25 @@ impl State {
         verdict
     }
 
+    /// Accepts a new performance level for the rows matching `patterns`
+    /// (exact row keys or trailing-`*` prefixes): drops their rolling history
+    /// AND their regression latch, so the next run re-baselines them as
+    /// FirstRun — no alert, fresh window. Returns the cleared row keys.
+    /// This is the `rebaseline` subcommand's core; the alternative was
+    /// hand-editing state.json.
+    pub fn clear_rows(&mut self, patterns: &[String]) -> Vec<String> {
+        let matched: Vec<String> = self
+            .rows
+            .keys()
+            .filter(|key| patterns.iter().any(|p| crate::config::star_pattern_matches(p, key)))
+            .cloned()
+            .collect();
+        for key in &matched {
+            self.rows.remove(key);
+        }
+        matched
+    }
+
     /// Bumps the digest counter; returns `true` when it has reached
     /// `batch_size` (caller should build+send a digest, then call
     /// `reset_digest_counter`).
@@ -265,6 +284,33 @@ mod tests {
             state.check_and_record(key, 2.35, 10.0, 20),
             Verdict::NewRegression { .. }
         ));
+    }
+
+    #[test]
+    fn test_clear_rows_drops_history_and_latch_by_pattern() {
+        let mut state = State::default();
+        // Two latched regressed rows and one healthy row.
+        for key in ["g/rex5_salt/w", "g/rex5/w", "other/rex5/w"] {
+            for _ in 0..3 {
+                state.check_and_record(key, 2.0, 10.0, 20);
+            }
+        }
+        assert!(state.check_and_record("g/rex5_salt/w", 3.0, 10.0, 20).is_regressed());
+        assert!(state.check_and_record("g/rex5/w", 3.0, 10.0, 20).is_regressed());
+
+        let cleared = state.clear_rows(&["g/*".to_string()]);
+        assert_eq!(cleared, vec!["g/rex5/w".to_string(), "g/rex5_salt/w".to_string()]);
+        // The untouched row keeps its window.
+        assert_eq!(state.rows.len(), 1);
+        assert!(state.rows.contains_key("other/rex5/w"));
+
+        // Cleared rows re-baseline at the NEW level: FirstRun, no alert, and
+        // a later value near the new level stays Ok.
+        assert_eq!(state.check_and_record("g/rex5_salt/w", 3.0, 10.0, 20), Verdict::FirstRun);
+        assert_eq!(state.check_and_record("g/rex5_salt/w", 3.05, 10.0, 20), Verdict::Ok);
+
+        // A pattern matching nothing clears nothing.
+        assert!(state.clear_rows(&["nope/*".to_string()]).is_empty());
     }
 
     #[test]

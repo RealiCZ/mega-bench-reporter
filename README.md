@@ -23,6 +23,8 @@ A consuming agent (e.g. BB9) polls a single pointer file, reads the data, and co
 
 **On demand** (`trend --repo <name> --last 30`, or `--from <sha> --to <sha>`, `--row <key>`): charts any window of already-stored commits into `trends/` — read-only, independent of the automatic digest.
 
+**On decision** (`rebaseline --repo <name> --row <key-or-prefix*>`): accept a latched regression as the new normal — clears the matching rows' rolling history and latch from `state.json` so the next run re-baselines them without an alert.
+
 **Nightly** (`flamegraph --repo <name>`): profile the configured workloads (Linux `perf` / macOS `sample`), render per-workload flame graphs + differentials via `inferno` into `flame/<day>/`, prune past retention.
 Archive only — no events, plain cron is enough.
 

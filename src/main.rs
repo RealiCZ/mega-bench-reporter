@@ -7,6 +7,7 @@
 use clap::{Parser, Subcommand};
 use mega_bench_reporter::config::Config;
 use mega_bench_reporter::pipeline::Event;
+use mega_bench_reporter::state::State;
 use mega_bench_reporter::storage::RepoStore;
 use mega_bench_reporter::{digest, flamegraph, pipeline};
 use serde::Serialize;
@@ -91,6 +92,22 @@ enum Command {
         /// `<data-root>/<repo>/trends/<day>-<first>..<last>`).
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+    /// Accept a regressed level as the new normal: clear the matching rows'
+    /// rolling history and regression latch from state.json, so the next run
+    /// re-baselines them (FirstRun, no alert). Operates on stored state only —
+    /// no config file needed.
+    Rebaseline {
+        /// Repo name — the `<data-root>/<repo>/` directory holding state.json.
+        #[arg(long)]
+        repo: String,
+        /// Root of the categorized data store (`<data-root>/<repo>/...`).
+        #[arg(long)]
+        data_root: PathBuf,
+        /// Row key to clear, repeatable (exact or trailing `*`, e.g.
+        /// `salt_dynamic_gas/rex5_salt/*`).
+        #[arg(long = "row", required = true)]
+        rows: Vec<String>,
     },
 }
 
@@ -187,6 +204,31 @@ fn run() -> anyhow::Result<()> {
                     "output_dir": outcome.dir,
                     "commits": outcome.commits,
                     "rows": outcome.rows,
+                }))?
+            );
+            return Ok(());
+        }
+        Command::Rebaseline { repo, data_root, rows } => {
+            let data_root = canonical_data_root(data_root)?;
+            let store = RepoStore::new(&data_root, &repo);
+            // Same exclusive lock as `run` — this mutates state.json.
+            let _lock = store.acquire_lock()?;
+            let mut state = State::load(&store.state_path())?;
+            let cleared = state.clear_rows(&rows);
+            if cleared.is_empty() {
+                anyhow::bail!(
+                    "no tracked rows match {:?} in {} — check the pattern against the row keys \
+                     in state.json",
+                    rows,
+                    store.state_path().display()
+                );
+            }
+            state.save(&store.state_path())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "repo": repo,
+                    "cleared": cleared,
                 }))?
             );
             return Ok(());

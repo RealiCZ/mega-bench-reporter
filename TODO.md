@@ -35,9 +35,8 @@ None of these block using the tool; they need a joint decision or a follow-up ou
 6d. **Recovery has no hysteresis.**
    Recovery = the latched row returning within the SAME +10% band it regressed past (vs the frozen pre-regression median), so recovery ≠ back-to-original (settling at +9.9% counts), and a row oscillating around the threshold emits alternating regression/recovery event pairs.
    If that proves noisy, add a stricter recovery threshold (e.g. regress at +10%, recover under +5%) — one config knob + one comparison.
-6c. **Accepted-regression workflow is manual.**
-   A sustained regression stays latched forever (baseline frozen); accepting the new level means deleting that row from `state.json`.
-   A `rebaseline` subcommand would formalize this if it happens often.
+6c. ~~Accepted-regression workflow is manual.~~ **Resolved:** the `rebaseline` subcommand clears matching rows' history + latch from `state.json` (`--row <key-or-prefix*>`, repeatable); the next run re-baselines them as FirstRun with no alert.
+   See `skill/references/cli.md`.
 7. **Same-day short-sha collision.**
    Commit dirs are keyed `<YYYYMMDD>-<7-char-sha>`; two same-day commits sharing a 7-char prefix would overwrite each other (probability ~1e-8 per pair, accepted).
 
