@@ -101,19 +101,25 @@ pub fn ensure_checkout(work_root: &Path, repo: &RepoConfig) -> anyhow::Result<Pa
     Ok(checkout)
 }
 
-/// Fetches the tracked branch and checks out `sha` (detached), updating
-/// submodules. `--force` so tracked files rewritten by a previous bench run
-/// (classic: a regenerated `Cargo.lock`) can't wedge the checkout. Falls back
-/// to fetching the sha directly if the branch fetch didn't make it reachable
-/// (e.g. a force-pushed branch).
+/// Checks out `sha` (detached), updating submodules. The tracked branch is
+/// fetched only when the sha isn't already in the object store — historical
+/// backfills and re-runs then need no network round-trip at all. `--force` so
+/// tracked files rewritten by a previous bench run (classic: a regenerated
+/// `Cargo.lock`) can't wedge the checkout. Falls back to fetching the sha
+/// directly if the branch fetch didn't make it reachable (e.g. a force-pushed
+/// branch).
 pub fn checkout_commit(checkout: &Path, repo: &RepoConfig, sha: &str) -> anyhow::Result<()> {
     let cred = git_credential_args(&repo.clone_url);
     let cred_refs: Vec<&str> = cred.iter().map(String::as_str).collect();
 
-    let fetch_branch: Vec<&str> = [&cred_refs[..], &["fetch", "origin", &repo.branch]].concat();
-    with_network_retry("git fetch", GIT_RETRY_BACKOFF_SECS, || {
-        git(checkout, &fetch_branch, "git fetch").map(|_| ())
-    })?;
+    let is_local =
+        git(checkout, &["cat-file", "-e", &format!("{sha}^{{commit}}")], "git cat-file").is_ok();
+    if !is_local {
+        let fetch_branch: Vec<&str> = [&cred_refs[..], &["fetch", "origin", &repo.branch]].concat();
+        with_network_retry("git fetch", GIT_RETRY_BACKOFF_SECS, || {
+            git(checkout, &fetch_branch, "git fetch").map(|_| ())
+        })?;
+    }
     if git(checkout, &["checkout", "--force", "--detach", sha], "git checkout").is_err() {
         let fetch_sha: Vec<&str> = [&cred_refs[..], &["fetch", "origin", sha]].concat();
         with_network_retry("git fetch <sha>", GIT_RETRY_BACKOFF_SECS, || {
@@ -190,6 +196,58 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(attempts, 2, "one initial try + one retry");
+    }
+
+    /// Runs a git command in `dir`, panicking on failure (test setup only).
+    fn sh(dir: &Path, args: &[&str]) -> String {
+        run_cmd(Command::new("git").arg("-C").arg(dir).args(args), "git (test setup)").unwrap()
+    }
+
+    fn local_repo_config(name: &str, clone_url: &str) -> RepoConfig {
+        RepoConfig {
+            name: name.to_string(),
+            github: format!("test/{name}"),
+            branch: "main".to_string(),
+            clone_url: clone_url.to_string(),
+            bench_targets: Vec::new(),
+            baseline_subject: "base".to_string(),
+            headline_subjects: vec!["feat".to_string()],
+            subject_order: None,
+            package: None,
+            tuning: Default::default(),
+            flamegraph: None,
+        }
+    }
+
+    #[test]
+    fn test_checkout_commit_needs_no_network_when_sha_is_local() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        sh(&origin, &["init", "-b", "main"]);
+        sh(&origin, &["config", "user.email", "test@example.com"]);
+        sh(&origin, &["config", "user.name", "test"]);
+        sh(&origin, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(origin.join("f.txt"), "one").unwrap();
+        sh(&origin, &["add", "."]);
+        sh(&origin, &["commit", "-m", "one"]);
+        let old_sha = sh(&origin, &["rev-parse", "HEAD"]);
+        std::fs::write(origin.join("f.txt"), "two").unwrap();
+        sh(&origin, &["commit", "-am", "two"]);
+
+        let repo = local_repo_config("tracked", origin.to_str().unwrap());
+        let checkout = ensure_checkout(&tmp.path().join("work"), &repo).unwrap();
+
+        // Cut the remote. If checkout_commit still fetched, it would fail (and
+        // sit through the retry backoff) — a locally-present sha must not need
+        // the network at all.
+        sh(&checkout, &["remote", "set-url", "origin", tmp.path().join("gone").to_str().unwrap()]);
+        checkout_commit(&checkout, &repo, &old_sha).unwrap();
+        assert_eq!(head_sha(&checkout).unwrap(), old_sha);
+
+        // Re-checkout of the same sha stays offline-safe too (idempotent path).
+        checkout_commit(&checkout, &repo, &old_sha).unwrap();
+        assert_eq!(head_sha(&checkout).unwrap(), old_sha);
     }
 
     #[test]
