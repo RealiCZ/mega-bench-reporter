@@ -17,7 +17,7 @@ use crate::config::{RepoConfig, Settings};
 use crate::criterion_results::{self, Row};
 use crate::digest;
 use crate::git::{self, CommitMeta};
-use crate::state::{State, Verdict};
+use crate::state::{State, Thresholds, Verdict};
 use crate::storage::{CommitRecord, RepoStore};
 use crate::subprocess::drain_stdout_to_stderr;
 use serde::Serialize;
@@ -34,7 +34,8 @@ pub enum Event {
     /// A headline row rose past the regression threshold this run (fires once
     /// per regression — latched until recovery).
     Regression { row_key: String, baseline_median: f64, current: f64, pct_over: f64 },
-    /// A previously-regressed headline row dropped back under the threshold.
+    /// A previously-regressed headline row dropped back within the recovery
+    /// threshold of its frozen pre-regression median.
     Recovery { row_key: String, baseline_median: f64, current: f64 },
     /// A digest window completed; its data is in `dir` (repo-relative).
     Digest { dir: String },
@@ -240,7 +241,10 @@ pub fn process_results(
                 let verdict = state.check_and_record(
                     &key,
                     ratio,
-                    settings.regression_threshold_pct,
+                    Thresholds {
+                        regression_pct: settings.regression_threshold_pct,
+                        recovery_pct: settings.recovery_threshold_pct,
+                    },
                     settings.rolling_window,
                 );
                 if !is_headline(&ratio_row.subject) {

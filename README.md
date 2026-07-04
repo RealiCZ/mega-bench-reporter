@@ -72,6 +72,7 @@ Full schemas and rules: [`skill/references/data-layout.md`](skill/references/dat
 ```toml
 [defaults]                        # global tuning, overridable per repo
 regression_threshold_pct = 10.0
+# recovery_threshold_pct = 5.0    # hysteresis: recover only under this; unset = no hysteresis
 rolling_window = 20
 digest_batch_size = 10
 # bench_profile = "profiling"     # unset = cargo's default bench profile (matches CI)

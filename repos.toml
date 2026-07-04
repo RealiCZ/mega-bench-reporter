@@ -10,6 +10,11 @@
 # ~4 sigma; recalibrate from state.json's recent_ratios after ~20 real runs
 # on the production box (built-in fallback stays at 10).
 regression_threshold_pct = 5.0
+# A latched row recovers only when back within this % of its frozen median
+# (must be <= regression_threshold_pct). Unset = same as the regression
+# threshold, i.e. no hysteresis; set lower if alternating regression/recovery
+# event pairs show up from rows oscillating around the threshold.
+# recovery_threshold_pct = 2.5
 # How many healthy (non-regressed) runs feed the rolling median.
 rolling_window = 20
 # Commits per trend digest.

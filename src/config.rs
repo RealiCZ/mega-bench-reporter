@@ -74,6 +74,10 @@ pub struct Tuning {
     /// Alert when a headline row rises more than this % over its rolling
     /// median (built-in: 10).
     pub regression_threshold_pct: Option<f64>,
+    /// A latched row recovers only when back within this % of its frozen
+    /// median (hysteresis; must be <= the regression threshold). Unset = the
+    /// regression threshold, i.e. no hysteresis.
+    pub recovery_threshold_pct: Option<f64>,
     /// How many healthy runs feed the rolling median (built-in: 20).
     pub rolling_window: Option<usize>,
     /// Commits per trend digest (built-in: 10).
@@ -93,6 +97,8 @@ const DEFAULT_DIGEST_BATCH_SIZE: u32 = 10;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub regression_threshold_pct: f64,
+    /// Defaults to `regression_threshold_pct` when not configured.
+    pub recovery_threshold_pct: f64,
     pub rolling_window: usize,
     pub digest_batch_size: u32,
     pub bench_profile: Option<String>,
@@ -100,11 +106,16 @@ pub struct Settings {
 
 impl Settings {
     fn resolve(repo: &Tuning, defaults: &Tuning) -> anyhow::Result<Self> {
+        let regression_threshold_pct = repo
+            .regression_threshold_pct
+            .or(defaults.regression_threshold_pct)
+            .unwrap_or(DEFAULT_REGRESSION_THRESHOLD_PCT);
         let settings = Self {
-            regression_threshold_pct: repo
-                .regression_threshold_pct
-                .or(defaults.regression_threshold_pct)
-                .unwrap_or(DEFAULT_REGRESSION_THRESHOLD_PCT),
+            regression_threshold_pct,
+            recovery_threshold_pct: repo
+                .recovery_threshold_pct
+                .or(defaults.recovery_threshold_pct)
+                .unwrap_or(regression_threshold_pct),
             rolling_window: repo
                 .rolling_window
                 .or(defaults.rolling_window)
@@ -119,6 +130,14 @@ impl Settings {
         // every run FirstRun) or spam it (threshold <= 0) — reject loudly.
         if settings.regression_threshold_pct <= 0.0 {
             anyhow::bail!("regression_threshold_pct must be > 0");
+        }
+        if settings.recovery_threshold_pct <= 0.0 {
+            anyhow::bail!("recovery_threshold_pct must be > 0");
+        }
+        // Recovering above the regression trigger would re-alert on the very
+        // next run — an event-pair generator, the opposite of hysteresis.
+        if settings.recovery_threshold_pct > settings.regression_threshold_pct {
+            anyhow::bail!("recovery_threshold_pct must be <= regression_threshold_pct");
         }
         if settings.rolling_window == 0 {
             anyhow::bail!("rolling_window must be >= 1");
@@ -273,16 +292,42 @@ headline_subjects = ["rex5", "rex5_*"]
         let cfg = Config::parse(SAMPLE).expect("parses");
         let settings = cfg.settings(cfg.repo("mega-evm").unwrap()).unwrap();
         assert_eq!(settings.regression_threshold_pct, 10.0);
+        // Unset recovery threshold = the regression threshold (no hysteresis).
+        assert_eq!(settings.recovery_threshold_pct, 10.0);
         assert_eq!(settings.rolling_window, 20);
         assert_eq!(settings.digest_batch_size, 10);
         assert_eq!(settings.bench_profile, None);
     }
 
     #[test]
+    fn test_settings_recovery_threshold_follows_configured_regression_threshold() {
+        // Only the regression threshold set: recovery follows it, not the
+        // built-in default.
+        let cfg =
+            Config::parse(&format!("{SAMPLE}\nregression_threshold_pct = 5.0\n")).expect("parses");
+        let settings = cfg.settings(cfg.repo("mega-evm").unwrap()).unwrap();
+        assert_eq!(settings.recovery_threshold_pct, 5.0);
+
+        // Both set: an explicit lower recovery threshold is hysteresis.
+        let cfg = Config::parse(&format!(
+            "{SAMPLE}\nregression_threshold_pct = 10.0\nrecovery_threshold_pct = 5.0\n"
+        ))
+        .expect("parses");
+        let settings = cfg.settings(cfg.repo("mega-evm").unwrap()).unwrap();
+        assert_eq!(settings.regression_threshold_pct, 10.0);
+        assert_eq!(settings.recovery_threshold_pct, 5.0);
+    }
+
+    #[test]
     fn test_settings_rejects_out_of_range_values() {
-        for bad in
-            ["rolling_window = 0", "digest_batch_size = 0", "regression_threshold_pct = -5.0"]
-        {
+        for bad in [
+            "rolling_window = 0",
+            "digest_batch_size = 0",
+            "regression_threshold_pct = -5.0",
+            "recovery_threshold_pct = 0.0",
+            // Recovering above the regression trigger would flap.
+            "regression_threshold_pct = 5.0\nrecovery_threshold_pct = 8.0",
+        ] {
             let cfg = Config::parse(&format!("{SAMPLE}\n{bad}\n")).expect("parses");
             assert!(
                 cfg.settings(cfg.repo("mega-evm").unwrap()).is_err(),

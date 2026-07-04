@@ -32,9 +32,8 @@ None of these block using the tool; they need a joint decision or a follow-up ou
    `regression_threshold_pct` is set to 5.0 in repos.toml (measured run-to-run ratio noise ~1-2% stdev on the trial box → 5% ≈ 4σ; the old 10% was ~8σ and would miss small real steps).
    After ~20 runs on mega-engineer, recalibrate from `state.json`'s per-row `recent_ratios` (target: ≥4σ of the noisiest headline row); the structural next step if more sensitivity is wanted is a per-row adaptive threshold (`max(k × row noise, floor)`).
    Note slow drift (~1%/commit) escapes any vs-rolling-median threshold by design — the digest trend is the drift catcher.
-6d. **Recovery has no hysteresis.**
-   Recovery = the latched row returning within the SAME +10% band it regressed past (vs the frozen pre-regression median), so recovery ≠ back-to-original (settling at +9.9% counts), and a row oscillating around the threshold emits alternating regression/recovery event pairs.
-   If that proves noisy, add a stricter recovery threshold (e.g. regress at +10%, recover under +5%) — one config knob + one comparison.
+6d. ~~Recovery has no hysteresis.~~ **Resolved (knob added, off by default):** `recovery_threshold_pct` in `repos.toml` — a latched row recovers only when back within it (validated `<= regression_threshold_pct`); between the two thresholds it stays latched and quiet.
+   Unset = same as the regression threshold, i.e. exactly the old behavior; turn it on (e.g. 2.5 against the 5.0 regression threshold) if real runs show alternating regression/recovery pairs.
 6c. ~~Accepted-regression workflow is manual.~~ **Resolved:** the `rebaseline` subcommand clears matching rows' history + latch from `state.json` (`--row <key-or-prefix*>`, repeatable); the next run re-baselines them as FirstRun with no alert.
    See `skill/references/cli.md`.
 7. **Same-day short-sha collision.**
