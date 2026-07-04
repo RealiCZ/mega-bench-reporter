@@ -25,7 +25,7 @@ serde_json = "1"
 toml = "0.8"
 
 # charts
-plotters = { version = "0.3", default-features = false, features = ["ab_glyph", "bitmap_backend", "bitmap_encoder", "line_series", "point_series"] }
+plotters = { version = "0.3", default-features = false, features = ["ab_glyph", "bitmap_backend", "bitmap_encoder", "line_series"] }
 
 # flamegraph
 inferno = { version = "0.12", default-features = false, features = ["multithreaded"] }

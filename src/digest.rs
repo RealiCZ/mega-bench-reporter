@@ -222,7 +222,10 @@ pub fn select_window(
             .ok_or_else(|| anyhow::anyhow!("no stored commit matches '{prefix}'"))
     };
     if from.is_none() && to.is_none() {
-        let skip = records.len().saturating_sub(last.max(1));
+        if last == 0 {
+            anyhow::bail!("--last must be >= 1");
+        }
+        let skip = records.len().saturating_sub(last);
         return Ok(records.split_off(skip));
     }
     let lo = from.map(&find).transpose()?.unwrap_or(0);
@@ -386,7 +389,11 @@ mod tests {
         assert_eq!(from_only.len(), 2);
 
         assert!(select_window(records.clone(), 5, Some("deadbeef"), None).is_err());
-        assert!(select_window(records, 5, Some(&sha(5)), Some(&sha(2))).is_err());
+        assert!(select_window(records.clone(), 5, Some(&sha(5)), Some(&sha(2))).is_err());
+        // last = 0 is a user error, not an implicit 1.
+        assert!(select_window(records.clone(), 0, None, None).is_err());
+        // ...but it is ignored (like any other last) when sha bounds are given.
+        assert!(select_window(records, 0, Some(&sha(2)), Some(&sha(5))).is_ok());
     }
 
     #[test]

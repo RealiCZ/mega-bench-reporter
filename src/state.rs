@@ -112,6 +112,9 @@ impl State {
         threshold_pct: f64,
         window: usize,
     ) -> Verdict {
+        // compute_ratios filters non-finite ratios at the source; a NaN here
+        // would otherwise surface as a confusing panic inside median's sort.
+        debug_assert!(ratio.is_finite(), "non-finite ratio for {row_key}");
         let entry = self.rows.entry(row_key.to_string()).or_default();
         let verdict = if entry.recent_ratios.is_empty() {
             Verdict::FirstRun

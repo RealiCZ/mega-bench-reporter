@@ -206,7 +206,7 @@ pub fn process_results(
     for row in &rows {
         by_workload.entry((row.group.clone(), row.workload.clone())).or_default().push(row);
     }
-    for ((group, workload), mut wl_rows) in by_workload.clone() {
+    for ((group, workload), mut wl_rows) in by_workload {
         if wl_rows.len() < 2 {
             continue;
         }
@@ -352,7 +352,8 @@ pub fn run_commit_pipeline(
         let state = State::load(&store.state_path())?;
         if state.last_seen_sha.as_deref() != Some(sha) {
             anyhow::bail!(
-                "--skip-bench only re-renders the last processed sha ({}); the existing                  criterion tree was not produced by {sha}",
+                "--skip-bench only re-renders the last processed sha ({}); the existing \
+                 criterion tree was not produced by {sha}",
                 state.last_seen_sha.as_deref().unwrap_or("<none>")
             );
         }
