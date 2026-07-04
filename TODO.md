@@ -48,9 +48,8 @@ None of these block using the tool; they need a joint decision or a follow-up ou
 9. **Absolute MGas/s (D1/D2/D4) not implemented — the comparison table's p95 column is p95 *time* (µs/call), not the design mock's p95 MGas/s.**
    Per the plan, gated on confirming `mega-engineer` is dedicated (D2) and re-adding the per-row gas emission (D4); ratio-only until then.
    The `state-test --bench` real-tx MGas/s series (replay-bench) is likewise not wired in yet.
-10. **Deployment (D9): GitHub repo creation, first push, and a release-artifact workflow.**
-    CI (fmt/clippy/test/release-build) is in `.github/workflows/ci.yml`; publishing a binary via GitHub Release is not set up yet.
-    Also: nothing has been pushed anywhere — the repo exists only locally.
+10. ~~Deployment (D9): release-artifact workflow.~~ **Resolved (workflow in place):** `.github/workflows/release.yml` builds the Linux x86_64 binary on a `v*` tag push and attaches `tar.gz` + `sha256` to a GitHub Release.
+    The repo lives at `github.com/RealiCZ/mega-bench-reporter`; cutting the first release = pushing a `v0.1.0` tag (user action).
 11. **BB9 wiring** (poll loop, invoking `run` on mega-engineer, card relay) — explicitly out of scope here, owner: user.
     Note: only flow A (per-commit) needs BB9 now; the nightly flamegraph can be a plain cron entry on mega-engineer since it posts nothing.
 
