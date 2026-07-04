@@ -9,8 +9,9 @@
 //! rendering are pure library calls, testable anywhere.
 
 use crate::config::{FlameWorkloadPair, RepoConfig};
-use crate::pipeline::{commit_meta, ensure_checkout};
+use crate::git;
 use crate::storage::RepoStore;
+use crate::subprocess::drain_stdout_to_stderr;
 use std::collections::BTreeMap;
 use std::io::{BufReader, Cursor};
 use std::path::{Path, PathBuf};
@@ -258,13 +259,7 @@ fn profile_with_perf(
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn perf record (Linux only): {e}"))?;
-    let mut record_stdout = record_child.stdout.take().expect("stdout piped");
-    let copied = std::io::copy(&mut record_stdout, &mut std::io::stderr());
-    if copied.is_err() {
-        let _ = record_child.kill();
-        let _ = record_child.wait();
-        copied?;
-    }
+    drain_stdout_to_stderr(&mut record_child)?;
     let status = record_child.wait()?;
     if !status.success() {
         anyhow::bail!("perf record failed for '{benchmark_id}' ({status})");
@@ -335,14 +330,10 @@ fn profile_with_sample(
     };
 
     // Drain the bench's stdout to stderr while the profiler runs alongside.
-    let mut bench_stdout = bench_child.stdout.take().expect("stdout piped");
-    let copied = std::io::copy(&mut bench_stdout, &mut std::io::stderr());
-    if copied.is_err() {
-        let _ = bench_child.kill();
-        let _ = bench_child.wait();
+    if let Err(e) = drain_stdout_to_stderr(&mut bench_child) {
         let _ = sample_child.kill();
         let _ = sample_child.wait();
-        copied?;
+        return Err(e);
     }
     let bench_status = match bench_child.wait() {
         Ok(status) => status,
@@ -389,12 +380,12 @@ pub fn run_flamegraph_pipeline(
     let store = RepoStore::new(data_root, &repo.name);
     // Same exclusive lock as the per-commit pipeline: both share the checkout.
     let _lock = store.acquire_lock()?;
-    let checkout = ensure_checkout(work_root, repo)?;
+    let checkout = git::ensure_checkout(work_root, repo)?;
 
     // Nightly profiles the tracked branch's current HEAD (not a specific sha).
-    crate::pipeline::checkout_branch_head(&checkout, repo)?;
-    let sha = crate::pipeline::head_sha(&checkout)?;
-    let meta = commit_meta(&checkout, &sha)?;
+    git::checkout_branch_head(&checkout, repo)?;
+    let sha = git::head_sha(&checkout)?;
+    let meta = git::commit_meta(&checkout, &sha)?;
 
     // A feature id appearing in two pairs would overwrite its own `_diff.svg`
     // with a different comparison — reject the config outright.
