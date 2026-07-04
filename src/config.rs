@@ -43,10 +43,7 @@ impl RepoConfig {
     /// Does `subject` match any headline pattern (exact, or trailing-`*`
     /// prefix)?
     pub fn is_headline(&self, subject: &str) -> bool {
-        self.headline_subjects.iter().any(|pattern| match pattern.strip_suffix('*') {
-            Some(prefix) => subject.starts_with(prefix),
-            None => subject == pattern,
-        })
+        self.headline_subjects.iter().any(|pattern| star_pattern_matches(pattern, subject))
     }
 
     /// Human-readable label for the headline family, e.g. `rex5, rex5_*`.
@@ -57,6 +54,16 @@ impl RepoConfig {
     /// Resolved subject display order: configured list, or baseline-first.
     pub fn subject_order(&self) -> Vec<String> {
         self.subject_order.clone().unwrap_or_else(|| vec![self.baseline_subject.clone()])
+    }
+}
+
+/// `true` when `value` matches `pattern` — exact, or prefix when the pattern
+/// ends with `*`. The one pattern grammar of every user-facing filter:
+/// `headline_subjects` entries and the `trend --row` selectors.
+pub fn star_pattern_matches(pattern: &str, value: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => value.starts_with(prefix),
+        None => pattern == value,
     }
 }
 
@@ -208,6 +215,18 @@ bench_targets = ["transact", "revm_bench", "mega_bench", "comp_cost", "block_ben
 baseline_subject = "revm_pinned"
 headline_subjects = ["rex5", "rex5_*"]
 "#;
+
+    #[test]
+    fn test_star_pattern_matches() {
+        assert!(star_pattern_matches("rex5", "rex5"));
+        assert!(!star_pattern_matches("rex5", "rex5_salt"));
+        assert!(star_pattern_matches("rex5_*", "rex5_salt"));
+        assert!(!star_pattern_matches("rex5_*", "rex5"));
+        // A lone `*` is the match-everything pattern.
+        assert!(star_pattern_matches("*", "anything/at/all"));
+        // The star is only a wildcard at the end.
+        assert!(!star_pattern_matches("*_salt", "rex5_salt"));
+    }
 
     #[test]
     fn test_parse_single_repo() {

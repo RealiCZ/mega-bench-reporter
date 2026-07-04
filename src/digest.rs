@@ -3,6 +3,7 @@
 //! a ready-to-post trend-digest card.
 
 use crate::charts::{self, TrendSeries};
+use crate::config::star_pattern_matches;
 use crate::storage::{short_sha, CommitRecord, RepoStore};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -197,15 +198,6 @@ pub fn build_digest(
     Ok(DigestOutcome { dir })
 }
 
-/// `true` when `key` matches `pattern` — exact, or prefix when the pattern
-/// ends with `*`.
-fn key_matches(pattern: &str, key: &str) -> bool {
-    match pattern.strip_suffix('*') {
-        Some(prefix) => key.starts_with(prefix),
-        None => pattern == key,
-    }
-}
-
 /// Cuts a window out of the stored records (oldest first): `from`/`to` are
 /// inclusive sha prefixes and take precedence; otherwise the most recent
 /// `last` records.
@@ -276,7 +268,7 @@ pub fn build_adhoc_trend(
         (build_summary(records, |_| true), row_patterns.join(", "))
     };
     if !row_patterns.is_empty() {
-        summary.rows.retain(|r| row_patterns.iter().any(|p| key_matches(p, &r.row_key)));
+        summary.rows.retain(|r| row_patterns.iter().any(|p| star_pattern_matches(p, &r.row_key)));
     }
     if summary.rows.is_empty() {
         anyhow::bail!("no '{scope}' rows with a baseline ratio in the requested window");
