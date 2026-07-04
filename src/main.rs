@@ -23,7 +23,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Per-commit pipeline: checkout, bench, chart, store, regression-check,
-    /// and (every 10th commit) trend digest.
+    /// and (every `digest_batch_size` commits) trend digest.
     Run {
         /// Repo name — must match a `[[repos]]` entry in the config.
         #[arg(long)]
