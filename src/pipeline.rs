@@ -166,8 +166,11 @@ pub fn process_results(
     }
 
     // One run-wide subject→color mapping so every chart of this commit agrees.
-    let subject_colors =
-        charts::SubjectColors::new(&repo.baseline_subject, rows.iter().map(|r| r.subject.clone()));
+    let subject_colors = charts::SubjectColors::new(
+        &repo.baseline_subject,
+        rows.iter().map(|r| r.subject.clone()),
+        is_headline,
+    );
 
     let speed_items: Vec<charts::SpeedBarItem> = ratios
         .iter()

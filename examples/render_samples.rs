@@ -71,6 +71,7 @@ fn main() {
     let colors = SubjectColors::new(
         "revm_pinned",
         rows.iter().map(|r| r.subject.clone()).chain(["rex5_oracle".to_string()]),
+        |s| s.starts_with("rex5"),
     );
 
     let items = vec![

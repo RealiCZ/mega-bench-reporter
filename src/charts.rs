@@ -48,8 +48,18 @@ const ALERT_RED: RGBColor = RGBColor(0xd0, 0x3b, 0x3b);
 /// at 1:1 — supersampling is what keeps text crisp in chat/browser embeds.
 const SS: i32 = 2;
 
+/// Palette slot → color. Slots past the base palette reuse its hues as
+/// darkened, then lightened shades, so a run with more series than palette
+/// entries (mega-evm's full comparison set is 11 subjects) never paints two
+/// of them identically.
 fn series_color(i: usize) -> RGBColor {
-    PALETTE[i % PALETTE.len()]
+    let RGBColor(r, g, b) = PALETTE[i % PALETTE.len()];
+    let scale = |c: u8, num: u16, den: u16, add: u16| ((c as u16 * num / den) + add) as u8;
+    match (i / PALETTE.len()) % 3 {
+        0 => RGBColor(r, g, b),
+        1 => RGBColor(scale(r, 3, 5, 0), scale(g, 3, 5, 0), scale(b, 3, 5, 0)),
+        _ => RGBColor(scale(r, 1, 2, 128), scale(g, 1, 2, 128), scale(b, 1, 2, 128)),
+    }
 }
 
 /// Neutral color reserved for the baseline subject in subject-keyed charts —
@@ -58,13 +68,14 @@ fn series_color(i: usize) -> RGBColor {
 const BASELINE_GRAY: RGBColor = RGBColor(144, 153, 176);
 
 /// Stable subject→color assignment shared by every subject-keyed chart of a
-/// run (speed bars and violins): the baseline gets [`BASELINE_GRAY`], every
-/// other subject gets a palette slot by alphabetical rank across the run's
-/// FULL subject set. Built once per run from all parsed rows, so `rex5_salt`
-/// wears the same color in the speed bars and in every violin even though
-/// each chart shows a different subject subset. (The trend chart is keyed on
-/// rows, not subjects — many rows share a subject — so it keeps its own
-/// per-row-key scheme.)
+/// run (speed bars and violins): the baseline gets [`BASELINE_GRAY`]; the
+/// priority (headline) subjects take the leading bright palette slots in
+/// alphabetical order, the remaining subjects follow alphabetically. Built
+/// once per run from all parsed rows, so `rex5_salt` wears the same color in
+/// the speed bars and in every violin even though each chart shows a
+/// different subject subset, and stable across commits for a stable subject +
+/// headline set. (The trend chart is keyed on rows, not subjects — many rows
+/// share a subject — so it keeps its own per-row-key scheme.)
 #[derive(Debug, Clone)]
 pub struct SubjectColors {
     baseline: String,
@@ -72,13 +83,26 @@ pub struct SubjectColors {
 }
 
 impl SubjectColors {
-    pub fn new<I, S>(baseline_subject: &str, subjects: I) -> Self
+    pub fn new<I, S>(
+        baseline_subject: &str,
+        subjects: I,
+        is_priority: impl Fn(&str) -> bool,
+    ) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let non_baseline: std::collections::BTreeSet<String> =
-            subjects.into_iter().map(Into::into).filter(|s| s != baseline_subject).collect();
+        let mut non_baseline: Vec<String> = subjects
+            .into_iter()
+            .map(Into::into)
+            .filter(|s| s != baseline_subject)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        // Headline subjects are what the speed bars show — they get the
+        // bright leading slots; shade-variant slots (if the set outgrows the
+        // palette) land on the comparison-only subjects.
+        non_baseline.sort_by_key(|s| (!is_priority(s), s.clone()));
         let slots = non_baseline.into_iter().enumerate().map(|(i, s)| (s, i)).collect();
         Self { baseline: baseline_subject.to_string(), slots }
     }
@@ -639,22 +663,39 @@ mod tests {
         SubjectColors::new(
             "revm_pinned",
             ["revm_pinned", "rex4", "rex5", "rex5_salt", "rex5_oracle", "s"],
+            |s| s.starts_with("rex5"),
         )
     }
 
     #[test]
-    fn test_subject_colors_baseline_reserved_and_stable_across_subsets() {
+    fn test_subject_colors_baseline_reserved_and_headline_gets_leading_slots() {
         let colors = sample_colors();
         assert_eq!(colors.baseline(), "revm_pinned");
         assert_eq!(colors.color("revm_pinned"), BASELINE_GRAY);
-        // Non-baseline subjects take palette slots by alphabetical rank over
-        // the FULL set — independent of which chart asks.
-        assert_eq!(colors.color("rex4"), PALETTE[0]);
-        assert_eq!(colors.color("rex5"), PALETTE[1]);
-        assert_eq!(colors.color("rex5_oracle"), PALETTE[2]);
-        assert_eq!(colors.color("rex5_salt"), PALETTE[3]);
+        // Priority (headline) subjects take the leading bright slots in
+        // alphabetical order; the rest follow — independent of which chart
+        // asks.
+        assert_eq!(colors.color("rex5"), PALETTE[0]);
+        assert_eq!(colors.color("rex5_oracle"), PALETTE[1]);
+        assert_eq!(colors.color("rex5_salt"), PALETTE[2]);
+        assert_eq!(colors.color("rex4"), PALETTE[3]);
+        assert_eq!(colors.color("s"), PALETTE[4]);
         // The baseline never occupies a palette slot.
         assert!(PALETTE.iter().all(|c| *c != BASELINE_GRAY));
+    }
+
+    #[test]
+    fn test_subject_colors_stay_distinct_past_the_palette_size() {
+        // mega-evm's real comparison set is 11 non-baseline subjects — more
+        // than the 8 base palette slots. Slots past the palette must shade,
+        // not repeat: every subject keeps a unique color.
+        let subjects: Vec<String> = (0..12).map(|i| format!("subject_{i:02}")).collect();
+        let colors = SubjectColors::new("base", subjects.iter().cloned(), |_| false);
+        let mut seen = std::collections::BTreeSet::new();
+        for s in &subjects {
+            let RGBColor(r, g, b) = colors.color(s);
+            assert!(seen.insert((r, g, b)), "duplicate color for {s}");
+        }
     }
 
     #[test]
