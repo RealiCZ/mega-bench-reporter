@@ -5,6 +5,7 @@
 //! by the repo-root `skill/` docs.
 
 pub mod charts;
+pub mod compare;
 pub mod config;
 pub mod criterion_results;
 pub mod digest;

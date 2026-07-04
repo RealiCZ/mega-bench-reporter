@@ -1,5 +1,6 @@
 //! Throwaway visual check: renders one of each chart type into OUT_DIR arg.
 use mega_bench_reporter::charts::*;
+use mega_bench_reporter::compare::build_compare_table;
 use mega_bench_reporter::criterion_results::{RatioRow, Row, WorkloadRatios};
 use std::path::Path;
 

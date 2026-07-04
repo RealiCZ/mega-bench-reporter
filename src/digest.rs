@@ -1,6 +1,6 @@
-//! Trend digest: rolls the last `digest_batch_size`
-//! commit records into `digests/<day>-<range>/{summary.json, trend.png}` plus
-//! a ready-to-post trend-digest card.
+//! Trend digest: rolls the last `digest_batch_size` commit records into
+//! `digests/<day>-<range>/{summary.json, trend.png}`, plus the manual `trend`
+//! subcommand's ad-hoc windows under `trends/`.
 
 use crate::charts::{self, TrendSeries};
 use crate::config::star_pattern_matches;

@@ -12,6 +12,7 @@
 //! git or cargo.
 
 use crate::charts;
+use crate::compare;
 use crate::config::{RepoConfig, Settings};
 use crate::criterion_results::{self, Row};
 use crate::digest;
@@ -144,7 +145,7 @@ pub fn process_results(
     //    update below must still happen.
     let is_headline = |s: &str| repo.is_headline(s);
     let subject_order = repo.subject_order();
-    let table = charts::build_compare_table(
+    let table = compare::build_compare_table(
         &rows,
         &ratios,
         &repo.headline_label(),
