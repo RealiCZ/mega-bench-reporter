@@ -43,9 +43,7 @@ None of these block using the tool; they need a joint decision or a follow-up ou
 
 ## Not yet done (deliberately)
 
-8. **Flamegraph: macOS path validated for real; the Linux `perf` path still needs one smoke run on `mega-engineer`.**
-   The macOS path (built-in `sample` + inferno + demangling) produced real flame graphs for `salt_dynamic_gas/{revm_pinned,rex5_salt}/sstore_100` (see `data/mega-evm/flame/20260702/`); the Linux branch (`perf record → perf script → collapse`) is unit-tested but has never run on a real Linux box.
-   **Blocked on server access:** `dev.md` on mega-engineer notes `perf_event_paranoid=4` — the smoke run needs a sysctl relaxation (or `CAP_PERFMON`) first, then one `flamegraph` invocation by BB9.
+8. ~~Flamegraph: the Linux `perf` path still needs one smoke run on `mega-engineer`.~~ **Resolved (user-confirmed, 2026-07-06):** the Linux perf smoke run has been done on mega-engineer (the earlier `perf_event_paranoid=4` block was lifted); the macOS path was validated earlier (`data/mega-evm/flame/20260702/`).
 9. **Absolute MGas/s (D1/D2/D4) not implemented — the comparison table's p95 column is p95 *time* (µs/call), not the design mock's p95 MGas/s.**
    Per the plan, gated on confirming `mega-engineer` is dedicated (D2) and re-adding the per-row gas emission (D4); ratio-only until then.
    **Blocked upstream:** mega-evm reverted the per-row gas emission (`d21a86f` on the bench-coverage branch), so there is no gas source to divide by yet.
