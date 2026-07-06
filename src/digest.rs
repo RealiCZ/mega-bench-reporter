@@ -1,8 +1,9 @@
-//! Trend digest: rolls the last `digest_batch_size`
-//! commit records into `digests/<day>-<range>/{summary.json, trend.png}` plus
-//! a ready-to-post trend-digest card.
+//! Trend digest: rolls the last `digest_batch_size` commit records into
+//! `digests/<day>-<range>/{summary.json, trend.png}`, plus the manual `trend`
+//! subcommand's ad-hoc windows under `trends/`.
 
 use crate::charts::{self, TrendSeries};
+use crate::config::star_pattern_matches;
 use crate::storage::{short_sha, CommitRecord, RepoStore};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -197,15 +198,6 @@ pub fn build_digest(
     Ok(DigestOutcome { dir })
 }
 
-/// `true` when `key` matches `pattern` — exact, or prefix when the pattern
-/// ends with `*`.
-fn key_matches(pattern: &str, key: &str) -> bool {
-    match pattern.strip_suffix('*') {
-        Some(prefix) => key.starts_with(prefix),
-        None => pattern == key,
-    }
-}
-
 /// Cuts a window out of the stored records (oldest first): `from`/`to` are
 /// inclusive sha prefixes and take precedence; otherwise the most recent
 /// `last` records.
@@ -222,7 +214,10 @@ pub fn select_window(
             .ok_or_else(|| anyhow::anyhow!("no stored commit matches '{prefix}'"))
     };
     if from.is_none() && to.is_none() {
-        let skip = records.len().saturating_sub(last.max(1));
+        if last == 0 {
+            anyhow::bail!("--last must be >= 1");
+        }
+        let skip = records.len().saturating_sub(last);
         return Ok(records.split_off(skip));
     }
     let lo = from.map(&find).transpose()?.unwrap_or(0);
@@ -273,7 +268,7 @@ pub fn build_adhoc_trend(
         (build_summary(records, |_| true), row_patterns.join(", "))
     };
     if !row_patterns.is_empty() {
-        summary.rows.retain(|r| row_patterns.iter().any(|p| key_matches(p, &r.row_key)));
+        summary.rows.retain(|r| row_patterns.iter().any(|p| star_pattern_matches(p, &r.row_key)));
     }
     if summary.rows.is_empty() {
         anyhow::bail!("no '{scope}' rows with a baseline ratio in the requested window");
@@ -386,7 +381,11 @@ mod tests {
         assert_eq!(from_only.len(), 2);
 
         assert!(select_window(records.clone(), 5, Some("deadbeef"), None).is_err());
-        assert!(select_window(records, 5, Some(&sha(5)), Some(&sha(2))).is_err());
+        assert!(select_window(records.clone(), 5, Some(&sha(5)), Some(&sha(2))).is_err());
+        // last = 0 is a user error, not an implicit 1.
+        assert!(select_window(records.clone(), 0, None, None).is_err());
+        // ...but it is ignored (like any other last) when sha bounds are given.
+        assert!(select_window(records, 0, Some(&sha(2)), Some(&sha(5))).is_ok());
     }
 
     #[test]

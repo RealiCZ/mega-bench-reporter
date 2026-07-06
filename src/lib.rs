@@ -5,10 +5,13 @@
 //! by the repo-root `skill/` docs.
 
 pub mod charts;
+pub mod compare;
 pub mod config;
 pub mod criterion_results;
 pub mod digest;
 pub mod flamegraph;
+pub mod git;
 pub mod pipeline;
 pub mod state;
 pub mod storage;
+pub mod subprocess;

@@ -1,5 +1,6 @@
 //! Throwaway visual check: renders one of each chart type into OUT_DIR arg.
 use mega_bench_reporter::charts::*;
+use mega_bench_reporter::compare::build_compare_table;
 use mega_bench_reporter::criterion_results::{RatioRow, Row, WorkloadRatios};
 use std::path::Path;
 
@@ -66,6 +67,13 @@ fn main() {
     std::fs::write(out.join("compare_table.json"), serde_json::to_string_pretty(&table).unwrap())
         .unwrap();
 
+    // Built from the whole run's subject set, exactly like the pipeline does.
+    let colors = SubjectColors::new(
+        "revm_pinned",
+        rows.iter().map(|r| r.subject.clone()).chain(["rex5_oracle".to_string()]),
+        |s| s.starts_with("rex5"),
+    );
+
     let items = vec![
         SpeedBarItem {
             item: "salt_dynamic_gas/sstore_100".into(),
@@ -83,8 +91,8 @@ fn main() {
     render_speed_bars(
         &out.join("compare_bars.png"),
         "mega-evm relative speed (revm_pinned = 100%)",
-        "revm_pinned",
         &items,
+        &colors,
     )
     .unwrap();
 
@@ -97,6 +105,7 @@ fn main() {
         &out.join("dist.png"),
         "salt_dynamic_gas/sstore_100 — per-call distribution",
         &violin_rows.iter().collect::<Vec<_>>(),
+        &colors,
     )
     .unwrap();
 

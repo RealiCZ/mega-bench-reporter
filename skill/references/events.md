@@ -21,7 +21,10 @@ for that dir — treat as `[]`.
   `regression_threshold_pct` (default 10%) above the median of its own last
   `rolling_window` (default 20) healthy runs. Fires **once** per regression: the row
   is latched and stays silent until it recovers.
-- `recovery` — a latched row dropped back under the threshold. Fires once.
+- `recovery` — a latched row dropped back within `recovery_threshold_pct` of its
+  frozen median (defaults to the regression threshold; configure it lower for
+  hysteresis so a row oscillating around the regression threshold stays latched
+  and quiet in between). Fires once.
 - `digest` — every `digest_batch_size` (default 10) commits; `dir` (repo-relative)
   holds `summary.json` + `trend.png` for the window.
 
@@ -31,8 +34,8 @@ for that dir — treat as `[]`.
   `rex5_*`) can emit regression/recovery; every row's history is still recorded.
 - The baseline is **frozen while a row is regressed** — regressed values never enter
   the rolling window, so a sustained regression cannot silently become the new
-  normal. Accepting a new performance level = deleting that row's entry from
-  `state.json` (it re-baselines on the next run).
+  normal. Accepting a new performance level = the `rebaseline` subcommand
+  (see `cli.md`), which clears the row's entry so it re-baselines on the next run.
 - First run ever (no history) establishes baselines and emits nothing.
 - A failed digest build (e.g. no headline rows yet) is retried on the next commit;
   the event only appears when the digest actually materialized.
@@ -41,6 +44,6 @@ for that dir — treat as `[]`.
 
 ## Tuning
 
-`regression_threshold_pct`, `rolling_window`, `digest_batch_size`, `bench_profile`
-live in `repos.toml` (`[defaults]` + per-repo overrides); built-in fallbacks in
-`src/config.rs`.
+`regression_threshold_pct`, `recovery_threshold_pct`, `rolling_window`,
+`digest_batch_size`, `bench_profile` live in `repos.toml` (`[defaults]` + per-repo
+overrides); built-in fallbacks in `src/config.rs`.

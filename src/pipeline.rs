@@ -6,16 +6,20 @@
 //! Composing and delivering Lark cards is entirely the consuming agent's job,
 //! guided by `skill/`.
 //!
-//! Split in two layers: subprocess helpers (`ensure_checkout`, `bench_target`,
-//! …) and the pure post-bench stage ([`process_results`]) that integration
-//! tests drive against fixture criterion trees without running git or cargo.
+//! Split in two layers: the bench runner (`bench_target`, with the git side
+//! in [`crate::git`]) and the pure post-bench stage ([`process_results`]) that
+//! integration tests drive against fixture criterion trees without running
+//! git or cargo.
 
 use crate::charts;
+use crate::compare;
 use crate::config::{RepoConfig, Settings};
 use crate::criterion_results::{self, Row};
 use crate::digest;
-use crate::state::{State, Verdict};
+use crate::git::{self, CommitMeta};
+use crate::state::{State, Thresholds, Verdict};
 use crate::storage::{CommitRecord, RepoStore};
+use crate::subprocess::drain_stdout_to_stderr;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -30,7 +34,8 @@ pub enum Event {
     /// A headline row rose past the regression threshold this run (fires once
     /// per regression — latched until recovery).
     Regression { row_key: String, baseline_median: f64, current: f64, pct_over: f64 },
-    /// A previously-regressed headline row dropped back under the threshold.
+    /// A previously-regressed headline row dropped back within the recovery
+    /// threshold of its frozen pre-regression median.
     Recovery { row_key: String, baseline_median: f64, current: f64 },
     /// A digest window completed; its data is in `dir` (repo-relative).
     Digest { dir: String },
@@ -45,170 +50,9 @@ pub struct RunOutcome {
     pub events: Vec<Event>,
 }
 
-/// Commit-level metadata stored in `raw.json`.
-#[derive(Debug, Clone)]
-pub struct CommitMeta {
-    /// Full commit sha.
-    pub sha: String,
-    /// Committer date, RFC3339.
-    pub date: String,
-    /// `rustc --version` output.
-    pub rustc: String,
-}
-
 // ---------------------------------------------------------------------------
-// Subprocess layer
+// Bench runner
 // ---------------------------------------------------------------------------
-
-fn run_cmd(cmd: &mut Command, what: &str) -> anyhow::Result<String> {
-    let output =
-        cmd.output().map_err(|e| anyhow::anyhow!("failed to spawn {what} ({cmd:?}): {e}"))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "{what} failed ({}):\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn git(checkout: &Path, args: &[&str], what: &str) -> anyhow::Result<String> {
-    run_cmd(Command::new("git").arg("-C").arg(checkout).args(args), what)
-}
-
-/// Retries a git operation that talks to the network (clone / fetch /
-/// submodule update) with backoff. Transient failures to reach the remote
-/// (observed in the wild: SSL connection timeouts to GitHub) shouldn't fail
-/// an entire bench run. `backoff_secs` has one entry per retry.
-fn with_network_retry<T>(
-    what: &str,
-    backoff_secs: &[u64],
-    mut op: impl FnMut() -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    let mut attempt = 0;
-    loop {
-        match op() {
-            Ok(value) => return Ok(value),
-            Err(e) if attempt < backoff_secs.len() => {
-                let wait = backoff_secs[attempt];
-                attempt += 1;
-                eprintln!(
-                    "{what} failed (attempt {attempt}/{}, retrying in {wait}s): {e:#}",
-                    backoff_secs.len() + 1
-                );
-                std::thread::sleep(std::time::Duration::from_secs(wait));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// Default backoff for git network operations: two retries.
-const GIT_RETRY_BACKOFF_SECS: &[u64] = &[5, 15];
-
-/// A `credential.helper` snippet that feeds `$GITHUB_TOKEN` from the process
-/// environment to git for https remotes — the token never appears in argv, and
-/// without the env var set git falls back to anonymous access (fine for public
-/// repos). The invoking agent populates the env var when needed.
-const TOKEN_CREDENTIAL_HELPER: &str =
-    "!f() { echo username=x-access-token; echo \"password=${GITHUB_TOKEN}\"; }; f";
-
-fn git_credential_args(clone_url: &str) -> Vec<String> {
-    if clone_url.starts_with("https://") && std::env::var("GITHUB_TOKEN").is_ok() {
-        vec!["-c".into(), format!("credential.helper={TOKEN_CREDENTIAL_HELPER}")]
-    } else {
-        Vec::new()
-    }
-}
-
-/// Clones (first run) or reuses the tracked repo's checkout under
-/// `<work_root>/<repo name>`. Submodules included — mega-evm needs them.
-/// A leftover directory without `.git` (an interrupted first clone) is
-/// removed and re-cloned instead of wedging every subsequent run — the
-/// checkout dir is fully machine-managed scratch.
-pub fn ensure_checkout(work_root: &Path, repo: &RepoConfig) -> anyhow::Result<PathBuf> {
-    let checkout = work_root.join(&repo.name);
-    if checkout.join(".git").exists() {
-        return Ok(checkout);
-    }
-    std::fs::create_dir_all(work_root)?;
-    with_network_retry(&format!("git clone {}", repo.clone_url), GIT_RETRY_BACKOFF_SECS, || {
-        // A leftover from an interrupted/failed previous attempt would make
-        // `git clone` refuse with "destination exists" — clear it first.
-        if checkout.exists() {
-            eprintln!("removing broken checkout {} (no .git) and re-cloning", checkout.display());
-            std::fs::remove_dir_all(&checkout)?;
-        }
-        let mut cmd = Command::new("git");
-        cmd.args(git_credential_args(&repo.clone_url));
-        cmd.arg("clone").arg("--recursive").arg(&repo.clone_url).arg(&checkout);
-        run_cmd(&mut cmd, "git clone")?;
-        Ok(())
-    })?;
-    Ok(checkout)
-}
-
-/// Fetches the tracked branch and checks out `sha` (detached), updating
-/// submodules. `--force` so tracked files rewritten by a previous bench run
-/// (classic: a regenerated `Cargo.lock`) can't wedge the checkout. Falls back
-/// to fetching the sha directly if the branch fetch didn't make it reachable
-/// (e.g. a force-pushed branch).
-pub fn checkout_commit(checkout: &Path, repo: &RepoConfig, sha: &str) -> anyhow::Result<()> {
-    let cred = git_credential_args(&repo.clone_url);
-    let cred_refs: Vec<&str> = cred.iter().map(String::as_str).collect();
-
-    let fetch_branch: Vec<&str> = [&cred_refs[..], &["fetch", "origin", &repo.branch]].concat();
-    with_network_retry("git fetch", GIT_RETRY_BACKOFF_SECS, || {
-        git(checkout, &fetch_branch, "git fetch").map(|_| ())
-    })?;
-    if git(checkout, &["checkout", "--force", "--detach", sha], "git checkout").is_err() {
-        let fetch_sha: Vec<&str> = [&cred_refs[..], &["fetch", "origin", sha]].concat();
-        with_network_retry("git fetch <sha>", GIT_RETRY_BACKOFF_SECS, || {
-            git(checkout, &fetch_sha, "git fetch <sha>").map(|_| ())
-        })?;
-        git(checkout, &["checkout", "--force", "--detach", sha], "git checkout")?;
-    }
-    let update_subs: Vec<&str> =
-        [&cred_refs[..], &["submodule", "update", "--init", "--recursive"]].concat();
-    with_network_retry("git submodule update", GIT_RETRY_BACKOFF_SECS, || {
-        git(checkout, &update_subs, "git submodule update").map(|_| ())
-    })?;
-    Ok(())
-}
-
-/// Fetches the tracked branch and checks out its remote HEAD (detached). Used
-/// by the nightly flamegraph pipeline, which profiles "current main", not a
-/// specific commit.
-pub fn checkout_branch_head(checkout: &Path, repo: &RepoConfig) -> anyhow::Result<()> {
-    let cred = git_credential_args(&repo.clone_url);
-    let cred_refs: Vec<&str> = cred.iter().map(String::as_str).collect();
-    let fetch: Vec<&str> = [&cred_refs[..], &["fetch", "origin", &repo.branch]].concat();
-    with_network_retry("git fetch", GIT_RETRY_BACKOFF_SECS, || {
-        git(checkout, &fetch, "git fetch").map(|_| ())
-    })?;
-    git(checkout, &["checkout", "--force", "--detach", "FETCH_HEAD"], "git checkout FETCH_HEAD")?;
-    let update_subs: Vec<&str> =
-        [&cred_refs[..], &["submodule", "update", "--init", "--recursive"]].concat();
-    with_network_retry("git submodule update", GIT_RETRY_BACKOFF_SECS, || {
-        git(checkout, &update_subs, "git submodule update").map(|_| ())
-    })?;
-    Ok(())
-}
-
-/// The checkout's current HEAD sha.
-pub fn head_sha(checkout: &Path) -> anyhow::Result<String> {
-    git(checkout, &["rev-parse", "HEAD"], "git rev-parse HEAD")
-}
-
-/// Commit metadata straight from the checkout: committer date + rustc version
-/// (run inside the checkout so a `rust-toolchain.toml` is honored).
-pub fn commit_meta(checkout: &Path, sha: &str) -> anyhow::Result<CommitMeta> {
-    let date = git(checkout, &["show", "-s", "--format=%cI", sha], "git show")?;
-    let rustc =
-        run_cmd(Command::new("rustc").arg("--version").current_dir(checkout), "rustc --version")?;
-    Ok(CommitMeta { sha: sha.to_string(), date, rustc })
-}
 
 /// Runs one bench target. With no configured `bench_profile` this is exactly
 /// the invocation the tracked repo's CI uses (mega-evm's benchmark.yml):
@@ -231,20 +75,12 @@ pub fn bench_target(
         .arg("--")
         .arg("--output-format")
         .arg("bencher")
-        // Our own stdout carries exactly one JSON document per invocation, so
-        // the bencher lines are streamed to stderr instead of inherited.
+        // The bencher lines are streamed to stderr instead of inherited.
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn cargo bench --bench {target}: {e}"))?;
-    let mut child_stdout = child.stdout.take().expect("stdout piped");
-    let copied = std::io::copy(&mut child_stdout, &mut std::io::stderr());
-    if copied.is_err() {
-        // Don't leave a running bench behind if the stdout drain broke.
-        let _ = child.kill();
-        let _ = child.wait();
-        copied?;
-    }
+    drain_stdout_to_stderr(&mut child)?;
     let status = child.wait()?;
     if !status.success() {
         anyhow::bail!("cargo bench --bench {target} failed ({status})");
@@ -310,7 +146,7 @@ pub fn process_results(
     //    update below must still happen.
     let is_headline = |s: &str| repo.is_headline(s);
     let subject_order = repo.subject_order();
-    let table = charts::build_compare_table(
+    let table = compare::build_compare_table(
         &rows,
         &ratios,
         &repo.headline_label(),
@@ -328,6 +164,13 @@ pub fn process_results(
             eprintln!("compare table json failed (continuing): {e:#}");
         }
     }
+
+    // One run-wide subject→color mapping so every chart of this commit agrees.
+    let subject_colors = charts::SubjectColors::new(
+        &repo.baseline_subject,
+        rows.iter().map(|r| r.subject.clone()),
+        is_headline,
+    );
 
     let speed_items: Vec<charts::SpeedBarItem> = ratios
         .iter()
@@ -360,8 +203,8 @@ pub fn process_results(
                 record.short_sha(),
                 repo.baseline_subject
             ),
-            &repo.baseline_subject,
             &speed_items,
+            &subject_colors,
         ) {
             eprintln!("speed bars chart failed (continuing): {e:#}");
         }
@@ -372,7 +215,7 @@ pub fn process_results(
     for row in &rows {
         by_workload.entry((row.group.clone(), row.workload.clone())).or_default().push(row);
     }
-    for ((group, workload), mut wl_rows) in by_workload.clone() {
+    for ((group, workload), mut wl_rows) in by_workload {
         if wl_rows.len() < 2 {
             continue;
         }
@@ -383,6 +226,7 @@ pub fn process_results(
             &commit_dir.join(dist_file_name(&group, &workload)),
             &format!("{title} — per-call distribution"),
             &wl_rows,
+            &subject_colors,
         ) {
             eprintln!("violin chart for {title} failed (continuing): {e:#}");
         }
@@ -400,7 +244,10 @@ pub fn process_results(
                 let verdict = state.check_and_record(
                     &key,
                     ratio,
-                    settings.regression_threshold_pct,
+                    Thresholds {
+                        regression_pct: settings.regression_threshold_pct,
+                        recovery_pct: settings.recovery_threshold_pct,
+                    },
                     settings.rolling_window,
                 );
                 if !is_headline(&ratio_row.subject) {
@@ -498,9 +345,9 @@ pub fn run_commit_pipeline(
     // Held for the whole run: concurrent invocations share the checkout, the
     // criterion tree, and state.json.
     let _lock = store.acquire_lock()?;
-    let checkout = ensure_checkout(work_root, repo)?;
-    checkout_commit(&checkout, repo, sha)?;
-    let meta = commit_meta(&checkout, sha)?;
+    let checkout = git::ensure_checkout(work_root, repo)?;
+    git::checkout_commit(&checkout, repo, sha)?;
+    let meta = git::commit_meta(&checkout, sha)?;
 
     let criterion_dir = criterion_results::criterion_dir_for(&checkout);
     let mut failed_targets = Vec::new();
@@ -518,7 +365,8 @@ pub fn run_commit_pipeline(
         let state = State::load(&store.state_path())?;
         if state.last_seen_sha.as_deref() != Some(sha) {
             anyhow::bail!(
-                "--skip-bench only re-renders the last processed sha ({}); the existing                  criterion tree was not produced by {sha}",
+                "--skip-bench only re-renders the last processed sha ({}); the existing \
+                 criterion tree was not produced by {sha}",
                 state.last_seen_sha.as_deref().unwrap_or("<none>")
             );
         }
@@ -575,38 +423,5 @@ mod tests {
             "dist_salt_dynamic_gas_sstore_100_x8.png"
         );
         assert_eq!(dist_file_name("empty_transaction", ""), "dist_empty_transaction.png");
-    }
-
-    #[test]
-    fn test_with_network_retry_retries_then_succeeds() {
-        let mut attempts = 0;
-        let result = with_network_retry("op", &[0, 0], || {
-            attempts += 1;
-            if attempts < 3 {
-                anyhow::bail!("transient");
-            }
-            Ok(attempts)
-        })
-        .unwrap();
-        assert_eq!(result, 3);
-    }
-
-    #[test]
-    fn test_with_network_retry_gives_up_after_backoff_exhausted() {
-        let mut attempts = 0;
-        let result: anyhow::Result<()> = with_network_retry("op", &[0], || {
-            attempts += 1;
-            anyhow::bail!("still down")
-        });
-        assert!(result.is_err());
-        assert_eq!(attempts, 2, "one initial try + one retry");
-    }
-
-    #[test]
-    fn test_git_credential_args_only_for_https_with_token() {
-        // No token in the test env → no credential args even for https.
-        std::env::remove_var("GITHUB_TOKEN");
-        assert!(git_credential_args("https://github.com/megaeth-labs/mega-evm.git").is_empty());
-        assert!(git_credential_args("git@github.com:megaeth-labs/mega-evm.git").is_empty());
     }
 }

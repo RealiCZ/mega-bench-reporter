@@ -60,6 +60,26 @@ without waiting for the next digest.
 - stdout: one JSON document — `{repo, output_dir, commits, rows}`.
 - Needs no lock and is safe to run while a bench run is in progress.
 
+## Rebaseline (accept a regressed level as the new normal)
+
+```bash
+mega-bench-reporter rebaseline --repo <name> --data-root <dir> \
+    --row <key-or-prefix*> [--row ...]
+```
+
+A sustained regression stays latched forever (frozen baseline, quiet after the
+one alert). When the team decides the new level is acceptable, clear the
+affected rows: their rolling history and regression latch are removed from
+`state.json`, and the next run re-baselines them (FirstRun — no alert, fresh
+window at the new level).
+
+- `--row` is required and repeatable: exact row key or trailing `*`
+  (e.g. `--row 'salt_dynamic_gas/rex5_salt/*'`). A pattern matching nothing
+  is an error — check the row keys in `state.json`.
+- Needs no config file; it operates on the stored state only.
+- Takes the per-repo lock (it mutates `state.json`) — don't run mid-bench.
+- stdout: one JSON document — `{repo, cleared: [<row keys>]}`.
+
 ## Nightly flamegraph (archive only)
 
 ```bash

@@ -1,11 +1,11 @@
 //! Synthetic dry run: drives the post-bench stage
 //! (`pipeline::process_results`) with fixture criterion trees — no git, no
 //! cargo, no benches — and asserts the storage layout, the simulated
-//! regression/recovery alert cards, and the 10-commit digest card.
+//! regression/recovery events, and the 10-commit digest.
 
 use mega_bench_reporter::config::Config;
-use mega_bench_reporter::pipeline::Event;
-use mega_bench_reporter::pipeline::{process_results, CommitMeta};
+use mega_bench_reporter::git::CommitMeta;
+use mega_bench_reporter::pipeline::{process_results, Event};
 use mega_bench_reporter::state::State;
 use mega_bench_reporter::storage::RepoStore;
 use std::path::Path;

@@ -32,12 +32,10 @@ None of these block using the tool; they need a joint decision or a follow-up ou
    `regression_threshold_pct` is set to 5.0 in repos.toml (measured run-to-run ratio noise ~1-2% stdev on the trial box → 5% ≈ 4σ; the old 10% was ~8σ and would miss small real steps).
    After ~20 runs on mega-engineer, recalibrate from `state.json`'s per-row `recent_ratios` (target: ≥4σ of the noisiest headline row); the structural next step if more sensitivity is wanted is a per-row adaptive threshold (`max(k × row noise, floor)`).
    Note slow drift (~1%/commit) escapes any vs-rolling-median threshold by design — the digest trend is the drift catcher.
-6d. **Recovery has no hysteresis.**
-   Recovery = the latched row returning within the SAME +10% band it regressed past (vs the frozen pre-regression median), so recovery ≠ back-to-original (settling at +9.9% counts), and a row oscillating around the threshold emits alternating regression/recovery event pairs.
-   If that proves noisy, add a stricter recovery threshold (e.g. regress at +10%, recover under +5%) — one config knob + one comparison.
-6c. **Accepted-regression workflow is manual.**
-   A sustained regression stays latched forever (baseline frozen); accepting the new level means deleting that row from `state.json`.
-   A `rebaseline` subcommand would formalize this if it happens often.
+6d. ~~Recovery has no hysteresis.~~ **Resolved (knob added, off by default):** `recovery_threshold_pct` in `repos.toml` — a latched row recovers only when back within it (validated `<= regression_threshold_pct`); between the two thresholds it stays latched and quiet.
+   Unset = same as the regression threshold, i.e. exactly the old behavior; turn it on (e.g. 2.5 against the 5.0 regression threshold) if real runs show alternating regression/recovery pairs.
+6c. ~~Accepted-regression workflow is manual.~~ **Resolved:** the `rebaseline` subcommand clears matching rows' history + latch from `state.json` (`--row <key-or-prefix*>`, repeatable); the next run re-baselines them as FirstRun with no alert.
+   See `skill/references/cli.md`.
 7. **Same-day short-sha collision.**
    Commit dirs are keyed `<YYYYMMDD>-<7-char-sha>`; two same-day commits sharing a 7-char prefix would overwrite each other (probability ~1e-8 per pair, accepted).
 
@@ -45,14 +43,13 @@ None of these block using the tool; they need a joint decision or a follow-up ou
 
 ## Not yet done (deliberately)
 
-8. **Flamegraph: macOS path validated for real; the Linux `perf` path still needs one smoke run on `mega-engineer`.**
-   The macOS path (built-in `sample` + inferno + demangling) produced real flame graphs for `salt_dynamic_gas/{revm_pinned,rex5_salt}/sstore_100` (see `data/mega-evm/flame/20260702/`); the Linux branch (`perf record → perf script → collapse`) is unit-tested but has never run on a real Linux box.
+8. ~~Flamegraph: the Linux `perf` path still needs one smoke run on `mega-engineer`.~~ **Resolved (user-confirmed, 2026-07-06):** the Linux perf smoke run has been done on mega-engineer (the earlier `perf_event_paranoid=4` block was lifted); the macOS path was validated earlier (`data/mega-evm/flame/20260702/`).
 9. **Absolute MGas/s (D1/D2/D4) not implemented — the comparison table's p95 column is p95 *time* (µs/call), not the design mock's p95 MGas/s.**
    Per the plan, gated on confirming `mega-engineer` is dedicated (D2) and re-adding the per-row gas emission (D4); ratio-only until then.
+   **Blocked upstream:** mega-evm reverted the per-row gas emission (`d21a86f` on the bench-coverage branch), so there is no gas source to divide by yet.
    The `state-test --bench` real-tx MGas/s series (replay-bench) is likewise not wired in yet.
-10. **Deployment (D9): GitHub repo creation, first push, and a release-artifact workflow.**
-    CI (fmt/clippy/test/release-build) is in `.github/workflows/ci.yml`; publishing a binary via GitHub Release is not set up yet.
-    Also: nothing has been pushed anywhere — the repo exists only locally.
+10. ~~Deployment (D9): release-artifact workflow.~~ **Resolved (workflow in place):** `.github/workflows/release.yml` builds the Linux x86_64 binary on a `v*` tag push and attaches `tar.gz` + `sha256` to a GitHub Release.
+    The repo lives at `github.com/RealiCZ/mega-bench-reporter`; cutting the first release = pushing a `v0.1.0` tag (user action).
 11. **BB9 wiring** (poll loop, invoking `run` on mega-engineer, card relay) — explicitly out of scope here, owner: user.
     Note: only flow A (per-commit) needs BB9 now; the nightly flamegraph can be a plain cron entry on mega-engineer since it posts nothing.
 

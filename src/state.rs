@@ -23,6 +23,27 @@ pub struct State {
     pub rows: BTreeMap<String, RowHistory>,
 }
 
+/// Detection thresholds for [`State::check_and_record`], both in percent over
+/// the rolling median.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Thresholds {
+    /// A healthy row regresses when it rises more than this.
+    pub regression_pct: f64,
+    /// A latched row recovers only when back within this (`<=
+    /// regression_pct`; equal = no hysteresis). A gap between the two stops a
+    /// row oscillating around the regression threshold from emitting an
+    /// alternating regression/recovery event pair per run: between the
+    /// thresholds it just stays latched (quiet).
+    pub recovery_pct: f64,
+}
+
+impl Thresholds {
+    /// No hysteresis: recover in the same band the row regressed past.
+    pub fn uniform(pct: f64) -> Self {
+        Self { regression_pct: pct, recovery_pct: pct }
+    }
+}
+
 /// What `check_and_record` found for one row, relative to its history *before*
 /// this run's value is folded in.
 #[derive(Debug, Clone, PartialEq)]
@@ -100,32 +121,37 @@ impl State {
     ///
     /// Regressed values are NOT folded into the window: otherwise a sustained
     /// regression would converge the median onto the regressed level, emit a
-    /// false "recovered" card, and silently rebaseline. The baseline stays
+    /// false recovery event, and silently rebaseline. The baseline stays
     /// frozen while a row is regressed — a permanent regression stays
     /// `StillRegressed` (quiet after the one alert) until it is actually
-    /// fixed, or until the operator accepts the new level by clearing the
-    /// row's entry in `state.json`.
+    /// fixed, or until the operator accepts the new level via the
+    /// `rebaseline` subcommand.
     pub fn check_and_record(
         &mut self,
         row_key: &str,
         ratio: f64,
-        threshold_pct: f64,
+        thresholds: Thresholds,
         window: usize,
     ) -> Verdict {
+        // compute_ratios filters non-finite ratios at the source; a NaN here
+        // would otherwise surface as a confusing panic inside median's sort.
+        debug_assert!(ratio.is_finite(), "non-finite ratio for {row_key}");
         let entry = self.rows.entry(row_key.to_string()).or_default();
         let verdict = if entry.recent_ratios.is_empty() {
             Verdict::FirstRun
         } else {
             let baseline_median = median(&entry.recent_ratios);
             let pct_over = (ratio - baseline_median) / baseline_median * 100.0;
-            if pct_over > threshold_pct {
-                if entry.currently_regressed {
-                    Verdict::StillRegressed
+            if entry.currently_regressed {
+                if pct_over <= thresholds.recovery_pct {
+                    Verdict::Recovered { median: baseline_median, current: ratio }
                 } else {
-                    Verdict::NewRegression { median: baseline_median, current: ratio, pct_over }
+                    // Above the recovery threshold — including the hysteresis
+                    // gap between the two thresholds: still latched, quiet.
+                    Verdict::StillRegressed
                 }
-            } else if entry.currently_regressed {
-                Verdict::Recovered { median: baseline_median, current: ratio }
+            } else if pct_over > thresholds.regression_pct {
+                Verdict::NewRegression { median: baseline_median, current: ratio, pct_over }
             } else {
                 Verdict::Ok
             }
@@ -138,6 +164,25 @@ impl State {
             }
         }
         verdict
+    }
+
+    /// Accepts a new performance level for the rows matching `patterns`
+    /// (exact row keys or trailing-`*` prefixes): drops their rolling history
+    /// AND their regression latch, so the next run re-baselines them as
+    /// FirstRun — no alert, fresh window. Returns the cleared row keys.
+    /// This is the `rebaseline` subcommand's core; the alternative was
+    /// hand-editing state.json.
+    pub fn clear_rows(&mut self, patterns: &[String]) -> Vec<String> {
+        let matched: Vec<String> = self
+            .rows
+            .keys()
+            .filter(|key| patterns.iter().any(|p| crate::config::star_pattern_matches(p, key)))
+            .cloned()
+            .collect();
+        for key in &matched {
+            self.rows.remove(key);
+        }
+        matched
     }
 
     /// Bumps the digest counter; returns `true` when it has reached
@@ -160,8 +205,12 @@ mod tests {
     #[test]
     fn test_first_run_establishes_baseline_no_alert() {
         let mut state = State::default();
-        let verdict =
-            state.check_and_record("salt_dynamic_gas/rex5_salt/sstore_100", 2.0, 10.0, 20);
+        let verdict = state.check_and_record(
+            "salt_dynamic_gas/rex5_salt/sstore_100",
+            2.0,
+            Thresholds::uniform(10.0),
+            20,
+        );
         assert_eq!(verdict, Verdict::FirstRun);
         assert!(!verdict.is_regressed());
         assert_eq!(state.rows["salt_dynamic_gas/rex5_salt/sstore_100"].recent_ratios.len(), 1);
@@ -173,10 +222,10 @@ mod tests {
         let key = "g/rex5/w";
         // Build up a stable history around ratio 2.0.
         for _ in 0..5 {
-            state.check_and_record(key, 2.0, 10.0, 20);
+            state.check_and_record(key, 2.0, Thresholds::uniform(10.0), 20);
         }
         // 15% jump — over the 10% threshold.
-        let v1 = state.check_and_record(key, 2.3, 10.0, 20);
+        let v1 = state.check_and_record(key, 2.3, Thresholds::uniform(10.0), 20);
         match v1 {
             Verdict::NewRegression { median, current, pct_over } => {
                 assert!((median - 2.0).abs() < 1e-9);
@@ -186,7 +235,7 @@ mod tests {
             other => panic!("expected NewRegression, got {other:?}"),
         }
         // Still elevated next run — must NOT re-alert (StillRegressed, not NewRegression).
-        let v2 = state.check_and_record(key, 2.35, 10.0, 20);
+        let v2 = state.check_and_record(key, 2.35, Thresholds::uniform(10.0), 20);
         assert_eq!(v2, Verdict::StillRegressed);
         assert!(v2.is_regressed());
     }
@@ -196,9 +245,9 @@ mod tests {
         let mut state = State::default();
         let key = "g/rex5/w";
         for _ in 0..5 {
-            state.check_and_record(key, 2.0, 10.0, 20);
+            state.check_and_record(key, 2.0, Thresholds::uniform(10.0), 20);
         }
-        let v = state.check_and_record(key, 1.5, 10.0, 20);
+        let v = state.check_and_record(key, 1.5, Thresholds::uniform(10.0), 20);
         assert_eq!(v, Verdict::Ok);
     }
 
@@ -207,7 +256,8 @@ mod tests {
         // A row_key never seen before (e.g. a brand new workload) is FirstRun,
         // not treated as a 0% -> N% "regression".
         let mut state = State::default();
-        let v = state.check_and_record("new/workload/never/seen", 999.0, 10.0, 20);
+        let v =
+            state.check_and_record("new/workload/never/seen", 999.0, Thresholds::uniform(10.0), 20);
         assert_eq!(v, Verdict::FirstRun);
     }
 
@@ -216,19 +266,19 @@ mod tests {
         let mut state = State::default();
         let key = "g/rex5/w";
         for _ in 0..5 {
-            state.check_and_record(key, 2.0, 10.0, 20);
+            state.check_and_record(key, 2.0, Thresholds::uniform(10.0), 20);
         }
-        let regressed = state.check_and_record(key, 2.3, 10.0, 20);
+        let regressed = state.check_and_record(key, 2.3, Thresholds::uniform(10.0), 20);
         assert!(regressed.is_regressed());
         // Drops back near baseline.
-        let v = state.check_and_record(key, 2.0, 10.0, 20);
+        let v = state.check_and_record(key, 2.0, Thresholds::uniform(10.0), 20);
         match v {
             Verdict::Recovered { .. } => {}
             other => panic!("expected Recovered, got {other:?}"),
         }
         assert!(!v.is_regressed());
         // Next run at the same level: no repeated recovery notice, just Ok.
-        let v2 = state.check_and_record(key, 2.0, 10.0, 20);
+        let v2 = state.check_and_record(key, 2.0, Thresholds::uniform(10.0), 20);
         assert_eq!(v2, Verdict::Ok);
     }
 
@@ -240,28 +290,92 @@ mod tests {
         let mut state = State::default();
         let key = "g/rex5/w";
         for _ in 0..5 {
-            state.check_and_record(key, 2.0, 10.0, 20);
+            state.check_and_record(key, 2.0, Thresholds::uniform(10.0), 20);
         }
         assert!(matches!(
-            state.check_and_record(key, 3.0, 10.0, 20),
+            state.check_and_record(key, 3.0, Thresholds::uniform(10.0), 20),
             Verdict::NewRegression { .. }
         ));
         for run in 0..30 {
-            let v = state.check_and_record(key, 3.0, 10.0, 20);
+            let v = state.check_and_record(key, 3.0, Thresholds::uniform(10.0), 20);
             assert_eq!(v, Verdict::StillRegressed, "run {run} must stay regressed");
         }
         // The baseline is still the pre-regression 2.0 median, so an actual
         // fix back to 2.05 recovers against the ORIGINAL baseline.
-        match state.check_and_record(key, 2.05, 10.0, 20) {
+        match state.check_and_record(key, 2.05, Thresholds::uniform(10.0), 20) {
             Verdict::Recovered { median, .. } => assert!((median - 2.0).abs() < 1e-9),
             other => panic!("expected Recovered, got {other:?}"),
         }
         // And the window was not polluted by the regressed era: a fresh +15%
         // over the old level alerts again.
         assert!(matches!(
-            state.check_and_record(key, 2.35, 10.0, 20),
+            state.check_and_record(key, 2.35, Thresholds::uniform(10.0), 20),
             Verdict::NewRegression { .. }
         ));
+    }
+
+    #[test]
+    fn test_recovery_hysteresis_holds_the_latch_between_thresholds() {
+        // Regress past +10%, recover only under +5%: the gap in between must
+        // stay latched and quiet instead of emitting recovery/regression
+        // pairs while the row oscillates around the regression threshold.
+        let th = Thresholds { regression_pct: 10.0, recovery_pct: 5.0 };
+        let mut state = State::default();
+        let key = "g/rex5/w";
+        for _ in 0..5 {
+            state.check_and_record(key, 2.0, th, 20);
+        }
+        assert!(matches!(state.check_and_record(key, 2.3, th, 20), Verdict::NewRegression { .. }));
+        // +7% over the frozen median: within the old one-threshold band, but
+        // above the recovery threshold — no recovery yet.
+        assert_eq!(state.check_and_record(key, 2.14, th, 20), Verdict::StillRegressed);
+        // Oscillating back up must NOT re-alert (still the same latch).
+        assert_eq!(state.check_and_record(key, 2.3, th, 20), Verdict::StillRegressed);
+        // +4%: under the recovery threshold — one recovery event, and the
+        // hysteresis-gap values never polluted the frozen window.
+        match state.check_and_record(key, 2.08, th, 20) {
+            Verdict::Recovered { median, .. } => assert!((median - 2.0).abs() < 1e-9),
+            other => panic!("expected Recovered, got {other:?}"),
+        }
+        // Healthy again: a fresh +15% re-alerts against the old baseline.
+        assert!(matches!(state.check_and_record(key, 2.31, th, 20), Verdict::NewRegression { .. }));
+    }
+
+    #[test]
+    fn test_clear_rows_drops_history_and_latch_by_pattern() {
+        let mut state = State::default();
+        // Two latched regressed rows and one healthy row.
+        for key in ["g/rex5_salt/w", "g/rex5/w", "other/rex5/w"] {
+            for _ in 0..3 {
+                state.check_and_record(key, 2.0, Thresholds::uniform(10.0), 20);
+            }
+        }
+        assert!(state
+            .check_and_record("g/rex5_salt/w", 3.0, Thresholds::uniform(10.0), 20)
+            .is_regressed());
+        assert!(state
+            .check_and_record("g/rex5/w", 3.0, Thresholds::uniform(10.0), 20)
+            .is_regressed());
+
+        let cleared = state.clear_rows(&["g/*".to_string()]);
+        assert_eq!(cleared, vec!["g/rex5/w".to_string(), "g/rex5_salt/w".to_string()]);
+        // The untouched row keeps its window.
+        assert_eq!(state.rows.len(), 1);
+        assert!(state.rows.contains_key("other/rex5/w"));
+
+        // Cleared rows re-baseline at the NEW level: FirstRun, no alert, and
+        // a later value near the new level stays Ok.
+        assert_eq!(
+            state.check_and_record("g/rex5_salt/w", 3.0, Thresholds::uniform(10.0), 20),
+            Verdict::FirstRun
+        );
+        assert_eq!(
+            state.check_and_record("g/rex5_salt/w", 3.05, Thresholds::uniform(10.0), 20),
+            Verdict::Ok
+        );
+
+        // A pattern matching nothing clears nothing.
+        assert!(state.clear_rows(&["nope/*".to_string()]).is_empty());
     }
 
     #[test]
@@ -280,7 +394,7 @@ mod tests {
         let mut state = State::default();
         let key = "g/s/w";
         for i in 0..30 {
-            state.check_and_record(key, 1.0 + i as f64 * 0.01, 10.0, 20);
+            state.check_and_record(key, 1.0 + i as f64 * 0.01, Thresholds::uniform(10.0), 20);
         }
         assert_eq!(state.rows[key].recent_ratios.len(), 20);
     }
@@ -301,7 +415,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("state.json");
         let mut state = State::default();
-        state.check_and_record("g/s/w", 1.5, 10.0, 20);
+        state.check_and_record("g/s/w", 1.5, Thresholds::uniform(10.0), 20);
         state.last_seen_sha = Some("abc123".into());
         state.commits_since_digest = 3;
         state.save(&path).unwrap();
