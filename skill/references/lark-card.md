@@ -84,6 +84,11 @@ from `summary.json.rows` (`row_key` / `median` / `first` / `last`) and attach
 `trend.png`. If your Lark stack uses card v1: move `body.elements` to top-level
 `elements` and swap `markdown` for `div`+`lark_md`.
 
+**Mixed events in one run** (a `digest` can coincide with regressions/recoveries —
+they are independent cadences): send the regression/recovery card for the commit AND a
+separate digest card for the window. Don't fold the digest into a red card — its
+audience reads it on a different rhythm.
+
 **Clean-run report card** (optional — your policy): when `events` is empty you can still
 post a `--template green` "run completed" card (the very first run always lands here —
 it only establishes baselines). Pull `sha` from `latest.json`, row/subject counts and the
@@ -103,7 +108,8 @@ Lark cards cannot embed a file path — upload the PNG first
 - `compare_bars.png` — relative speed per test item, baseline = 100%.
 - `dist_<group>_<workload>.png` — per-call distribution of an affected row
   (derive the filename from the event's `row_key`: `dist_<group>_<workload>.png`
-  with `/` → `_`, subject dropped).
+  with `/` → `_`, subject dropped; a row with no workload part is just
+  `dist_<group>.png`).
 - `trend.png` (digest dir) — headline ratios across the window, red rings on
   threshold-tripping points.
 

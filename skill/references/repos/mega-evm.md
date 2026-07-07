@@ -32,5 +32,6 @@ precompile groups.
 
 - MGas/s is not reported yet (needs the per-row gas emission, design decision D4);
   everything is time-based.
-- The rex5 comparison rows exist only once the bench-coverage branch is merged to
-  `main`; before that, runs against `main` produce no headline data.
+- The rex5 comparison rows exist on `main` only from the bench-coverage merge
+  (2026-07) onward; older `main` commits produce no headline data (digest retries
+  with a stderr note until headline rows appear — that is expected, not a bug).
