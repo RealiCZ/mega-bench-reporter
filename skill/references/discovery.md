@@ -39,8 +39,14 @@ guarantees the facts stay available on disk either way.
 
 ## Scheduling
 
-- Per-commit: poll the tracked branch with `git ls-remote` (5–15 min), and on a new
-  HEAD run `mega-bench-reporter run --repo <name> --sha <sha> …`. A per-repo lock
-  makes concurrent invocations fail fast — never run two at once for the same repo.
+- Per-commit: poll the tracked branch with `git ls-remote` (5–15 min). Keep your own
+  last-benched-sha marker next to the dedup marker; initialize it to the branch's
+  current HEAD (older history stays unbenched unless you backfill deliberately).
+- On a new HEAD, bench every commit in between, oldest first —
+  `gh api repos/<owner>/<repo>/compare/<marker>...<HEAD> --jq '.commits[].sha'` —
+  running `mega-bench-reporter run --repo <name> --sha <sha> …` serially and advancing
+  the marker only after each successful (exit 0) run; on failure, stop and surface the
+  stderr instead of advancing. A per-repo lock makes concurrent invocations fail fast —
+  never run two at once for the same repo.
 - Nightly flamegraph: plain cron is enough (`flamegraph` produces no events; its SVGs
   under `flame/<day>/` are the deliverable).
