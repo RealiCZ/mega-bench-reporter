@@ -39,14 +39,22 @@ guarantees the facts stay available on disk either way.
 
 ## Scheduling
 
-- Per-commit: poll the tracked branch with `git ls-remote` (5–15 min). Keep your own
-  last-benched-sha marker next to the dedup marker; initialize it to the branch's
-  current HEAD (older history stays unbenched unless you backfill deliberately).
+- Per-commit: poll the tracked branch with `git ls-remote` every 5–15 minutes. Keep
+  your own last-benched-sha marker next to the dedup marker; initialize it to the
+  branch's current HEAD (older history stays unbenched unless you backfill
+  deliberately).
 - On a new HEAD, bench every commit in between, oldest first —
-  `gh api repos/<owner>/<repo>/compare/<marker>...<HEAD> --jq '.commits[].sha'` —
-  running `mega-bench-reporter run --repo <name> --sha <sha> …` serially and advancing
-  the marker only after each successful (exit 0) run; on failure, stop and surface the
-  stderr instead of advancing. A per-repo lock makes concurrent invocations fail fast —
-  never run two at once for the same repo.
+  `gh api repos/<owner-slash-repo>/compare/<marker>...<HEAD> --jq '.commits[].sha'`
+  (`<owner-slash-repo>` is the repo's `github` field in `repos.toml`) — running
+  `mega-bench-reporter run --repo <name> --sha <sha> …` serially and advancing the
+  marker only after each successful (exit 0) run.
+- Failure handling, two distinct cases:
+  - **Lock rejection** (stderr says another invocation is already running): benign —
+    a run is still in flight. Skip this poll cycle; never treat it as a failure and
+    never start a second run for the same repo.
+  - **Real failure** (non-zero exit, no lock message): retry the sha once on the next
+    cycle; if it fails again it is likely broken at that commit — advance the marker
+    past it and say so in your next report (the skip must be visible, not silent).
 - Nightly flamegraph: plain cron is enough (`flamegraph` produces no events; its SVGs
-  under `flame/<day>/` are the deliverable).
+  under `flame/<day>/` are the deliverable). It shares the per-repo lock with `run`,
+  so a collision just skips that night — schedule it away from likely bench hours.

@@ -68,5 +68,6 @@ Rows are headline-family only, sorted by median ratio descending. `null` in
 `currently_regressed` is the event latch; `commits_since_digest` counts toward the
 next digest; `last_seen_sha` powers the retry-idempotence guard.
 
-Do not hand-edit — with one exception: deleting a single row's entry is the
-sanctioned way to accept a new performance level (the row re-baselines next run).
+Do not hand-edit. Accepting a new performance level for a row (clearing its window +
+latch so it re-baselines next run) is the `rebaseline` subcommand's job — see
+[`cli.md`](cli.md) — and only ever follows an explicit human decision.
