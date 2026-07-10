@@ -9,10 +9,12 @@ Everything is under `<data-root>/<repo>/`:
 | `commits/<YYYYMMDD>-<shortsha>/events.json` | the run's factual events (see [`events.md`](events.md)); missing = no events recorded |
 | `commits/<YYYYMMDD>-<shortsha>/compare_table.json` | table-ready JSON: `{subjects[], headline_label, baseline_subject, rows[{item, p95_us[], headline_ratio, instr[]?, instr_headline_ratio?}]}` (`p95_us` aligns with `subjects`; `null` = subject absent; `headline_ratio` = worst headline time ratio; the optional `instr` fields mirror that for instruction counts) |
 | `commits/<YYYYMMDD>-<shortsha>/compare_bars.png` | grouped bars: relative speed per item, baseline = 100% (lower = more overhead) |
+| `commits/<YYYYMMDD>-<shortsha>/instr_bars.png` | grouped bars: relative instruction count per item, baseline = 100% — written only when the commit has instructions data |
 | `commits/<YYYYMMDD>-<shortsha>/dist_<group>[_<workload>].png` | violin plot of per-call time distributions (`/` in workloads becomes `_`) |
-| `digests/<YYYYMMDD>-<first>..<last>/summary.json` | last-N-commits headline series: per-row `ratios[]`, `first`, `last`, `median` |
+| `digests/<YYYYMMDD>-<first>..<last>/summary.json` | last-N-commits headline series: per-row `ratios[]`, `first`, `last`, `median`; the optional `instr_series` mirrors it for the instructions lane |
 | `digests/<YYYYMMDD>-<first>..<last>/trend.png` | headline ratios over the digest window, red rings on threshold-tripping points |
-| `trends/<YYYYMMDD>-<first>..<last>/` | manual `trend` runs — same `summary.json` + `trend.png` shape as a digest, never produced automatically |
+| `digests/<YYYYMMDD>-<first>..<last>/instr_trend.png` | instructions ratios over the digest window, same chart style; red rings on instructions-threshold-tripping points; commits without instructions data are gaps |
+| `trends/<YYYYMMDD>-<first>..<last>/` | manual `trend` runs — same `summary.json` + `trend.png` shape as a digest (with `--metric instructions`: `instr_trend.png` + `summary.json` with `instr_series`), never produced automatically |
 | `flame/<YYYYMMDD>/<workload>.svg` | flame graph of one benchmark id (nightly, archive-only — open directly in a browser) |
 | `flame/<YYYYMMDD>/<workload>_diff.svg` | differential flame graph, feature vs baseline (red = grew, blue = shrank) |
 | `state.json` | rolling windows, regression latches, digest counter, `last_seen_sha` |
@@ -77,6 +79,12 @@ The commit-dir date is the commit's committer date, not the run date.
 
 Rows are headline-family only, sorted by median ratio descending. `null` in
 `ratios` = the row was missing that run.
+
+`instr_series` (optional) — the instructions lane's counterpart to `rows`:
+same structure, but each `ratios` value is that commit's instructions
+`ratio_vs_baseline`, `null` for commits without instructions data. Its chart
+is `instr_trend.png` beside `trend.png` — same style, red rings on
+instructions-threshold-tripping points, `null` commits drawn as gaps.
 
 ## state.json semantics
 

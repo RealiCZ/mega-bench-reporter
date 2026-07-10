@@ -17,11 +17,12 @@ A consuming agent (e.g. BB9) polls a single pointer file, reads the data, and co
 2. `cargo bench -p <package> --bench <target> -- --output-format bencher` per configured target — the exact invocation mega-evm's CI uses, so numbers stay comparable with the per-PR `/benchmark` flow.
    A failing target is recorded and skipped; the run only fails if every target fails.
 3. Parse criterion's `target/criterion` tree and compute each row's `ratio_vs_baseline` (time ratio; > 1 = slower than the baseline).
-4. Write the commit's data dir: `raw.json`, `compare_table.json`, `compare_bars.png`, `dist_*.png`.
-5. Check headline rows against their rolling medians and record regression/recovery events; every Nth commit, roll a digest (`summary.json` + `trend.png`).
-6. Atomically update `latest.json` — the pointer consumers poll.
+4. With `[repos.instructions]` configured, run the instructions lane on the same checkout (CodSpeed offline simulation, Linux-only): deterministic CPU instruction counts per row — a second metric lane beside walltime. A skipped or failed lane leaves the run walltime-only.
+5. Write the commit's data dir: `raw.json`, `compare_table.json`, `compare_bars.png`, `dist_*.png` (+ `instr_bars.png` when the commit has instructions data).
+6. Check headline rows against their rolling medians — in both lanes — and record regression/recovery events; every Nth commit, roll a digest (`summary.json` + `trend.png`, plus `instr_series` + `instr_trend.png` for the instructions lane).
+7. Atomically update `latest.json` — the pointer consumers poll.
 
-**On demand** (`trend --repo <name> --last 30`, or `--from <sha> --to <sha>`, `--row <key>`): charts any window of already-stored commits into `trends/` — read-only, independent of the automatic digest.
+**On demand** (`trend --repo <name> --last 30`, or `--from <sha> --to <sha>`, `--row <key>`, `--metric instructions` for the second lane): charts any window of already-stored commits into `trends/` — read-only, independent of the automatic digest.
 
 **On decision** (`rebaseline --repo <name> --row <key-or-prefix*>`): accept a latched regression as the new normal — clears the matching rows' rolling history and latch from `state.json` so the next run re-baselines them without an alert.
 
@@ -50,14 +51,16 @@ stdout is one JSON summary — `{repo, sha, output_dir, failed_targets, events}`
 <data-root>/<repo>/
   latest.json             # discovery pointer: {sha, commit_dir, finished_at}
   commits/<YYYYMMDD>-<shortsha>/
-    raw.json              # source of truth: every row's mean ns + ratio_vs_baseline
+    raw.json              # source of truth: mean ns + ratio_vs_baseline (+ instr counts)
     events.json           # this run's factual events: regression / recovery / digest
     compare_table.json    # table-ready: subjects[], rows[{item, p95_us[], headline_ratio}]
     compare_bars.png      # relative speed per item, baseline = 100%
+    instr_bars.png        # relative instruction count per item (instructions lane)
     dist_*.png            # per-call time distributions (violin)
   digests/<YYYYMMDD>-<first>..<last>/
-    summary.json          # headline ratio series over the window
+    summary.json          # headline ratio series over the window (+ instr_series)
     trend.png             # trend chart, red rings on threshold-tripping points
+    instr_trend.png       # the instructions lane's trend (missing data = gaps)
   trends/<YYYYMMDD>-<first>..<last>/
     ...                   # manual `trend` runs, same shape as a digest
   flame/<YYYYMMDD>/       # nightly flame graphs (SVG + differential), archive-only
@@ -65,6 +68,7 @@ stdout is one JSON summary — `{repo, sha, output_dir, failed_targets, events}`
 ```
 
 Event semantics in one breath: a headline row rising more than `regression_threshold_pct` (default 10%) above the median of its last `rolling_window` (default 20) healthy runs records a regression event, latches (no repeats), and unlatches with a recovery event; regressed values never enter the window, so a sustained regression cannot rebaseline itself.
+The instructions lane runs the same protocol over deterministic instruction counts with its own thresholds (`instr_regression_threshold_pct`, default 2%); its events carry `"metric": "instructions"`, and every walltime alert notes what instructions did for the same row (`instructions.verdict`).
 Full schemas and rules: [`skill/references/data-layout.md`](skill/references/data-layout.md), [`skill/references/events.md`](skill/references/events.md).
 
 ## Configuration (`repos.toml`)

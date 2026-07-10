@@ -46,6 +46,11 @@ CodSpeed runner's offline simulation mode.
   x86_64 — never compare stored counts across hosts of different architectures,
   and expect a full instructions-lane rebaseline if the host architecture ever
   changes.
+- The lane is **best-effort by default** (`require_instructions = false`): a
+  skip or per-target failure leaves the run walltime-only and exit 0. Setting
+  `require_instructions = true` under `[repos.instructions]` makes such a run
+  exit nonzero after all walltime data is written, so a scheduler can alert
+  (details in [`cli.md`](../cli.md)).
 
 ## Caveats
 

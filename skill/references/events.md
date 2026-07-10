@@ -9,7 +9,8 @@ for that dir — treat as `[]`.
 
 ```json
 { "type": "regression", "row_key": "salt_dynamic_gas/rex5_salt/sstore_100",
-  "baseline_median": 2.0, "current": 2.3, "pct_over": 15.0 }
+  "baseline_median": 2.0, "current": 2.3, "pct_over": 15.0,
+  "instructions": { "ratio_delta_pct": -0.31, "verdict": "flat" } }
 
 { "type": "regression", "row_key": "salt_dynamic_gas/rex5_salt/sstore_100",
   "baseline_median": 2.0, "current": 2.06, "pct_over": 3.0, "metric": "instructions" }
@@ -37,6 +38,18 @@ for that dir — treat as `[]`.
   (`instr_regression_threshold_pct`, default 2%, and
   `instr_recovery_threshold_pct`), and ratios over deterministic counts — so any
   instructions regression is a real code-path change, not noise.
+- `instructions` — optional, on **walltime** regression/recovery events only:
+  what the instructions lane saw for the same row when the walltime alert
+  fired. `verdict` is `"flat" | "up" | "down" | "missing"`. `"missing"` (with
+  `ratio_delta_pct: null`) = the row has no instructions data this run or no
+  instructions rolling median yet. Otherwise `ratio_delta_pct` =
+  `(current_instr_ratio / instr_rolling_median - 1) * 100` — the same
+  pre-update median the instructions lane's own check compares against — and
+  the verdict is `"up"` if `ratio_delta_pct >= instr_regression_threshold_pct`,
+  `"down"` if `<= -instr_regression_threshold_pct`, else `"flat"`. A walltime
+  regression with instructions `"flat"` is likely machine noise or a layout
+  effect; with `"up"` it is corroborated by a real code-path change (card
+  wording in [`lark-card.md`](lark-card.md)).
 
 ## Semantics that matter when interpreting
 

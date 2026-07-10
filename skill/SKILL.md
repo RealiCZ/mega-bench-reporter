@@ -19,7 +19,7 @@ consuming agent's job, following these docs.
 |---|---|
 | `mega-bench-reporter run --repo <name> --sha <sha> --config repos.toml --data-root <dir>` | per-commit pipeline: bench → parse → charts + table JSON → store → events (regression/recovery/digest) |
 | `mega-bench-reporter flamegraph --repo <name> --config repos.toml --data-root <dir>` | nightly flame-graph archive into `flame/<day>/` — no events, nothing to relay |
-| `mega-bench-reporter trend --repo <name> --config repos.toml --data-root <dir> [--last N \| --from <sha> --to <sha>] [--row <key>]...` | manual trend chart over any stored-commit window into `trends/` — read-only, independent of the automatic digest |
+| `mega-bench-reporter trend --repo <name> --config repos.toml --data-root <dir> [--last N \| --from <sha> --to <sha>] [--row <key>]... [--metric walltime\|instructions]` | manual trend chart over any stored-commit window into `trends/` — either lane, read-only, independent of the automatic digest |
 | `mega-bench-reporter rebaseline --repo <name> --data-root <dir> --row <key-or-prefix*>...` | accept a latched regression as the new normal: clear the rows' history + latch from `state.json`; next run re-baselines them (no alert). Only on an explicit human decision |
 
 Ground rules: exit 0 = success; stdout = one JSON summary (facts are durable on disk
