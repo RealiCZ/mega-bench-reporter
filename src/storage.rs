@@ -367,6 +367,93 @@ mod tests {
         r
     }
 
+    /// `raw.json` bytes for a lane-off record, captured by serializing this
+    /// exact record with the pre-instructions-lane code. Guards the core
+    /// compatibility contract: with the lane off, the record must serialize
+    /// byte-identically to before the lane existed.
+    const PRE_LANE_GOLDEN: &str = r#"{
+  "commit": "abcdef0123456789abcdef0123456789abcdef01",
+  "date": "2026-07-02T10:00:00Z",
+  "rustc": "rustc 1.86.0 (05f9846f8 2025-03-31)",
+  "baseline_subject": "revm_pinned",
+  "failed_targets": [
+    "block_bench"
+  ],
+  "groups": {
+    "empty_transaction": {
+      "rex5": {
+        "ns": 9000.0,
+        "ratio_vs_baseline": null
+      }
+    },
+    "salt_dynamic_gas": {
+      "revm_pinned/sstore_100": {
+        "ns": 14000.0,
+        "ratio_vs_baseline": 1.0
+      },
+      "rex5_salt/sstore_100": {
+        "ns": 28000.0,
+        "ratio_vs_baseline": 2.0
+      }
+    }
+  }
+}"#;
+
+    #[test]
+    fn test_lane_off_record_serializes_byte_identical_to_pre_lane_golden() {
+        let mut record = CommitRecord::new(
+            "abcdef0123456789abcdef0123456789abcdef01".into(),
+            "2026-07-02T10:00:00Z".into(),
+            "rustc 1.86.0 (05f9846f8 2025-03-31)".into(),
+            "revm_pinned".into(),
+        );
+        record.add_ratios(&sample_ratios());
+        record.failed_targets = vec!["block_bench".to_string()];
+        assert_eq!(serde_json::to_string_pretty(&record).unwrap(), PRE_LANE_GOLDEN);
+        // And a pre-lane file (no instr fields) still deserializes.
+        let parsed: CommitRecord = serde_json::from_str(PRE_LANE_GOLDEN).unwrap();
+        assert_eq!(parsed, record);
+    }
+
+    #[test]
+    fn test_instr_ratios_attach_to_rows_and_roundtrip() {
+        let mut record = record("abcdef0123456789", "2026-07-02T10:00:00Z");
+        record.add_instr_ratios(&[
+            InstrWorkloadRatios {
+                group: "salt_dynamic_gas".into(),
+                workload: "sstore_100".into(),
+                rows: vec![crate::instructions::InstrRatioRow {
+                    subject: "rex5_salt".into(),
+                    count: 25_000,
+                    ratio_vs_baseline: Some(2.5),
+                }],
+            },
+            // A count without a walltime row is skipped, not a panic and not
+            // a phantom RowRecord.
+            InstrWorkloadRatios {
+                group: "missing_group".into(),
+                workload: String::new(),
+                rows: vec![crate::instructions::InstrRatioRow {
+                    subject: "rex5".into(),
+                    count: 1,
+                    ratio_vs_baseline: None,
+                }],
+            },
+        ]);
+        let row = &record.groups["salt_dynamic_gas"]["rex5_salt/sstore_100"];
+        assert_eq!(
+            row.instr,
+            Some(InstrRecord { count: 25_000, ratio_vs_baseline: Some(2.5) })
+        );
+        // The sibling row without instr data keeps its plain shape.
+        assert_eq!(record.groups["salt_dynamic_gas"]["revm_pinned/sstore_100"].instr, None);
+        assert!(!record.groups.contains_key("missing_group"));
+
+        let json = serde_json::to_string_pretty(&record).unwrap();
+        let parsed: CommitRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, record);
+    }
+
     #[test]
     fn test_record_shape_matches_plan_schema() {
         let r = record("abcdef0123456789", "2026-07-02T10:00:00Z");

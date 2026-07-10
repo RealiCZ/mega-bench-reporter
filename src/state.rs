@@ -442,6 +442,72 @@ mod tests {
     }
 
     #[test]
+    fn test_pre_lane_state_file_deserializes_and_stays_byte_stable() {
+        // A state.json written before the instructions lane existed (no
+        // instr_rows key) must load unchanged...
+        let pre_lane = r#"{
+  "last_seen_sha": "abc123",
+  "commits_since_digest": 3,
+  "rows": {
+    "g/rex5/w": {
+      "recent_ratios": [2.0, 2.01],
+      "currently_regressed": false
+    }
+  }
+}"#;
+        let state: State = serde_json::from_str(pre_lane).unwrap();
+        assert_eq!(state.rows["g/rex5/w"].recent_ratios.len(), 2);
+        assert!(state.instr_rows.is_empty());
+        // ...and re-serialize without an instr_rows key while the lane is
+        // off, so lane-off state files keep their pre-lane shape.
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        assert!(!json.contains("instr_rows"), "empty instr_rows must not serialize: {json}");
+
+        // With the lane on, the key appears and round-trips.
+        let mut state = state;
+        state.check_and_record_instr("g/rex5/w", 1.5, Thresholds::uniform(2.0), 20);
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        assert!(json.contains("instr_rows"));
+        let reloaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(reloaded, state);
+    }
+
+    #[test]
+    fn test_instr_lane_history_is_independent_of_walltime() {
+        let mut state = State::default();
+        let key = "g/rex5/w";
+        // Same key, different lanes: the walltime window must not see the
+        // instructions values and vice versa.
+        for _ in 0..3 {
+            state.check_and_record(key, 2.0, Thresholds::uniform(10.0), 20);
+            state.check_and_record_instr(key, 1.0, Thresholds::uniform(2.0), 20);
+        }
+        // +5% on instructions: fires on the instructions lane...
+        assert!(matches!(
+            state.check_and_record_instr(key, 1.05, Thresholds::uniform(2.0), 20),
+            Verdict::NewRegression { .. }
+        ));
+        // ...while the walltime lane at its own level stays quiet.
+        assert_eq!(state.check_and_record(key, 2.0, Thresholds::uniform(10.0), 20), Verdict::Ok);
+        assert!(state.instr_rows[key].currently_regressed);
+        assert!(!state.rows[key].currently_regressed);
+    }
+
+    #[test]
+    fn test_clear_rows_clears_both_lanes_and_dedupes_keys() {
+        let mut state = State::default();
+        state.check_and_record("g/rex5/w", 2.0, Thresholds::uniform(10.0), 20);
+        state.check_and_record_instr("g/rex5/w", 1.0, Thresholds::uniform(2.0), 20);
+        state.check_and_record_instr("g/rex5/instr_only", 1.0, Thresholds::uniform(2.0), 20);
+
+        let cleared = state.clear_rows(&["g/*".to_string()]);
+        // The shared key is reported once, the instr-only key found too.
+        assert_eq!(cleared, vec!["g/rex5/instr_only".to_string(), "g/rex5/w".to_string()]);
+        assert!(state.rows.is_empty());
+        assert!(state.instr_rows.is_empty());
+    }
+
+    #[test]
     fn test_save_and_load_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("state.json");

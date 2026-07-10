@@ -5,6 +5,7 @@
 
 use mega_bench_reporter::config::Config;
 use mega_bench_reporter::git::CommitMeta;
+use mega_bench_reporter::instructions::{InstrCollection, InstrRow};
 use mega_bench_reporter::pipeline::{process_results, Event};
 use mega_bench_reporter::state::State;
 use mega_bench_reporter::storage::RepoStore;
@@ -224,6 +225,163 @@ fn test_synthetic_ten_commit_run_with_regression_and_recovery() {
     assert_eq!(state.commits_since_digest, 0);
     assert_eq!(state.last_seen_sha.as_deref(), Some(meta(9).sha.as_str()));
     assert!(!state.rows["salt_dynamic_gas/rex5_salt/sstore_100"].currently_regressed);
+}
+
+/// A synthetic instructions-lane collection mirroring `write_criterion_tree`'s
+/// headline row; `salt_count` controls the `rex5_salt` count (baseline fixed
+/// at 10_000, so `salt_count / 10_000` is the instructions ratio).
+fn instr_collection(salt_count: u64) -> InstrCollection {
+    let mk = |group: &str, subject: &str, workload: &str, count: u64| InstrRow {
+        group: group.into(),
+        subject: subject.into(),
+        workload: workload.into(),
+        count,
+    };
+    InstrCollection {
+        rows: vec![
+            mk("salt_dynamic_gas", "revm_pinned", "sstore_100", 10_000),
+            mk("salt_dynamic_gas", "rex5", "sstore_100", 24_000),
+            mk("salt_dynamic_gas", "rex5_salt", "sstore_100", salt_count),
+            mk("empty_transaction", "revm_pinned", "", 8_000),
+            mk("empty_transaction", "rex5", "", 9_500),
+        ],
+        failed_targets: vec![],
+    }
+}
+
+#[test]
+fn test_instructions_lane_regression_recovery_and_rebaseline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_root = tmp.path().join("data");
+    let cfg = Config::parse(CONFIG).unwrap();
+    let repo = cfg.repo("mega-evm").unwrap();
+    let settings = cfg.settings(repo).unwrap();
+    let store = RepoStore::new(&data_root, "mega-evm");
+
+    let scratch = tmp.path().join("criterion");
+    let run = |i: usize, salt_count: u64| {
+        if scratch.exists() {
+            std::fs::remove_dir_all(&scratch).unwrap();
+        }
+        // Walltime stays flat throughout: every event below is instructions-only.
+        write_criterion_tree(&scratch, 2.0);
+        process_results(
+            repo,
+            &settings,
+            &store,
+            &scratch,
+            &meta(i),
+            vec![],
+            Some(instr_collection(salt_count)),
+        )
+        .unwrap()
+    };
+
+    // Runs 0–4: stable counts. Quiet on both lanes.
+    for i in 0..5 {
+        let outcome = run(i, 20_000);
+        assert!(outcome.events.is_empty(), "run {i} should be quiet, got {:?}", outcome.events);
+        assert_eq!(outcome.instr_failed_targets, None, "clean lane reports no failures");
+    }
+
+    // The per-commit artifacts carry the lane's data.
+    let first_dir = store.root().join("commits").join(format!("20260701-{}", &meta(0).sha[..7]));
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(first_dir.join("raw.json")).unwrap())
+            .unwrap();
+    let salt_row = &raw["groups"]["salt_dynamic_gas"]["rex5_salt/sstore_100"];
+    assert_eq!(salt_row["instr"]["count"], 20_000);
+    assert_eq!(salt_row["instr"]["ratio_vs_baseline"], 2.0);
+    // Lane on but all targets fine: no instr_failed_targets key.
+    assert!(raw.get("instr_failed_targets").is_none());
+    let table: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(first_dir.join("compare_table.json")).unwrap(),
+    )
+    .unwrap();
+    let salt_item = table["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["item"] == "salt_dynamic_gas/sstore_100")
+        .expect("salt row in compare_table.json");
+    // Worst (max) headline-family instructions ratio: plain rex5's
+    // 24_000/10_000 beats rex5_salt's 2.0.
+    assert_eq!(salt_item["instr_headline_ratio"], 2.4);
+    let subjects = table["subjects"].as_array().unwrap();
+    let instr_cols = salt_item["instr"].as_array().unwrap();
+    assert_eq!(instr_cols.len(), subjects.len(), "instr aligns with subjects");
+    let pinned_idx = subjects.iter().position(|s| s == "revm_pinned").unwrap();
+    assert_eq!(instr_cols[pinned_idx], 10_000);
+
+    // Run 5: counts jump 3% — over the 2% built-in instructions threshold,
+    // far under the 10% walltime threshold. Exactly one event, marked.
+    let outcome = run(5, 20_600);
+    assert_eq!(outcome.events.len(), 1, "got {:?}", outcome.events);
+    match &outcome.events[0] {
+        Event::Regression { row_key, metric, pct_over, .. } => {
+            assert_eq!(row_key, "salt_dynamic_gas/rex5_salt/sstore_100");
+            assert_eq!(metric.as_deref(), Some("instructions"));
+            assert!((pct_over - 3.0).abs() < 0.1);
+        }
+        other => panic!("expected instructions Regression, got {other:?}"),
+    }
+    // The persisted events carry the marker too.
+    let alert_dir = store.root().join("commits").join(format!("20260702-{}", &meta(5).sha[..7]));
+    let persisted: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(alert_dir.join("events.json")).unwrap())
+            .unwrap();
+    assert_eq!(persisted[0]["metric"], "instructions");
+
+    // Run 6: still elevated — latched, quiet.
+    assert!(run(6, 20_600).events.is_empty(), "still-regressed must not re-fire");
+
+    // Run 7: back to the old count → recovery, still marked.
+    let outcome = run(7, 20_000);
+    assert_eq!(outcome.events.len(), 1);
+    match &outcome.events[0] {
+        Event::Recovery { metric, .. } => assert_eq!(metric.as_deref(), Some("instructions")),
+        other => panic!("expected instructions Recovery, got {other:?}"),
+    }
+
+    // The lanes' histories live side by side under the same key.
+    let state = State::load(&store.state_path()).unwrap();
+    let key = "salt_dynamic_gas/rex5_salt/sstore_100";
+    assert!(state.rows.contains_key(key));
+    assert!(state.instr_rows.contains_key(key));
+    assert!(!state.instr_rows[key].currently_regressed);
+
+    // Rebaseline clears the row from BOTH lanes.
+    let mut state = state;
+    let cleared = state.clear_rows(&[format!("{key}*")]);
+    assert_eq!(cleared, vec![key.to_string()]);
+    assert!(!state.rows.contains_key(key));
+    assert!(!state.instr_rows.contains_key(key));
+}
+
+#[test]
+fn test_instr_failed_targets_are_marked_in_record_and_outcome() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_root = tmp.path().join("data");
+    let cfg = Config::parse(CONFIG).unwrap();
+    let repo = cfg.repo("mega-evm").unwrap();
+    let settings = cfg.settings(repo).unwrap();
+    let store = RepoStore::new(&data_root, "mega-evm");
+
+    let scratch = tmp.path().join("criterion");
+    write_criterion_tree(&scratch, 2.0);
+    let mut instr = instr_collection(20_000);
+    instr.failed_targets = vec!["mega_bench".to_string()];
+    let outcome =
+        process_results(repo, &settings, &store, &scratch, &meta(0), vec![], Some(instr)).unwrap();
+
+    assert_eq!(outcome.instr_failed_targets, Some(vec!["mega_bench".to_string()]));
+    let raw: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(outcome.commit_dir.join("raw.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(raw["instr_failed_targets"][0], "mega_bench");
+    // The walltime marker stays independent (and absent here).
+    assert!(raw.get("failed_targets").is_none());
 }
 
 #[test]

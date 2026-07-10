@@ -518,6 +518,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_walltime_events_serialize_byte_identical_to_pre_lane_golden() {
+        // Captured by serializing these exact events with the
+        // pre-instructions-lane code: walltime events (metric: None) must not
+        // change shape for existing consumers.
+        let golden = r#"[
+  {
+    "type": "regression",
+    "row_key": "salt_dynamic_gas/rex5_salt/sstore_100",
+    "baseline_median": 2.0,
+    "current": 2.3,
+    "pct_over": 15.0
+  },
+  {
+    "type": "recovery",
+    "row_key": "salt_dynamic_gas/rex5_salt/sstore_100",
+    "baseline_median": 2.0,
+    "current": 2.02
+  },
+  {
+    "type": "digest",
+    "dir": "digests/20260702-abc1234..def5678"
+  }
+]"#;
+        let events = vec![
+            Event::Regression {
+                row_key: "salt_dynamic_gas/rex5_salt/sstore_100".into(),
+                baseline_median: 2.0,
+                current: 2.3,
+                pct_over: 15.0,
+                metric: None,
+            },
+            Event::Recovery {
+                row_key: "salt_dynamic_gas/rex5_salt/sstore_100".into(),
+                baseline_median: 2.0,
+                current: 2.02,
+                metric: None,
+            },
+            Event::Digest { dir: "digests/20260702-abc1234..def5678".into() },
+        ];
+        assert_eq!(serde_json::to_string_pretty(&events).unwrap(), golden);
+    }
+
+    #[test]
+    fn test_instructions_events_carry_the_metric_marker() {
+        let event = Event::Regression {
+            row_key: "g/rex5/w".into(),
+            baseline_median: 1.0,
+            current: 1.05,
+            pct_over: 5.0,
+            metric: Some(INSTRUCTIONS_METRIC.to_string()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""metric":"instructions""#), "got {json}");
+    }
+
+    #[test]
     fn test_dist_file_name_sanitizes_criterion_separators() {
         assert_eq!(
             dist_file_name("salt_dynamic_gas", "sstore_100"),
