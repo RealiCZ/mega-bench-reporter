@@ -33,6 +33,10 @@ pub struct RepoConfig {
     /// not available for this repo.
     #[serde(default)]
     pub flamegraph: Option<FlamegraphConfig>,
+    /// Instruction-count lane settings; absent = the lane is off and the
+    /// output is byte-identical to a walltime-only run.
+    #[serde(default)]
+    pub instructions: Option<InstructionsConfig>,
 }
 
 impl RepoConfig {
@@ -83,13 +87,23 @@ pub struct Tuning {
     /// Commits per trend digest (built-in: 10).
     pub digest_batch_size: Option<u32>,
     /// Cargo profile for `cargo bench` runs. Unset = cargo's default bench
-    /// profile — the same invocation mega-evm's CI uses. Set to `"profiling"`
-    /// to bench the debug-symbol build the flamegraph pipeline uses.
+    /// profile — comparable with the scheduled walltime layer. Set to
+    /// `"profiling"` to bench the debug-symbol build the flamegraph pipeline
+    /// uses.
     pub bench_profile: Option<String>,
+    /// Instructions lane: alert when a headline row's instruction-count ratio
+    /// rises more than this % over its rolling median (built-in: 2). Counts
+    /// are deterministic, so the threshold only needs headroom for incidental
+    /// codegen shifts, not run-to-run noise.
+    pub instr_regression_threshold_pct: Option<f64>,
+    /// Instructions lane recovery threshold (hysteresis; must be <= the
+    /// instructions regression threshold). Unset = that threshold.
+    pub instr_recovery_threshold_pct: Option<f64>,
 }
 
 /// Built-in defaults used when neither the repo nor `[defaults]` sets a knob.
 const DEFAULT_REGRESSION_THRESHOLD_PCT: f64 = 10.0;
+const DEFAULT_INSTR_REGRESSION_THRESHOLD_PCT: f64 = 2.0;
 const DEFAULT_ROLLING_WINDOW: usize = 20;
 const DEFAULT_DIGEST_BATCH_SIZE: u32 = 10;
 
@@ -99,6 +113,10 @@ pub struct Settings {
     pub regression_threshold_pct: f64,
     /// Defaults to `regression_threshold_pct` when not configured.
     pub recovery_threshold_pct: f64,
+    /// Instructions lane; unused (but still resolved) when the lane is off.
+    pub instr_regression_threshold_pct: f64,
+    /// Defaults to `instr_regression_threshold_pct` when not configured.
+    pub instr_recovery_threshold_pct: f64,
     pub rolling_window: usize,
     pub digest_batch_size: u32,
     pub bench_profile: Option<String>,
@@ -110,12 +128,21 @@ impl Settings {
             .regression_threshold_pct
             .or(defaults.regression_threshold_pct)
             .unwrap_or(DEFAULT_REGRESSION_THRESHOLD_PCT);
+        let instr_regression_threshold_pct = repo
+            .instr_regression_threshold_pct
+            .or(defaults.instr_regression_threshold_pct)
+            .unwrap_or(DEFAULT_INSTR_REGRESSION_THRESHOLD_PCT);
         let settings = Self {
             regression_threshold_pct,
             recovery_threshold_pct: repo
                 .recovery_threshold_pct
                 .or(defaults.recovery_threshold_pct)
                 .unwrap_or(regression_threshold_pct),
+            instr_regression_threshold_pct,
+            instr_recovery_threshold_pct: repo
+                .instr_recovery_threshold_pct
+                .or(defaults.instr_recovery_threshold_pct)
+                .unwrap_or(instr_regression_threshold_pct),
             rolling_window: repo
                 .rolling_window
                 .or(defaults.rolling_window)
@@ -138,6 +165,16 @@ impl Settings {
         // next run — an event-pair generator, the opposite of hysteresis.
         if settings.recovery_threshold_pct > settings.regression_threshold_pct {
             anyhow::bail!("recovery_threshold_pct must be <= regression_threshold_pct");
+        }
+        // The instructions pair follows the same rules as the walltime pair.
+        if settings.instr_regression_threshold_pct <= 0.0 {
+            anyhow::bail!("instr_regression_threshold_pct must be > 0");
+        }
+        if settings.instr_recovery_threshold_pct <= 0.0 {
+            anyhow::bail!("instr_recovery_threshold_pct must be > 0");
+        }
+        if settings.instr_recovery_threshold_pct > settings.instr_regression_threshold_pct {
+            anyhow::bail!("instr_recovery_threshold_pct must be <= instr_regression_threshold_pct");
         }
         if settings.rolling_window == 0 {
             anyhow::bail!("rolling_window must be >= 1");
@@ -180,6 +217,17 @@ fn default_profile_secs() -> u64 {
 
 fn default_retention_days() -> u32 {
     30
+}
+
+/// Instruction-count lane settings (CodSpeed runner offline mode). Presence
+/// of the section turns the lane on; it only ever runs on Linux hosts with
+/// the `codspeed` CLI and `cargo-codspeed` installed.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct InstructionsConfig {
+    /// Optional benchmark filter appended to `cargo codspeed run`; unset =
+    /// run everything the instrumented build produced.
+    #[serde(default)]
+    pub bench_filter: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -294,9 +342,42 @@ headline_subjects = ["rex5", "rex5_*"]
         assert_eq!(settings.regression_threshold_pct, 10.0);
         // Unset recovery threshold = the regression threshold (no hysteresis).
         assert_eq!(settings.recovery_threshold_pct, 10.0);
+        // The instructions lane's deterministic counts get a tight built-in.
+        assert_eq!(settings.instr_regression_threshold_pct, 2.0);
+        assert_eq!(settings.instr_recovery_threshold_pct, 2.0);
         assert_eq!(settings.rolling_window, 20);
         assert_eq!(settings.digest_batch_size, 10);
         assert_eq!(settings.bench_profile, None);
+    }
+
+    #[test]
+    fn test_instructions_lane_off_by_default_and_parses_with_or_without_filter() {
+        let cfg = Config::parse(SAMPLE).expect("parses");
+        assert_eq!(cfg.repo("mega-evm").unwrap().instructions, None);
+
+        // Empty section = lane on, no filter.
+        let cfg = Config::parse(&format!("{SAMPLE}\n[repos.instructions]\n")).expect("parses");
+        let instr = cfg.repo("mega-evm").unwrap().instructions.as_ref().expect("lane on");
+        assert_eq!(instr.bench_filter, None);
+
+        let cfg = Config::parse(&format!(
+            "{SAMPLE}\n[repos.instructions]\nbench_filter = \"mega_bench\"\n"
+        ))
+        .expect("parses");
+        let instr = cfg.repo("mega-evm").unwrap().instructions.as_ref().expect("lane on");
+        assert_eq!(instr.bench_filter.as_deref(), Some("mega_bench"));
+    }
+
+    #[test]
+    fn test_settings_instr_recovery_threshold_follows_instr_regression_threshold() {
+        // Only the instructions regression threshold set: recovery follows it.
+        let cfg = Config::parse(&format!("{SAMPLE}\ninstr_regression_threshold_pct = 1.0\n"))
+            .expect("parses");
+        let settings = cfg.settings(cfg.repo("mega-evm").unwrap()).unwrap();
+        assert_eq!(settings.instr_regression_threshold_pct, 1.0);
+        assert_eq!(settings.instr_recovery_threshold_pct, 1.0);
+        // The instructions pair is independent of the walltime pair.
+        assert_eq!(settings.regression_threshold_pct, 10.0);
     }
 
     #[test]
@@ -327,6 +408,10 @@ headline_subjects = ["rex5", "rex5_*"]
             "recovery_threshold_pct = 0.0",
             // Recovering above the regression trigger would flap.
             "regression_threshold_pct = 5.0\nrecovery_threshold_pct = 8.0",
+            // The instructions pair follows the same validation.
+            "instr_regression_threshold_pct = -1.0",
+            "instr_recovery_threshold_pct = 0.0",
+            "instr_regression_threshold_pct = 2.0\ninstr_recovery_threshold_pct = 3.0",
         ] {
             let cfg = Config::parse(&format!("{SAMPLE}\n{bad}\n")).expect("parses");
             assert!(
