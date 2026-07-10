@@ -7,8 +7,10 @@ description: Use when operating mega-bench-reporter or consuming its output - tr
 
 `mega-bench-reporter` continuously measures a repo's benchmark overhead against a
 configured baseline (for mega-evm: vanilla `revm_pinned`) and produces **data only**:
-raw metrics JSON, charts, and factual events. It never talks to Lark and renders no
-cards — discovering results, composing cards, and delivering them is entirely the
+raw metrics JSON, charts, and factual events. Two metric lanes exist: walltime
+(always on) and deterministic CPU instruction counts (opt-in per repo, Linux-only;
+events from it carry `"metric": "instructions"`). It never talks to Lark and renders
+no cards — discovering results, composing cards, and delivering them is entirely the
 consuming agent's job, following these docs.
 
 ## Commands

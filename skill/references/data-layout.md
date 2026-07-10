@@ -5,9 +5,9 @@ Everything is under `<data-root>/<repo>/`:
 | path | what it is |
 |---|---|
 | `latest.json` | pointer to the newest completed run: `{sha, commit_dir, finished_at}` (see [`discovery.md`](discovery.md)) |
-| `commits/<YYYYMMDD>-<shortsha>/raw.json` | source of truth for one benched commit: every row's mean ns and ratio |
+| `commits/<YYYYMMDD>-<shortsha>/raw.json` | source of truth for one benched commit: every row's mean ns and ratio, plus instruction counts when that lane ran |
 | `commits/<YYYYMMDD>-<shortsha>/events.json` | the run's factual events (see [`events.md`](events.md)); missing = no events recorded |
-| `commits/<YYYYMMDD>-<shortsha>/compare_table.json` | table-ready JSON: `{subjects[], headline_label, baseline_subject, rows[{item, p95_us[], headline_ratio}]}` (`p95_us` aligns with `subjects`; `null` = subject absent; `headline_ratio` = worst headline time ratio) |
+| `commits/<YYYYMMDD>-<shortsha>/compare_table.json` | table-ready JSON: `{subjects[], headline_label, baseline_subject, rows[{item, p95_us[], headline_ratio, instr[]?, instr_headline_ratio?}]}` (`p95_us` aligns with `subjects`; `null` = subject absent; `headline_ratio` = worst headline time ratio; the optional `instr` fields mirror that for instruction counts) |
 | `commits/<YYYYMMDD>-<shortsha>/compare_bars.png` | grouped bars: relative speed per item, baseline = 100% (lower = more overhead) |
 | `commits/<YYYYMMDD>-<shortsha>/dist_<group>[_<workload>].png` | violin plot of per-call time distributions (`/` in workloads becomes `_`) |
 | `digests/<YYYYMMDD>-<first>..<last>/summary.json` | last-N-commits headline series: per-row `ratios[]`, `first`, `last`, `median` |
@@ -28,9 +28,14 @@ The commit-dir date is the commit's committer date, not the run date.
   "rustc": "rustc 1.x.y (…)",
   "baseline_subject": "revm_pinned",
   "failed_targets": ["block_bench"],
+  "instr_failed_targets": ["comp_cost"],
   "groups": {
     "<group>": {
-      "<subject>[/<workload>]": { "ns": 24899.0, "ratio_vs_baseline": 1.76 }
+      "<subject>[/<workload>]": {
+        "ns": 24899.0,
+        "ratio_vs_baseline": 1.76,
+        "instr": { "count": 105230, "ratio_vs_baseline": 1.62 }
+      }
     }
   }
 }
@@ -42,8 +47,19 @@ The commit-dir date is the commit's committer date, not the run date.
   faster.** `null` = no baseline row for that group/workload.
 - `failed_targets` present only when non-empty: those targets' rows are absent, the
   rest of the data is still valid.
+- `instr` — the instructions lane's numbers, present only when that lane ran and
+  produced a count for the row: `count` = CPU instructions retired (callgrind `Ir`)
+  for one traced iteration, `ratio_vs_baseline` = same semantics as the walltime
+  ratio but over counts. Counts are **deterministic** (byte-identical across
+  repeat runs on the same commit/host).
+- `instr_failed_targets` — bench targets whose instructions-lane build/run failed;
+  absent when the lane is off, skipped, or fully clean. Independent of
+  `failed_targets` (the walltime marker).
 - `p95_us` (compare_table.json) is the 95th percentile of per-call times in µs —
   more outlier-sensitive than the mean; ratios still use means.
+- `instr` / `instr_headline_ratio` (compare_table.json, optional): per-subject
+  instruction counts aligned with `subjects[]`, and the worst headline-family
+  count ratio for the item. Absent on rows without instructions data.
 
 ## summary.json schema (digest)
 
@@ -67,6 +83,9 @@ Rows are headline-family only, sorted by median ratio descending. `null` in
 `rows.<row_key>.recent_ratios` is the rolling window (healthy runs only);
 `currently_regressed` is the event latch; `commits_since_digest` counts toward the
 next digest; `last_seen_sha` powers the retry-idempotence guard.
+`instr_rows` (present only once the instructions lane has recorded something) is
+the same structure for that lane — same row keys, independent windows and latches.
 
-Do not hand-edit — with one exception: deleting a single row's entry is the
-sanctioned way to accept a new performance level (the row re-baselines next run).
+Do not hand-edit — with one exception: deleting a single row's entry (from `rows`
+and/or `instr_rows`) is the sanctioned way to accept a new performance level (the
+row re-baselines next run).

@@ -20,8 +20,9 @@ its `commit_dir` is where this run's files live. Then pull exactly these fields:
 |---|---|---|
 | commit sha (short = first 7) | `latest.json` | `sha` |
 | what happened (the trigger for the card) | `<commit_dir>/events.json` | `[].type`: `regression` / `recovery` / `digest` |
-| regression detail rows | `events.json` | per event: `row_key`, `baseline_median`, `current`, `pct_over` |
-| partially-failed bench targets | `<commit_dir>/raw.json` | `failed_targets` (absent = none) |
+| regression detail rows | `events.json` | per event: `row_key`, `baseline_median`, `current`, `pct_over`, `metric` (absent = walltime, `"instructions"` = instruction-count lane) |
+| partially-failed bench targets | `<commit_dir>/raw.json` | `failed_targets`, `instr_failed_targets` (absent = none) |
+| any row's instruction count | `raw.json` | `groups.<group>.<subject>[/<workload>].instr.{count, ratio_vs_baseline}` (absent = the instructions lane didn't run) |
 | the numbers table | `<commit_dir>/compare_table.json` | `subjects[]`, `rows[]: {item, p95_us[], headline_ratio}`, `baseline_subject`, `headline_label` |
 | any row's exact mean/ratio | `raw.json` | `groups.<group>.<subject>[/<workload>].{ns, ratio_vs_baseline}` |
 | digest data (when events has `digest`) | `<data-root>/<repo>/<event.dir>/summary.json` | `commits[]`, `rows[]: {row_key, ratios[], first, last, median}` |
@@ -46,6 +47,13 @@ how far the current ratio sits above the row's rolling median, in percent.
   do not post again (see `discovery.md`).
 - Show ratios with two decimals and an `×` suffix (`2.09×`); show `pct_over` signed
   (`+15.0%`). Keep the card scannable.
+- **Instructions events** (`metric: "instructions"`): treat exactly like walltime
+  ones for the color standard — any regression event is red. Counts are
+  deterministic, so there is no noise to second-guess: a latched instructions
+  regression is a real code-path change, however small the percentage. Label the
+  line with the lane (e.g. a `[instructions]` prefix) so it isn't read as a
+  walltime slowdown; `instr_failed_targets` non-empty counts as "numbers
+  incomplete" for the yellow rule, same as `failed_targets`.
 
 ---
 

@@ -78,12 +78,13 @@ pub struct RunOutcome {
 // Bench runner
 // ---------------------------------------------------------------------------
 
-/// Runs one bench target. With no configured `bench_profile` this is exactly
-/// the invocation the tracked repo's CI uses (mega-evm's benchmark.yml):
-/// `cargo bench -p <pkg> --bench <target> -- --output-format bencher` — so the
-/// numbers stay comparable with the per-PR `/benchmark` flow. Output streams
-/// to stderr for the invoker's process logs; the data we parse is
-/// criterion's `target/criterion` tree, written as a side effect of any run.
+/// Runs one bench target. With no configured `bench_profile` this is
+/// `cargo bench -p <pkg> --bench <target> -- --output-format bencher` — the
+/// invocation the scheduled walltime layer standardized on, so the numbers
+/// stay comparable across runs (mega-evm's per-PR walltime flow has been
+/// superseded by CodSpeed instruction-count CI). Output streams to stderr
+/// for the invoker's process logs; the data we parse is criterion's
+/// `target/criterion` tree, written as a side effect of any run.
 pub fn bench_target(
     checkout: &Path,
     repo: &RepoConfig,
@@ -142,9 +143,8 @@ pub fn process_results(
 ) -> anyhow::Result<RunOutcome> {
     let rows = criterion_results::scan(criterion_dir)?;
     let ratios = criterion_results::compute_ratios(&rows, &repo.baseline_subject);
-    let instr_ratios = instr
-        .as_ref()
-        .map(|c| instructions::compute_instr_ratios(&c.rows, &repo.baseline_subject));
+    let instr_ratios =
+        instr.as_ref().map(|c| instructions::compute_instr_ratios(&c.rows, &repo.baseline_subject));
 
     // Idempotence guard: a retried run of the sha we just processed (e.g. the
     // invoker re-running after losing the output) must not
@@ -173,10 +173,8 @@ pub fn process_results(
     if let Some(instr_ratios) = &instr_ratios {
         record.add_instr_ratios(instr_ratios);
     }
-    record.instr_failed_targets = instr
-        .as_ref()
-        .map(|c| c.failed_targets.clone())
-        .filter(|failed| !failed.is_empty());
+    record.instr_failed_targets =
+        instr.as_ref().map(|c| c.failed_targets.clone()).filter(|failed| !failed.is_empty());
     let commit_dir = store.write_commit_record(&record)?;
 
     // 2. Charts and structured tables. Derived artifacts: a rendering failure

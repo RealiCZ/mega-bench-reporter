@@ -28,9 +28,28 @@ SLOAD with real data), `empty_transaction` (fixed per-tx overhead), `sstore_heav
 (LOG storage-gas), `system_contract_*` (interceptor dispatch), plus the `comp_cost`
 precompile groups.
 
+## Instructions lane
+
+The `[repos.instructions]` config enables a second metric beside walltime:
+CPU instructions retired (callgrind `Ir`) per benchmark, collected with the
+CodSpeed runner's offline simulation mode.
+
+- The count covers **one traced iteration** of the benchmark body — including
+  first-iteration lazy initialization (allocator warmup, `lazy_static`/`OnceCell`
+  fills), which a walltime mean amortizes away. Level shifts between the two
+  lanes are therefore expected; compare each lane against its own history.
+- Counts are **deterministic**: byte-identical across repeat runs of the same
+  commit on the same host. Any latched instructions regression is a real
+  code-path change.
+- Counts are **architecture-pinned**: an x86_64 count and an aarch64 count of
+  the same code differ by ISA, not by performance. The deployment host is
+  x86_64 — never compare stored counts across hosts of different architectures,
+  and expect a full instructions-lane rebaseline if the host architecture ever
+  changes.
+
 ## Caveats
 
 - MGas/s is not reported yet (needs the per-row gas emission, design decision D4);
-  everything is time-based.
+  everything is time-based except the instructions lane above.
 - The rex5 comparison rows exist only once the bench-coverage branch is merged to
   `main`; before that, runs against `main` produce no headline data.

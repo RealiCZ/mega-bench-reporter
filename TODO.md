@@ -56,6 +56,27 @@ None of these block using the tool; they need a joint decision or a follow-up ou
 11a. **The design doc's "commit 选择" page has no card equivalent.**
    Navigation of past reports is Lark chat scrollback plus `commits/` on disk (per the revised no-web-page plan); if a browsable index is wanted later, it is a new small feature.
 
+## Instructions lane (v1)
+
+20. **Instructions threshold calibration after real runs.**
+    `instr_regression_threshold_pct` defaults to 2.0 (counts are deterministic, but incidental codegen shifts — inlining changes, register allocation — produce small real deltas on unrelated commits).
+    After ~20 real runs on the Linux host, recalibrate from `state.json`'s `instr_rows.<key>.recent_ratios`: if flat-code commits show ratio wiggle above ~1%, raise the threshold or add hysteresis via `instr_recovery_threshold_pct`; if the windows are dead flat, consider tightening below 2%.
+21. **Host provisioning for the instructions lane — owner: user.**
+    The Linux box needs the `codspeed` CLI, `cargo-codspeed`, and valgrind (`codspeed setup`) preinstalled; the reporter deliberately never installs tools.
+    Until then the lane self-skips with a stderr note (walltime unaffected).
+    Once the host is provisioned, consider turning the missing-tool skip into a hard fail so a broken installation cannot silently produce walltime-only runs.
+22. **v1 exclusions (planned follow-ups).**
+    Cross-lane alert disambiguation (annotating a walltime regression event with "instructions flat/up" so BB9 can tell real slowdowns from machine noise) and instructions trend charts in the digest are deliberately not in v1.
+    The digest/trend pipeline is still walltime-only; instructions history accumulates in `state.json` and `raw.json` from day one, so both features can be added retroactively over stored data.
+23. **Expected walltime step when mega-evm swaps criterion for codspeed-criterion-compat.**
+    When that dependency swap merges in mega-evm, the walltime numbers may show a small one-off step (different harness overhead).
+    If the trend chart jumps on that commit, `rebaseline` the affected rows rather than hunting a phantom regression.
+24. **Instructions lane known edge cases (documented, accepted for v1).**
+    (a) Row-key parity with the walltime lane is proven for the bench styles mega-evm uses (grouped `bench_function`/`bench_with_input`); bare top-level `Criterion::bench_function` and `BenchmarkId::from_parameter` benches would get a lane-local key — revisit only if a tracked repo adopts those styles.
+    (b) An instruction count whose walltime row is missing (walltime target failed, instrumented run succeeded) is tracked in `state.json` but not recorded in `raw.json` (`ns` is a required field of the stable row schema) — a regression event for such a row cannot be cross-checked in `raw.json`.
+    (c) `--skip-bench` regen never re-collects the lane, so re-rendering a commit that had instructions data writes a walltime-only `raw.json` for it (dev/regen mode only).
+    (d) Per-target `cargo codspeed build` + full `cargo codspeed run` may re-run previously-built targets if `cargo-codspeed` accumulates bench binaries across builds; duplicate rows fold to identical values (counts are deterministic), so this costs time, not correctness — verify on the real host and scope the run with `bench_filter` per target if it bites.
+
 ## Plan deviations (for the record — deliberate, no action unless someone objects)
 
 12. Ratios are parsed from criterion's `target/criterion/**/new/*.json` tree, not from captured bencher-format stdout (plan Task 1.2 said "port the benchmark.yml inline JS"); the tree is structured and lossless, bencher stdout is only forwarded to stderr as logs.

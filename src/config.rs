@@ -422,6 +422,19 @@ headline_subjects = ["rex5", "rex5_*"]
     }
 
     #[test]
+    fn test_shipped_repos_toml_parses_and_resolves() {
+        // The checked-in config must stay loadable: a syntax error or an
+        // out-of-range knob would otherwise only surface on the prod box.
+        let cfg = Config::parse(include_str!("../repos.toml")).expect("repos.toml parses");
+        let repo = cfg.repo("mega-evm").expect("mega-evm entry");
+        cfg.settings(repo).expect("settings resolve");
+        // The instructions lane ships enabled for mega-evm, unfiltered.
+        let instr = repo.instructions.as_ref().expect("instructions lane configured");
+        assert_eq!(instr.bench_filter, None);
+        assert!(repo.flamegraph.is_some(), "flamegraph config still parses next to it");
+    }
+
+    #[test]
     fn test_settings_defaults_section_and_per_repo_override() {
         let text = format!(
             "[defaults]\nregression_threshold_pct = 15.0\nrolling_window = 30\n\

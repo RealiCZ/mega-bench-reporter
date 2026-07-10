@@ -288,9 +288,14 @@ fn collect_target(
     target: &str,
 ) -> anyhow::Result<Vec<InstrRow>> {
     let mut build = Command::new("cargo");
-    build
-        .current_dir(checkout)
-        .args(["codspeed", "build", "-p", repo.package(), "--bench", target]);
+    build.current_dir(checkout).args([
+        "codspeed",
+        "build",
+        "-p",
+        repo.package(),
+        "--bench",
+        target,
+    ]);
     run_streaming(build, &format!("cargo codspeed build --bench {target}"))?;
 
     if profile_dir.exists() {
@@ -364,12 +369,15 @@ totals: 1000 5 5
 ";
         let rows = parse_callgrind_rows(text);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0], InstrRow {
-            group: "g".into(),
-            subject: "rex5".into(),
-            workload: "w1".into(),
-            count: 99,
-        });
+        assert_eq!(
+            rows[0],
+            InstrRow {
+                group: "g".into(),
+                subject: "rex5".into(),
+                workload: "w1".into(),
+                count: 99,
+            }
+        );
     }
 
     #[test]
@@ -488,10 +496,8 @@ totals: 777 1
 
         let walltime_rows = criterion_results::scan(tmp.path()).unwrap();
         assert_eq!(walltime_rows.len(), 3);
-        let walltime_keys: std::collections::BTreeSet<String> = walltime_rows
-            .iter()
-            .map(|r| row_key(&r.group, &r.subject, &r.workload))
-            .collect();
+        let walltime_keys: std::collections::BTreeSet<String> =
+            walltime_rows.iter().map(|r| row_key(&r.group, &r.subject, &r.workload)).collect();
 
         let instr_keys: std::collections::BTreeSet<String> = [uri1, uri2, uri3]
             .iter()
@@ -515,13 +521,16 @@ totals: 777 1
             workload: "sstore_100".into(),
             count,
         };
-        let rows =
-            vec![mk("revm_pinned", 10_000), mk("rex5_salt", 25_000), InstrRow {
+        let rows = vec![
+            mk("revm_pinned", 10_000),
+            mk("rex5_salt", 25_000),
+            InstrRow {
                 group: "oracle_real_data".into(),
                 subject: "rex5_oracle".into(),
                 workload: "oracle_sload_50".into(),
                 count: 500,
-            }];
+            },
+        ];
         let ratios = compute_instr_ratios(&rows, "revm_pinned");
         assert_eq!(ratios.len(), 2);
         // Baseline-less group: counts recorded, no ratio.
@@ -536,7 +545,12 @@ totals: 777 1
     #[test]
     fn test_compute_instr_ratios_zero_baseline_yields_no_ratio() {
         let rows = vec![
-            InstrRow { group: "g".into(), subject: "revm_pinned".into(), workload: "w".into(), count: 0 },
+            InstrRow {
+                group: "g".into(),
+                subject: "revm_pinned".into(),
+                workload: "w".into(),
+                count: 0,
+            },
             InstrRow { group: "g".into(), subject: "rex5".into(), workload: "w".into(), count: 10 },
         ];
         let ratios = compute_instr_ratios(&rows, "revm_pinned");

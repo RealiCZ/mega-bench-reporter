@@ -441,10 +441,7 @@ mod tests {
             },
         ]);
         let row = &record.groups["salt_dynamic_gas"]["rex5_salt/sstore_100"];
-        assert_eq!(
-            row.instr,
-            Some(InstrRecord { count: 25_000, ratio_vs_baseline: Some(2.5) })
-        );
+        assert_eq!(row.instr, Some(InstrRecord { count: 25_000, ratio_vs_baseline: Some(2.5) }));
         // The sibling row without instr data keeps its plain shape.
         assert_eq!(record.groups["salt_dynamic_gas"]["revm_pinned/sstore_100"].instr, None);
         assert!(!record.groups.contains_key("missing_group"));

@@ -11,6 +11,9 @@ for that dir — treat as `[]`.
 { "type": "regression", "row_key": "salt_dynamic_gas/rex5_salt/sstore_100",
   "baseline_median": 2.0, "current": 2.3, "pct_over": 15.0 }
 
+{ "type": "regression", "row_key": "salt_dynamic_gas/rex5_salt/sstore_100",
+  "baseline_median": 2.0, "current": 2.06, "pct_over": 3.0, "metric": "instructions" }
+
 { "type": "recovery", "row_key": "salt_dynamic_gas/rex5_salt/sstore_100",
   "baseline_median": 2.0, "current": 2.02 }
 
@@ -27,6 +30,13 @@ for that dir — treat as `[]`.
   and quiet in between). Fires once.
 - `digest` — every `digest_batch_size` (default 10) commits; `dir` (repo-relative)
   holds `summary.json` + `trend.png` for the window.
+- `metric` — which lane a regression/recovery came from: **absent = walltime**
+  (unchanged from before the field existed), `"instructions"` = the
+  instruction-count lane. Instructions events use the same latch protocol but
+  their own state (`state.json → instr_rows`), their own thresholds
+  (`instr_regression_threshold_pct`, default 2%, and
+  `instr_recovery_threshold_pct`), and ratios over deterministic counts — so any
+  instructions regression is a real code-path change, not noise.
 
 ## Semantics that matter when interpreting
 
@@ -41,9 +51,11 @@ for that dir — treat as `[]`.
   the event only appears when the digest actually materialized.
 - To verify a regression by hand: `state.json → rows.<row_key>.recent_ratios` is the
   authoritative window; check `current > median(recent_ratios) * (1 + threshold/100)`.
+  For instructions events use `instr_rows.<row_key>` and the instr thresholds instead.
 
 ## Tuning
 
-`regression_threshold_pct`, `recovery_threshold_pct`, `rolling_window`,
-`digest_batch_size`, `bench_profile` live in `repos.toml` (`[defaults]` + per-repo
-overrides); built-in fallbacks in `src/config.rs`.
+`regression_threshold_pct`, `recovery_threshold_pct`,
+`instr_regression_threshold_pct`, `instr_recovery_threshold_pct`,
+`rolling_window`, `digest_batch_size`, `bench_profile` live in `repos.toml`
+(`[defaults]` + per-repo overrides); built-in fallbacks in `src/config.rs`.

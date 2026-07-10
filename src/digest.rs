@@ -312,11 +312,10 @@ mod tests {
         );
         record.failed_targets = failed.iter().map(|s| s.to_string()).collect();
         for (group, row_name, ns, ratio) in rows {
-            record
-                .groups
-                .entry(group.to_string())
-                .or_default()
-                .insert(row_name.to_string(), RowRecord { ns: *ns, ratio_vs_baseline: *ratio, instr: None });
+            record.groups.entry(group.to_string()).or_default().insert(
+                row_name.to_string(),
+                RowRecord { ns: *ns, ratio_vs_baseline: *ratio, instr: None },
+            );
         }
         record
     }
