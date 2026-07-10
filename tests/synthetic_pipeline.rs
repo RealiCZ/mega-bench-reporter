@@ -413,6 +413,45 @@ fn test_rerunning_same_sha_does_not_double_count() {
 }
 
 #[test]
+fn test_rerunning_same_sha_with_instr_does_not_double_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_root = tmp.path().join("data");
+    let cfg = Config::parse(CONFIG).unwrap();
+    let repo = cfg.repo("mega-evm").unwrap();
+    let settings = cfg.settings(repo).unwrap();
+    let store = RepoStore::new(&data_root, "mega-evm");
+
+    let scratch = tmp.path().join("criterion");
+    write_criterion_tree(&scratch, 2.0);
+    let run = || {
+        process_results(
+            repo,
+            &settings,
+            &store,
+            &scratch,
+            &meta(0),
+            vec![],
+            Some(instr_collection(20_000)),
+        )
+        .unwrap()
+    };
+    run();
+    let state_after_first = State::load(&store.state_path()).unwrap();
+
+    // Same sha again WITH instructions data: artifacts refresh, but neither
+    // lane's rolling window nor the digest counter moves, and the replayed
+    // ratios fire no events — mirroring the walltime-only rerun above.
+    let outcome = run();
+    assert!(outcome.events.is_empty());
+    let state_after_rerun = State::load(&store.state_path()).unwrap();
+    assert_eq!(state_after_first, state_after_rerun);
+    let key = "salt_dynamic_gas/rex5_salt/sstore_100";
+    assert_eq!(state_after_rerun.rows[key].recent_ratios.len(), 1);
+    assert_eq!(state_after_rerun.instr_rows[key].recent_ratios.len(), 1);
+    assert_eq!(state_after_rerun.commits_since_digest, 1);
+}
+
+#[test]
 fn test_failed_targets_are_marked_not_silently_dropped() {
     let tmp = tempfile::tempdir().unwrap();
     let data_root = tmp.path().join("data");

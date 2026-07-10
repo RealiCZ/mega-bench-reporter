@@ -51,9 +51,12 @@ pub struct InstrCollection {
 ///
 /// The `events:` line names the columns of the following `totals:` line;
 /// callgrind omits trailing zero-valued columns, so missing values are 0.
-/// Parts triggered by anything other than a client request (e.g.
-/// `Program termination`) carry no payload and are skipped here.
-fn parse_callgrind_parts(text: &str) -> Vec<(String, u64)> {
+/// A *present* token that fails to parse is different — the profile is
+/// malformed, so the part is skipped with a warning naming `source` (the
+/// profile file): recording it as 0 would feed a bogus 0.0 ratio into the
+/// rolling window. Parts triggered by anything other than a client request
+/// (e.g. `Program termination`) carry no payload and are skipped here.
+fn parse_callgrind_parts(text: &str, source: &str) -> Vec<(String, u64)> {
     const CLIENT_REQUEST: &str = "desc: Trigger: Client Request:";
     let mut parts = Vec::new();
     // The current part's client-request payload, and the most recent
@@ -75,8 +78,14 @@ fn parse_callgrind_parts(text: &str) -> Vec<(String, u64)> {
                 eprintln!("instructions lane: part '{payload}' has no Ir column — skipped");
                 continue;
             };
-            let values: Vec<u64> =
-                values.split_whitespace().map(|v| v.parse().unwrap_or(0)).collect();
+            let Ok(values) =
+                values.split_whitespace().map(str::parse).collect::<Result<Vec<u64>, _>>()
+            else {
+                eprintln!(
+                    "instructions lane: malformed totals for part '{payload}' in {source} — skipped"
+                );
+                continue;
+            };
             // Trailing zero-valued events are omitted by callgrind.
             let ir = values.get(ir_index).copied().unwrap_or(0);
             parts.push((payload, ir));
@@ -126,9 +135,10 @@ fn uri_to_triple(uri: &str) -> Option<(String, String, String)> {
 }
 
 /// Parses one callgrind text profile into keyed rows, skipping non-bench
-/// parts (metadata, program termination).
-pub fn parse_callgrind_rows(text: &str) -> Vec<InstrRow> {
-    parse_callgrind_parts(text)
+/// parts (metadata, program termination). `source` names the profile in
+/// anomaly warnings (malformed totals).
+pub fn parse_callgrind_rows(text: &str, source: &str) -> Vec<InstrRow> {
+    parse_callgrind_parts(text, source)
         .into_iter()
         .filter_map(|(uri, count)| {
             uri_to_triple(&uri).map(|(group, subject, workload)| InstrRow {
@@ -156,7 +166,7 @@ pub fn scan_profile_dir(dir: &Path) -> anyhow::Result<Vec<InstrRow>> {
     paths.sort();
     for path in paths {
         let text = std::fs::read_to_string(&path)?;
-        for row in parse_callgrind_rows(&text) {
+        for row in parse_callgrind_rows(&text, &path.display().to_string()) {
             by_key.insert((row.group, row.subject, row.workload), row.count);
         }
     }
@@ -238,6 +248,21 @@ pub fn collect(
     profile_root: &Path,
     os: &str,
 ) -> Option<InstrCollection> {
+    collect_inner(checkout, repo, cfg, profile_root, os, None)
+}
+
+/// [`collect`] with the preflight probes' `PATH` injectable — a test seam:
+/// overriding it with a bogus path forces the tools-missing skip hermetically,
+/// without depending on what the host has installed. Production callers go
+/// through [`collect`], which inherits the process environment (`None`).
+fn collect_inner(
+    checkout: &Path,
+    repo: &RepoConfig,
+    cfg: &InstructionsConfig,
+    profile_root: &Path,
+    os: &str,
+    preflight_path: Option<&str>,
+) -> Option<InstrCollection> {
     if os != "linux" {
         eprintln!(
             "instructions lane: skipped on {os} (CodSpeed simulation mode needs Linux/valgrind)"
@@ -249,7 +274,12 @@ pub fn collect(
         ("codspeed", &["--version"][..], "codspeed CLI"),
         ("cargo", &["codspeed", "--version"][..], "cargo-codspeed"),
     ] {
-        if let Err(e) = run_cmd(Command::new(program).args(args), what) {
+        let mut probe = Command::new(program);
+        probe.args(args);
+        if let Some(path) = preflight_path {
+            probe.env("PATH", path);
+        }
+        if let Err(e) = run_cmd(&mut probe, what) {
             eprintln!("instructions lane: skipped — {what} not usable: {e:#}");
             return None;
         }
@@ -344,7 +374,7 @@ totals: 456 1 1 2 0 1 2 0 1
 
     #[test]
     fn test_parse_fixture_counts_and_omitted_trailing_zeros() {
-        let rows = parse_callgrind_rows(FIXTURE);
+        let rows = parse_callgrind_rows(FIXTURE, "fixture.out");
         assert_eq!(rows.len(), 2);
         // 9 values for 12 event names: trailing zero columns are omitted,
         // and Ir (the first column) still parses.
@@ -370,7 +400,7 @@ part: 3
 desc: Trigger: Program termination
 totals: 1000 5 5
 ";
-        let rows = parse_callgrind_rows(text);
+        let rows = parse_callgrind_rows(text, "fixture.out");
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0],
@@ -391,7 +421,7 @@ events: Dr Ir Dw
 desc: Trigger: Client Request: b.rs::m::g::s/w
 totals: 7 42
 ";
-        let rows = parse_callgrind_rows(text);
+        let rows = parse_callgrind_rows(text, "fixture.out");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].count, 42);
         // And a totals line too short to reach the Ir column reads as 0.
@@ -400,7 +430,31 @@ events: Dr Dw Ir
 desc: Trigger: Client Request: b.rs::m::g::s/w
 totals: 7
 ";
-        assert_eq!(parse_callgrind_rows(text)[0].count, 0);
+        assert_eq!(parse_callgrind_rows(text, "fixture.out")[0].count, 0);
+    }
+
+    #[test]
+    fn test_parse_skips_part_with_malformed_totals_token() {
+        // A present-but-unparseable token (in ANY column, not just Ir) marks
+        // the part malformed: it must be skipped, not recorded as count 0 —
+        // a 0 count for a non-baseline subject would flow into the rolling
+        // window as a 0.0 ratio. Parts before and after still parse.
+        let text = "\
+events: Ir Dr
+desc: Trigger: Client Request: b.rs::m::g::before/w
+totals: 12 1
+desc: Trigger: Client Request: b.rs::m::g::bad_ir/w
+totals: 56garbage 1
+desc: Trigger: Client Request: b.rs::m::g::bad_other/w
+totals: 56 nope
+desc: Trigger: Client Request: b.rs::m::g::after/w
+totals: 34 1
+";
+        let rows = parse_callgrind_rows(text, "300.out");
+        let subjects: Vec<&str> = rows.iter().map(|r| r.subject.as_str()).collect();
+        assert_eq!(subjects, vec!["before", "after"]);
+        assert_eq!(rows[0].count, 12);
+        assert_eq!(rows[1].count, 34);
     }
 
     #[test]
@@ -590,6 +644,26 @@ headline_subjects = ["rex5", "rex5_*"]
             &InstructionsConfig::default(),
             Path::new("/nonexistent-profiles"),
             "macos",
+        );
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn test_collect_skipped_cleanly_when_preflight_tools_missing() {
+        // os IS linux, but the preflight PATH points nowhere, so neither
+        // `codspeed --version` nor `cargo codspeed --version` can spawn —
+        // hermetic regardless of what the host has installed. The lane must
+        // skip (None) without panicking and before touching the filesystem
+        // (both paths are nonexistent). `None` is exactly the lane-off value
+        // the pipeline maps to a walltime-only run, whose unaffected
+        // artifacts the synthetic pipeline tests pin.
+        let out = collect_inner(
+            Path::new("/nonexistent-checkout"),
+            &test_repo_config(),
+            &InstructionsConfig::default(),
+            Path::new("/nonexistent-profiles"),
+            "linux",
+            Some("/nonexistent-bin"),
         );
         assert_eq!(out, None);
     }
