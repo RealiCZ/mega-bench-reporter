@@ -316,7 +316,7 @@ mod tests {
                 .groups
                 .entry(group.to_string())
                 .or_default()
-                .insert(row_name.to_string(), RowRecord { ns: *ns, ratio_vs_baseline: *ratio });
+                .insert(row_name.to_string(), RowRecord { ns: *ns, ratio_vs_baseline: *ratio, instr: None });
         }
         record
     }

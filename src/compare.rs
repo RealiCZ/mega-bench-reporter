@@ -5,6 +5,7 @@
 //! chart, which is why it lives apart from the plotters renderers.
 
 use crate::criterion_results::{Row, WorkloadRatios};
+use crate::instructions::InstrWorkloadRatios;
 use std::collections::BTreeMap;
 
 /// p95 of a sample set (nearest-rank).
@@ -40,6 +41,14 @@ pub struct CompareTableRow {
     pub p95_us: Vec<Option<f64>>,
     /// Worst (max) headline-family time ratio vs the baseline for this item.
     pub headline_ratio: Option<f64>,
+    /// Instruction count per subject column, aligned with `subjects` like
+    /// `p95_us`. Absent (not `null`) when the instructions lane produced
+    /// nothing for this item, keeping lane-off tables byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instr: Option<Vec<Option<u64>>>,
+    /// Worst (max) headline-family instruction-count ratio vs the baseline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instr_headline_ratio: Option<f64>,
 }
 
 fn subject_rank(subject: &str, order: &[String]) -> (usize, String) {
@@ -53,10 +62,14 @@ fn subject_rank(subject: &str, order: &[String]) -> (usize, String) {
 /// `is_headline` decides which subjects feed the ratio column;
 /// `subject_order` pins the leading columns (unlisted subjects follow
 /// alphabetically) and is display-only — `baseline_subject` is the
-/// configured ratio baseline regardless of column order.
+/// configured ratio baseline regardless of column order. `instr_ratios`
+/// (the instructions lane, `None` when off) adds per-subject counts and a
+/// headline count ratio to matching items; the column set stays driven by
+/// the walltime rows.
 pub fn build_compare_table(
     rows: &[Row],
     ratios: &[WorkloadRatios],
+    instr_ratios: Option<&[InstrWorkloadRatios]>,
     headline_label: &str,
     baseline_subject: &str,
     subject_order: &[String],
@@ -79,6 +92,13 @@ pub fn build_compare_table(
             .insert(row.subject.clone(), p95(&row.samples_ns) / 1000.0);
     }
 
+    // (group, workload) -> the instructions lane's ratio table for that item.
+    let instr_by_item: BTreeMap<(String, String), &InstrWorkloadRatios> = instr_ratios
+        .unwrap_or_default()
+        .iter()
+        .map(|wl| ((wl.group.clone(), wl.workload.clone()), wl))
+        .collect();
+
     let table_rows = ratios
         .iter()
         .map(|wl| {
@@ -95,7 +115,21 @@ pub fn build_compare_table(
                 .filter(|r| is_headline(&r.subject))
                 .filter_map(|r| r.ratio_vs_baseline)
                 .fold(None, |acc: Option<f64>, r| Some(acc.map_or(r, |a| a.max(r))));
-            CompareTableRow { item, p95_us, headline_ratio }
+            let instr_wl = instr_by_item.get(&(wl.group.clone(), wl.workload.clone()));
+            let instr = instr_wl.map(|iwl| {
+                subjects
+                    .iter()
+                    .map(|s| iwl.rows.iter().find(|r| &r.subject == s).map(|r| r.count))
+                    .collect()
+            });
+            let instr_headline_ratio = instr_wl.and_then(|iwl| {
+                iwl.rows
+                    .iter()
+                    .filter(|r| is_headline(&r.subject))
+                    .filter_map(|r| r.ratio_vs_baseline)
+                    .fold(None, |acc: Option<f64>, r| Some(acc.map_or(r, |a| a.max(r))))
+            });
+            CompareTableRow { item, p95_us, headline_ratio, instr, instr_headline_ratio }
         })
         .collect();
 
@@ -165,6 +199,7 @@ mod tests {
         let table = build_compare_table(
             &rows,
             &ratios,
+            None,
             "rex5",
             "revm_pinned",
             &["revm_pinned".to_string()],
@@ -176,6 +211,47 @@ mod tests {
         // Worst headline ratio (only rex5_salt matches the filter).
         assert_eq!(table.rows[0].headline_ratio, Some(2.0));
         assert!(table.rows[0].p95_us.iter().all(|v| v.is_some()));
+        // Lane off: the instr fields stay absent from the serialized table.
+        assert_eq!(table.rows[0].instr, None);
+        assert_eq!(table.rows[0].instr_headline_ratio, None);
+        let json = serde_json::to_string(&table).unwrap();
+        assert!(!json.contains("instr"), "lane-off table must not mention instr: {json}");
+    }
+
+    #[test]
+    fn test_build_compare_table_instr_columns_align_with_subjects() {
+        let (rows, ratios) = sample_ratio_rows();
+        let instr = vec![crate::instructions::InstrWorkloadRatios {
+            group: "salt_dynamic_gas".into(),
+            workload: "sstore_100".into(),
+            rows: vec![
+                crate::instructions::InstrRatioRow {
+                    subject: "revm_pinned".into(),
+                    count: 10_000,
+                    ratio_vs_baseline: Some(1.0),
+                },
+                // rex4 has no instr row (absent column); rex5_salt does.
+                crate::instructions::InstrRatioRow {
+                    subject: "rex5_salt".into(),
+                    count: 25_000,
+                    ratio_vs_baseline: Some(2.5),
+                },
+            ],
+        }];
+        let table = build_compare_table(
+            &rows,
+            &ratios,
+            Some(&instr),
+            "rex5",
+            "revm_pinned",
+            &["revm_pinned".to_string()],
+            |s| s.starts_with("rex5"),
+        );
+        assert_eq!(table.subjects, vec!["revm_pinned", "rex4", "rex5_salt"]);
+        assert_eq!(table.rows[0].instr, Some(vec![Some(10_000), None, Some(25_000)]));
+        assert_eq!(table.rows[0].instr_headline_ratio, Some(2.5));
+        // The walltime columns are untouched by the extra lane.
+        assert_eq!(table.rows[0].headline_ratio, Some(2.0));
     }
 
     #[test]
@@ -186,6 +262,7 @@ mod tests {
         let table = build_compare_table(
             &rows,
             &ratios,
+            None,
             "rex5",
             "revm_pinned",
             &["rex5_salt".to_string(), "rex4".to_string()],

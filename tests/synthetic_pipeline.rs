@@ -93,7 +93,7 @@ fn test_synthetic_ten_commit_run_with_regression_and_recovery() {
             std::fs::remove_dir_all(&scratch).unwrap();
         }
         write_criterion_tree(&scratch, salt_ratio);
-        process_results(repo, &settings, &store, &scratch, &meta(i), vec![]).unwrap()
+        process_results(repo, &settings, &store, &scratch, &meta(i), vec![], None).unwrap()
     };
 
     // Runs 0–4: stable baseline. No events at all.
@@ -150,11 +150,13 @@ fn test_synthetic_ten_commit_run_with_regression_and_recovery() {
     let outcome = run(5, 2.3);
     assert_eq!(outcome.events.len(), 1);
     match &outcome.events[0] {
-        Event::Regression { row_key, baseline_median, current, pct_over } => {
+        Event::Regression { row_key, baseline_median, current, pct_over, metric } => {
             assert_eq!(row_key, "salt_dynamic_gas/rex5_salt/sstore_100");
             assert!((baseline_median - 2.0).abs() < 1e-9);
             assert!((current - 2.3).abs() < 1e-9);
             assert!((pct_over - 15.0).abs() < 0.1);
+            // Walltime events carry no metric marker (absent in the JSON).
+            assert_eq!(*metric, None);
         }
         other => panic!("expected Regression, got {other:?}"),
     }
@@ -235,12 +237,13 @@ fn test_rerunning_same_sha_does_not_double_count() {
 
     let scratch = tmp.path().join("criterion");
     write_criterion_tree(&scratch, 2.0);
-    process_results(repo, &settings, &store, &scratch, &meta(0), vec![]).unwrap();
+    process_results(repo, &settings, &store, &scratch, &meta(0), vec![], None).unwrap();
     let state_after_first = State::load(&store.state_path()).unwrap();
 
     // Same sha again (e.g. a consumer retry): artifacts refresh, but the
     // rolling window and digest counter must not move.
-    let outcome = process_results(repo, &settings, &store, &scratch, &meta(0), vec![]).unwrap();
+    let outcome =
+        process_results(repo, &settings, &store, &scratch, &meta(0), vec![], None).unwrap();
     assert!(outcome.events.is_empty());
     let state_after_rerun = State::load(&store.state_path()).unwrap();
     assert_eq!(state_after_first, state_after_rerun);
@@ -262,9 +265,16 @@ fn test_failed_targets_are_marked_not_silently_dropped() {
 
     let scratch = tmp.path().join("criterion");
     write_criterion_tree(&scratch, 2.0);
-    let outcome =
-        process_results(repo, &settings, &store, &scratch, &meta(0), vec!["block_bench".into()])
-            .unwrap();
+    let outcome = process_results(
+        repo,
+        &settings,
+        &store,
+        &scratch,
+        &meta(0),
+        vec!["block_bench".into()],
+        None,
+    )
+    .unwrap();
 
     let raw: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(outcome.commit_dir.join("raw.json")).unwrap(),

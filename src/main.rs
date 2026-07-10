@@ -123,6 +123,10 @@ struct CliOutput {
     /// Bench targets that failed this run (already marked in raw.json).
     /// Always present — a stable shape is easier on consumers.
     failed_targets: Vec<String>,
+    /// Instructions-lane per-target failures. Absent when the lane is off,
+    /// skipped, or fully clean — pre-lane consumers see an unchanged summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instr_failed_targets: Option<Vec<String>>,
     /// Factual events from this run (regression / recovery / digest).
     events: Vec<Event>,
 }
@@ -158,6 +162,7 @@ fn run() -> anyhow::Result<()> {
                 sha,
                 output_dir: outcome.commit_dir,
                 failed_targets: outcome.failed_targets,
+                instr_failed_targets: outcome.instr_failed_targets,
                 events: outcome.events,
             }
         }
@@ -175,6 +180,7 @@ fn run() -> anyhow::Result<()> {
                 sha: outcome.sha,
                 output_dir: outcome.flame_dir,
                 failed_targets: Vec::new(),
+                instr_failed_targets: None,
                 // Archive-only: the flamegraph subcommand never emits events.
                 events: Vec::new(),
             }

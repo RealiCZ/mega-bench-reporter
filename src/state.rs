@@ -21,6 +21,11 @@ pub struct State {
     pub last_seen_sha: Option<String>,
     pub commits_since_digest: u32,
     pub rows: BTreeMap<String, RowHistory>,
+    /// The instructions lane's rolling windows and latches, keyed by the same
+    /// row-key strings as `rows`. Empty when the lane is off — and then not
+    /// serialized, so pre-lane state files round-trip unchanged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub instr_rows: BTreeMap<String, RowHistory>,
 }
 
 /// Detection thresholds for [`State::check_and_record`], both in percent over
@@ -133,10 +138,33 @@ impl State {
         thresholds: Thresholds,
         window: usize,
     ) -> Verdict {
+        Self::check_and_record_in(&mut self.rows, row_key, ratio, thresholds, window)
+    }
+
+    /// [`Self::check_and_record`] for the instructions lane: identical
+    /// semantics against the row's history in `instr_rows` — the two lanes'
+    /// windows and latches never mix.
+    pub fn check_and_record_instr(
+        &mut self,
+        row_key: &str,
+        ratio: f64,
+        thresholds: Thresholds,
+        window: usize,
+    ) -> Verdict {
+        Self::check_and_record_in(&mut self.instr_rows, row_key, ratio, thresholds, window)
+    }
+
+    fn check_and_record_in(
+        rows: &mut BTreeMap<String, RowHistory>,
+        row_key: &str,
+        ratio: f64,
+        thresholds: Thresholds,
+        window: usize,
+    ) -> Verdict {
         // compute_ratios filters non-finite ratios at the source; a NaN here
         // would otherwise surface as a confusing panic inside median's sort.
         debug_assert!(ratio.is_finite(), "non-finite ratio for {row_key}");
-        let entry = self.rows.entry(row_key.to_string()).or_default();
+        let entry = rows.entry(row_key.to_string()).or_default();
         let verdict = if entry.recent_ratios.is_empty() {
             Verdict::FirstRun
         } else {
@@ -168,21 +196,24 @@ impl State {
 
     /// Accepts a new performance level for the rows matching `patterns`
     /// (exact row keys or trailing-`*` prefixes): drops their rolling history
-    /// AND their regression latch, so the next run re-baselines them as
-    /// FirstRun — no alert, fresh window. Returns the cleared row keys.
-    /// This is the `rebaseline` subcommand's core; the alternative was
-    /// hand-editing state.json.
+    /// AND their regression latch — in BOTH lanes' maps — so the next run
+    /// re-baselines them as FirstRun: no alert, fresh window. Returns the
+    /// cleared row keys (deduplicated across lanes). This is the `rebaseline`
+    /// subcommand's core; the alternative was hand-editing state.json.
     pub fn clear_rows(&mut self, patterns: &[String]) -> Vec<String> {
-        let matched: Vec<String> = self
-            .rows
-            .keys()
-            .filter(|key| patterns.iter().any(|p| crate::config::star_pattern_matches(p, key)))
-            .cloned()
-            .collect();
-        for key in &matched {
-            self.rows.remove(key);
+        let mut matched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for rows in [&mut self.rows, &mut self.instr_rows] {
+            let keys: Vec<String> = rows
+                .keys()
+                .filter(|key| patterns.iter().any(|p| crate::config::star_pattern_matches(p, key)))
+                .cloned()
+                .collect();
+            for key in keys {
+                rows.remove(&key);
+                matched.insert(key);
+            }
         }
-        matched
+        matched.into_iter().collect()
     }
 
     /// Bumps the digest counter; returns `true` when it has reached

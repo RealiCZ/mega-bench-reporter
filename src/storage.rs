@@ -13,6 +13,7 @@
 //! of truth; PNGs are derived artifacts.
 
 use crate::criterion_results::WorkloadRatios;
+use crate::instructions::InstrWorkloadRatios;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,21 @@ pub struct RowRecord {
     /// `mean_ns / baseline mean_ns` for the same `(group, workload)`;
     /// `None` when the group/workload has no baseline row. The baseline
     /// subject's name is recorded at the record level (`baseline_subject`).
+    pub ratio_vs_baseline: Option<f64>,
+    /// Instruction-count numbers; absent (not `null`) when the instructions
+    /// lane was off or produced nothing for this row, so lane-off records are
+    /// byte-identical to pre-lane ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instr: Option<InstrRecord>,
+}
+
+/// One row's instruction-count numbers inside `raw.json` (`instr` field).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InstrRecord {
+    /// CPU instructions retired (callgrind `Ir`) for one traced iteration.
+    pub count: u64,
+    /// `count / baseline count` for the same `(group, workload)`; `None`
+    /// when the group/workload has no baseline count.
     pub ratio_vs_baseline: Option<f64>,
 }
 
@@ -45,6 +61,10 @@ pub struct CommitRecord {
     /// silently dropped; their rows are simply absent from `groups`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed_targets: Vec<String>,
+    /// Bench targets whose instructions-lane build/run failed. Absent when
+    /// the lane is off or every target collected fine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instr_failed_targets: Option<Vec<String>>,
     /// `group -> row ("subject" or "subject/workload") -> numbers`.
     pub groups: BTreeMap<String, BTreeMap<String, RowRecord>>,
 }
@@ -57,6 +77,7 @@ impl CommitRecord {
             rustc,
             baseline_subject,
             failed_targets: Vec::new(),
+            instr_failed_targets: None,
             groups: BTreeMap::new(),
         }
     }
@@ -68,8 +89,39 @@ impl CommitRecord {
             for row in &wl.rows {
                 group.insert(
                     row_name(&row.subject, &wl.workload),
-                    RowRecord { ns: row.mean_ns, ratio_vs_baseline: row.ratio_vs_baseline },
+                    RowRecord {
+                        ns: row.mean_ns,
+                        ratio_vs_baseline: row.ratio_vs_baseline,
+                        instr: None,
+                    },
                 );
+            }
+        }
+    }
+
+    /// Attaches the instructions lane's counts/ratios to existing rows. A
+    /// count whose row the walltime lane did not produce (e.g. its walltime
+    /// target failed while the instrumented run succeeded) has no `RowRecord`
+    /// to attach to — `ns` is a required field of the stable schema — and is
+    /// skipped with a stderr note; its history is still tracked in
+    /// `state.json`.
+    pub fn add_instr_ratios(&mut self, ratios: &[InstrWorkloadRatios]) {
+        for wl in ratios {
+            for row in &wl.rows {
+                let name = row_name(&row.subject, &wl.workload);
+                match self.groups.get_mut(&wl.group).and_then(|g| g.get_mut(&name)) {
+                    Some(record) => {
+                        record.instr = Some(InstrRecord {
+                            count: row.count,
+                            ratio_vs_baseline: row.ratio_vs_baseline,
+                        });
+                    }
+                    None => eprintln!(
+                        "instructions lane: no walltime row for {}/{name} — count not recorded \
+                         in raw.json",
+                        wl.group
+                    ),
+                }
             }
         }
     }

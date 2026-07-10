@@ -59,6 +59,7 @@ fn main() {
     let table = build_compare_table(
         &rows,
         &ratios,
+        None,
         "rex5",
         "revm_pinned",
         &["revm_pinned".to_string()],

@@ -17,6 +17,7 @@ use crate::config::{RepoConfig, Settings};
 use crate::criterion_results::{self, Row};
 use crate::digest;
 use crate::git::{self, CommitMeta};
+use crate::instructions::{self, InstrCollection};
 use crate::state::{State, Thresholds, Verdict};
 use crate::storage::{CommitRecord, RepoStore};
 use crate::subprocess::drain_stdout_to_stderr;
@@ -28,18 +29,38 @@ use std::process::Command;
 /// A factual thing that happened during a run — the consumer decides what (if
 /// anything) to do about it. Persisted as `events.json` in the commit dir and
 /// echoed in the CLI's stdout summary.
+///
+/// `metric` names the lane an alert came from: absent (`None`, skipped in the
+/// JSON) for the walltime lane — so pre-lane consumers see identical events —
+/// and `"instructions"` for the instruction-count lane.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     /// A headline row rose past the regression threshold this run (fires once
     /// per regression — latched until recovery).
-    Regression { row_key: String, baseline_median: f64, current: f64, pct_over: f64 },
+    Regression {
+        row_key: String,
+        baseline_median: f64,
+        current: f64,
+        pct_over: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metric: Option<String>,
+    },
     /// A previously-regressed headline row dropped back within the recovery
     /// threshold of its frozen pre-regression median.
-    Recovery { row_key: String, baseline_median: f64, current: f64 },
+    Recovery {
+        row_key: String,
+        baseline_median: f64,
+        current: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metric: Option<String>,
+    },
     /// A digest window completed; its data is in `dir` (repo-relative).
     Digest { dir: String },
 }
+
+/// The `metric` value instruction-count events carry.
+pub const INSTRUCTIONS_METRIC: &str = "instructions";
 
 /// Everything a `run` invocation produced. Serialized (via the CLI) as the
 /// stdout JSON summary for the consuming agent.
@@ -47,6 +68,9 @@ pub enum Event {
 pub struct RunOutcome {
     pub commit_dir: PathBuf,
     pub failed_targets: Vec<String>,
+    /// Instructions-lane per-target failures; `None` when the lane is off,
+    /// skipped, or fully clean (mirrors `CommitRecord::instr_failed_targets`).
+    pub instr_failed_targets: Option<Vec<String>>,
     pub events: Vec<Event>,
 }
 
@@ -104,6 +128,9 @@ pub fn dist_file_name(group: &str, workload: &str) -> String {
 
 /// The whole post-bench stage for one commit:
 /// parse → record → charts → rolling-median regression check → digest batch.
+/// `instr` is the instructions lane's collection — `None` when the lane is
+/// off or was skipped, in which case every artifact is byte-identical to a
+/// walltime-only run.
 pub fn process_results(
     repo: &RepoConfig,
     settings: &Settings,
@@ -111,9 +138,13 @@ pub fn process_results(
     criterion_dir: &Path,
     meta: &CommitMeta,
     failed_targets: Vec<String>,
+    instr: Option<InstrCollection>,
 ) -> anyhow::Result<RunOutcome> {
     let rows = criterion_results::scan(criterion_dir)?;
     let ratios = criterion_results::compute_ratios(&rows, &repo.baseline_subject);
+    let instr_ratios = instr
+        .as_ref()
+        .map(|c| instructions::compute_instr_ratios(&c.rows, &repo.baseline_subject));
 
     // Idempotence guard: a retried run of the sha we just processed (e.g. the
     // invoker re-running after losing the output) must not
@@ -139,6 +170,13 @@ pub fn process_results(
     );
     record.add_ratios(&ratios);
     record.failed_targets = failed_targets.clone();
+    if let Some(instr_ratios) = &instr_ratios {
+        record.add_instr_ratios(instr_ratios);
+    }
+    record.instr_failed_targets = instr
+        .as_ref()
+        .map(|c| c.failed_targets.clone())
+        .filter(|failed| !failed.is_empty());
     let commit_dir = store.write_commit_record(&record)?;
 
     // 2. Charts and structured tables. Derived artifacts: a rendering failure
@@ -149,6 +187,7 @@ pub fn process_results(
     let table = compare::build_compare_table(
         &rows,
         &ratios,
+        instr_ratios.as_deref(),
         &repo.headline_label(),
         &repo.baseline_subject,
         &subject_order,
@@ -260,6 +299,7 @@ pub fn process_results(
                             baseline_median: median,
                             current,
                             pct_over,
+                            metric: None,
                         });
                     }
                     Verdict::Recovered { median, current } => {
@@ -267,6 +307,47 @@ pub fn process_results(
                             row_key: key,
                             baseline_median: median,
                             current,
+                            metric: None,
+                        });
+                    }
+                    Verdict::FirstRun | Verdict::Ok | Verdict::StillRegressed => {}
+                }
+            }
+        }
+        // The instructions lane runs the same protocol against its own state
+        // map and thresholds; its events are distinguished by `metric`.
+        for wl in instr_ratios.as_deref().unwrap_or_default() {
+            for ratio_row in &wl.rows {
+                let Some(ratio) = ratio_row.ratio_vs_baseline else { continue };
+                let key = criterion_results::row_key(&wl.group, &ratio_row.subject, &wl.workload);
+                let verdict = state.check_and_record_instr(
+                    &key,
+                    ratio,
+                    Thresholds {
+                        regression_pct: settings.instr_regression_threshold_pct,
+                        recovery_pct: settings.instr_recovery_threshold_pct,
+                    },
+                    settings.rolling_window,
+                );
+                if !is_headline(&ratio_row.subject) {
+                    continue;
+                }
+                match verdict {
+                    Verdict::NewRegression { median, current, pct_over } => {
+                        events.push(Event::Regression {
+                            row_key: key,
+                            baseline_median: median,
+                            current,
+                            pct_over,
+                            metric: Some(INSTRUCTIONS_METRIC.to_string()),
+                        });
+                    }
+                    Verdict::Recovered { median, current } => {
+                        events.push(Event::Recovery {
+                            row_key: key,
+                            baseline_median: median,
+                            current,
+                            metric: Some(INSTRUCTIONS_METRIC.to_string()),
                         });
                     }
                     Verdict::FirstRun | Verdict::Ok | Verdict::StillRegressed => {}
@@ -322,7 +403,12 @@ pub fn process_results(
     // Discovery pointer: always points at the newest completed run.
     store.write_latest(&meta.sha, &commit_dir)?;
 
-    Ok(RunOutcome { commit_dir, failed_targets, events })
+    Ok(RunOutcome {
+        commit_dir,
+        failed_targets,
+        instr_failed_targets: record.instr_failed_targets.clone(),
+        events,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -405,7 +491,26 @@ pub fn run_commit_pipeline(
         }
     }
 
-    process_results(repo, settings, &store, &criterion_dir, &meta, failed_targets)
+    // Instructions lane: collected after the walltime benches on the same
+    // checkout, only when configured. `collect` handles its own skipping
+    // (non-Linux, tools missing) and never fails the run. Not collected in
+    // --skip-bench regen mode — unlike the criterion tree, the callgrind
+    // profiles are not kept around to re-parse.
+    let instr = if skip_bench {
+        None
+    } else {
+        repo.instructions.as_ref().and_then(|cfg| {
+            instructions::collect(
+                &checkout,
+                repo,
+                cfg,
+                &work_root.join("_instr_profiles").join(&repo.name),
+                std::env::consts::OS,
+            )
+        })
+    };
+
+    process_results(repo, settings, &store, &criterion_dir, &meta, failed_targets, instr)
 }
 
 #[cfg(test)]
