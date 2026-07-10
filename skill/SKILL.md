@@ -22,9 +22,11 @@ consuming agent's job, following these docs.
 | `mega-bench-reporter trend --repo <name> --config repos.toml --data-root <dir> [--last N \| --from <sha> --to <sha>] [--row <key>]... [--metric walltime\|instructions]` | manual trend chart over any stored-commit window into `trends/` — either lane, read-only, independent of the automatic digest |
 | `mega-bench-reporter rebaseline --repo <name> --data-root <dir> --row <key-or-prefix*>...` | accept a latched regression as the new normal: clear the rows' history + latch from `state.json`; next run re-baselines them (no alert). Only on an explicit human decision |
 
-Ground rules: exit 0 = success; stdout = one JSON summary (facts are durable on disk
-regardless); stderr = logs; runs take tens of minutes — no short timeouts; a per-repo
-lock rejects concurrent invocations; `GITHUB_TOKEN` only for private repos.
+Ground rules: exit 0 = success (except `require_instructions = true`, which turns a
+skipped/failed instructions lane into a nonzero exit — see `cli.md`); stdout = one
+JSON summary (facts are durable on disk regardless); stderr = logs; runs take tens of
+minutes — no short timeouts; a per-repo lock rejects concurrent invocations;
+`GITHUB_TOKEN` only for private repos.
 
 ## Routing — which doc for what
 

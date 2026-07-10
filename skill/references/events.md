@@ -30,7 +30,8 @@ for that dir — treat as `[]`.
   hysteresis so a row oscillating around the regression threshold stays latched
   and quiet in between). Fires once.
 - `digest` — every `digest_batch_size` (default 10) commits; `dir` (repo-relative)
-  holds `summary.json` + `trend.png` for the window.
+  holds `summary.json` + `trend.png` (plus the instructions lane's
+  `instr_trend.png`, see [`data-layout.md`](data-layout.md)) for the window.
 - `metric` — which lane a regression/recovery came from: **absent = walltime**
   (unchanged from before the field existed), `"instructions"` = the
   instruction-count lane. Instructions events use the same latch protocol but

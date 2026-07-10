@@ -26,7 +26,7 @@ its `commit_dir` is where this run's files live. Then pull exactly these fields:
 | any row's instruction count | `raw.json` | `groups.<group>.<subject>[/<workload>].instr.{count, ratio_vs_baseline}` (absent = the instructions lane didn't run) |
 | the numbers table | `<commit_dir>/compare_table.json` | `subjects[]`, `rows[]: {item, p95_us[], headline_ratio}`, `baseline_subject`, `headline_label` |
 | any row's exact mean/ratio | `raw.json` | `groups.<group>.<subject>[/<workload>].{ns, ratio_vs_baseline}` |
-| digest data (when events has `digest`) | `<data-root>/<repo>/<event.dir>/summary.json` | `commits[]`, `rows[]: {row_key, ratios[], first, last, median}` |
+| digest data (when events has `digest`) | `<data-root>/<repo>/<event.dir>/summary.json` | `commits[]`, `rows[]: {row_key, ratios[], first, last, median}`, `instr_series[]` (optional — the instructions-lane counterpart to `rows`, same shape, `null` where a commit has no instructions data) |
 | chart images | `commit_dir` / digest dir | `compare_bars.png`, `instr_bars.png`, `dist_*.png`, `trend.png`, `instr_trend.png` (see §4) |
 
 Ratio semantics: `ratio_vs_baseline` is a TIME ratio against `baseline_subject`
@@ -60,10 +60,11 @@ how far the current ratio sits above the row's rolling median, in percent.
   line — never fold it into the walltime numbers. Wording per `verdict`:
   - 🔴 `up` — "corroborated real regression — instructions
     {{+ratio_delta_pct}}% too". The strongest signal a card can carry.
-  - 🟢 `flat` — "likely machine noise / layout effect — instructions steady
+  - ✅ `flat` — "likely machine noise / layout effect — instructions steady
     ({{ratio_delta_pct}}%)".
-  - 🟢 `down` — instructions moved down past the threshold while walltime
-    rose: not corroborated; show the signed delta.
+  - ⚠️ `down` — instructions moved down past the threshold while walltime
+    rose: not corroborated, but inconclusive — show the signed delta and let
+    the reader judge.
   - `missing` (`ratio_delta_pct: null`) — no instructions signal for this row
     (no data this run, or no rolling median yet): write `—`, don't imply
     corroboration either way.
@@ -104,8 +105,10 @@ Regression example — replace every `{{…}}`:
 Recovery uses the same shape with `--template green`, a ✅ title, and
 `back to {{current}}× (median {{baseline_median}}×)` lines. Digest cards: build a table
 from `summary.json.rows` (`row_key` / `median` / `first` / `last`) and attach
-`trend.png`. If your Lark stack uses card v1: move `body.elements` to top-level
-`elements` and swap `markdown` for `div`+`lark_md`.
+`trend.png`; when the digest has `instr_series`, mirror the table for the
+instructions lane (same fields) and attach `instr_trend.png` beside it. If your
+Lark stack uses card v1: move `body.elements` to top-level `elements` and swap
+`markdown` for `div`+`lark_md`.
 
 **Clean-run report card** (optional — your policy): when `events` is empty you can still
 post a `--template green` "run completed" card (the very first run always lands here —
