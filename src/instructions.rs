@@ -303,18 +303,21 @@ fn collect_target(
     }
     // The runner does not create the profile folder itself.
     std::fs::create_dir_all(profile_dir)?;
+    // The runner resolves --profile-folder against ITS working directory (the
+    // checkout), so a relative work root must be absolutized first.
+    let profile_dir = profile_dir.canonicalize()?;
 
     let mut run = Command::new("codspeed");
     run.current_dir(checkout)
         .args(["run", "--skip-upload", "--mode", "simulation", "--profile-folder"])
-        .arg(profile_dir)
+        .arg(&profile_dir)
         .args(["--", "cargo", "codspeed", "run"]);
     if let Some(filter) = &cfg.bench_filter {
         run.arg(filter);
     }
     run_streaming(run, &format!("codspeed run (target {target})"))?;
 
-    scan_profile_dir(profile_dir)
+    scan_profile_dir(&profile_dir)
 }
 
 #[cfg(test)]
