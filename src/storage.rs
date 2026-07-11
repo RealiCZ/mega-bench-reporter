@@ -2,9 +2,12 @@
 //!
 //! ```text
 //! <data-root>/<repo>/
-//!   commits/<YYYYMMDD>-<shortsha>/{raw.json, compare.png, dist_*.png}
+//!   commits/<YYYYMMDD>-<shortsha>/{raw.json, events.json, compare_table.json,
+//!                                  compare_bars.png, dist_*.png}
 //!   digests/<YYYYMMDD>-<shortsha-range>/{summary.json, trend.png}
+//!   trends/<YYYYMMDD>-<shortsha-range>/   (manual `trend` runs, same shape)
 //!   flame/<YYYYMMDD>/{<workload>.svg, <workload>_diff.svg}
+//!   latest.json
 //!   state.json
 //! ```
 //!

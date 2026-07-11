@@ -94,6 +94,6 @@ next digest; `last_seen_sha` powers the retry-idempotence guard.
 `instr_rows` (present only once the instructions lane has recorded something) is
 the same structure for that lane — same row keys, independent windows and latches.
 
-Do not hand-edit — with one exception: deleting a single row's entry (from `rows`
-and/or `instr_rows`) is the sanctioned way to accept a new performance level (the
-row re-baselines next run).
+Do not hand-edit. Accepting a new performance level for a row (clearing its window +
+latch — in both lanes — so it re-baselines next run) is the `rebaseline` subcommand's
+job — see [`cli.md`](cli.md) — and only ever follows an explicit human decision.
