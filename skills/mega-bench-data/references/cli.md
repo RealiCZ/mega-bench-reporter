@@ -35,12 +35,11 @@ record events, update `state.json` and `latest.json`.
 - No need to hold a live connection: launch detached, wait for exit, read the files
   (see [`discovery.md`](discovery.md)).
 - `--skip-bench` re-renders artifacts from the checkout's existing criterion tree —
-  dev/regen only; it accepts only the last processed sha, and it never re-collects
-  the instructions lane (the previous raw.json's instructions data is carried
-  forward instead of being dropped). Under `require_instructions = true` this
-  carry-forward feeds the gate: a regen whose previous record had no instructions
-  data passes the gate silently, while one whose previous record carried
-  `instr_failed_targets` re-fails the gate on every re-render (both deliberate).
+  dev/regen only; it accepts only the last processed sha, and never re-collects the
+  instructions lane: it carries the previous raw.json's instructions data forward.
+  Under `require_instructions = true`, a previous record with no instructions data
+  passes the gate silently; one carrying `instr_failed_targets` re-fails the gate on
+  every re-render.
 
 ## stdout summary
 
@@ -133,9 +132,8 @@ nothing to relay — plain cron is enough; view `flame/<day>/*.svg` in a browser
 ## Environment and safety
 
 - Exit 0 = success. Runs take as long as the benches take (tens of minutes) — no
-  short timeouts. With `require_instructions = true`, a run whose instructions
-  lane skipped or failed exits nonzero even though its walltime data landed in
-  full (see the per-commit run section).
+  short timeouts. The one exception is `require_instructions = true` — see the
+  per-commit run section.
 - `GITHUB_TOKEN` env var: only needed for private repos (https clone URLs use it via
   a git credential helper; the token never appears in argv).
 - Concurrency: a per-repo lock (`<data-root>/<repo>/.lock`) makes a second
