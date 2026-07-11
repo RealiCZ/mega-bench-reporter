@@ -71,14 +71,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          gh label create toolchain-canary --force \
+            --description "weekly CodSpeed toolchain drift alerts" --color D93F0B
           existing=$(gh issue list --label toolchain-canary --state open --json number --jq length)
           if [ "$existing" = "0" ]; then
+            body=$(printf '%s\n\n%s' \
+              "The weekly canary failed against the LATEST codspeed CLI / cargo-codspeed: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              "Do NOT upgrade the toolchain on the production host until this is understood (the host stays on the pinned versions from skills/provision-instructions-lane). Likely drift points: --skip-upload flag, profile folder layout, callgrind file format (creator line), install.sh location.")
             gh issue create \
               --title "toolchain-canary: latest CodSpeed toolchain broke offline collection" \
-              --label toolchain-canary \
-              --body "The weekly canary failed against the LATEST codspeed CLI / cargo-codspeed: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
-
-Do NOT upgrade the toolchain on the production host until this is understood (the host stays on the pinned versions from skills/provision-instructions-lane). Likely drift points: --skip-upload flag, profile folder layout, callgrind file format (creator line), install.sh location."
+              --label toolchain-canary --body "$body"
           else
             echo "open canary issue already exists — not duplicating"
           fi
