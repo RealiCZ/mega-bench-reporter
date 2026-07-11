@@ -63,11 +63,10 @@ None of these block using the tool; they need a joint decision or a follow-up ou
     After ~20 real runs on the Linux host, recalibrate from `state.json`'s `instr_rows.<key>.recent_ratios`: if flat-code commits show ratio wiggle above ~1%, raise the threshold or add hysteresis via `instr_recovery_threshold_pct`; if the windows are dead flat, consider tightening below 2%.
 21. **Host provisioning for the instructions lane — owner: user.**
     The Linux box needs the `codspeed` CLI, `cargo-codspeed`, and valgrind (`codspeed setup`) preinstalled; the reporter deliberately never installs tools.
+    Pin the validated versions when provisioning: codspeed runner 4.18.x and cargo-codspeed 5.0.1 — the callgrind parsing and the `--skip-upload` offline flow were validated against these, and the preflight warns on a non-5.x cargo-codspeed major.
     Until then the lane self-skips with a stderr note (walltime unaffected).
-    Once the host is provisioned, consider turning the missing-tool skip into a hard fail so a broken installation cannot silently produce walltime-only runs.
-22. **v1 exclusions (planned follow-ups).**
-    Cross-lane alert disambiguation (annotating a walltime regression event with "instructions flat/up" so BB9 can tell real slowdowns from machine noise) and instructions trend charts in the digest are deliberately not in v1.
-    The digest/trend pipeline is still walltime-only; instructions history accumulates in `state.json` and `raw.json` from day one, so both features can be added retroactively over stored data.
+    ~~Once the host is provisioned, consider turning the missing-tool skip into a hard fail so a broken installation cannot silently produce walltime-only runs.~~ **Resolved (knob added, off by default):** `require_instructions = true` in `[repos.instructions]` makes a run whose lane skipped (or failed any target) exit nonzero — after the complete write sequence, so on-disk data stays valid; flip it on once the host is provisioned.
+22. ~~v1 exclusions (planned follow-ups).~~ **Resolved:** both follow-ups have shipped over the stored data — cross-lane alert disambiguation (walltime regression/recovery events carry an `instructions` annotation with `ratio_delta_pct` + flat/up/down/missing verdict) and instructions trends in the digest (`instr_series` in summary.json, `instr_trend.png`, plus the manual `trend --metric instructions`).
 23. **Expected walltime step when mega-evm swaps criterion for codspeed-criterion-compat.**
     When that dependency swap merges in mega-evm, the walltime numbers may show a small one-off step (different harness overhead).
     If the trend chart jumps on that commit, `rebaseline` the affected rows rather than hunting a phantom regression.
@@ -75,8 +74,11 @@ None of these block using the tool; they need a joint decision or a follow-up ou
     (a) Row-key parity with the walltime lane is proven for the bench styles mega-evm uses (grouped `bench_function`/`bench_with_input`); bare top-level `Criterion::bench_function` and `BenchmarkId::from_parameter` benches would get a lane-local key — revisit only if a tracked repo adopts those styles.
     The URI shape for value-parameterized benches (`…::<group>::<function>/<value>`) follows criterion's full-id display but is not yet confirmed against a real profile — mega-evm has no such bench; verify one on the real host if a tracked repo adds one.
     (b) An instruction count whose walltime row is missing (walltime target failed, instrumented run succeeded) is tracked in `state.json` but not recorded in `raw.json` (`ns` is a required field of the stable row schema) — a regression event for such a row cannot be cross-checked in `raw.json`.
-    (c) `--skip-bench` regen never re-collects the lane, so re-rendering a commit that had instructions data writes a walltime-only `raw.json` for it (dev/regen mode only).
+    ~~(c) `--skip-bench` regen never re-collects the lane, so re-rendering a commit that had instructions data writes a walltime-only `raw.json` for it (dev/regen mode only).~~ **Resolved:** the regen reads the previous `raw.json` for the sha and carries its instr blocks (and the compare-table instructions columns derived from them) forward byte-identically; a previous record without instr data regenerates exactly as before, and a malformed one warns (`instructions lane:` prefix) and regenerates without instr rather than failing.
     (d) Per-target `cargo codspeed build` + full `cargo codspeed run` may re-run previously-built targets if `cargo-codspeed` accumulates bench binaries across builds; duplicate rows fold to identical values (counts are deterministic), so this costs time, not correctness — verify on the real host and scope the run with `bench_filter` per target if it bites.
+25. **De-runner contingency (documented escape hatch — not implemented).**
+    If a codspeed runner upgrade ever breaks `--skip-upload` or the profile-folder layout, the fallback is to drive valgrind directly on the `cargo codspeed build` bench binaries (callgrind with `--instr-atstart=no`, one callgrind-out file per bench): the instrumented binaries already emit the client requests the parser keys on, so the callgrind-text parser layer is unchanged — only the collection subprocess layer would swap.
+    The pinned host versions (codspeed runner 4.18.x, cargo-codspeed 5.0.1 — see 21) make an unplanned upgrade unlikely; this entry exists so the escape hatch is on record, not as work to do now.
 
 ## Plan deviations (for the record — deliberate, no action unless someone objects)
 
