@@ -180,38 +180,83 @@ pub struct WorkloadRatios {
     pub rows: Vec<RatioRow>,
 }
 
-/// Groups `rows` by `(group, workload)` and computes each subject's ratio
-/// against that workload's `baseline_subject` row. Ordering is deterministic
-/// (BTreeMap) so digest tables and tests aren't flaky on directory-read order.
-pub fn compute_ratios(rows: &[Row], baseline_subject: &str) -> Vec<WorkloadRatios> {
-    let mut by_key: BTreeMap<(String, String), Vec<&Row>> = BTreeMap::new();
+/// A benchmark row the ratio computation can key by identity and measure by a
+/// single scalar. Both lanes implement it — walltime over `mean_ns`,
+/// instructions over `count` — so [`compute_ratios_by_workload`] is the one
+/// implementation behind `compute_ratios` and `compute_instr_ratios`.
+pub(crate) trait RatioInput {
+    fn group(&self) -> &str;
+    fn subject(&self) -> &str;
+    fn workload(&self) -> &str;
+    /// The scalar ratios are taken over (per-call ns, or instruction count).
+    fn value(&self) -> f64;
+}
+
+impl RatioInput for Row {
+    fn group(&self) -> &str {
+        &self.group
+    }
+    fn subject(&self) -> &str {
+        &self.subject
+    }
+    fn workload(&self) -> &str {
+        &self.workload
+    }
+    fn value(&self) -> f64 {
+        self.mean_ns
+    }
+}
+
+/// The shared ratio computation for both lanes: groups `rows` by
+/// `(group, workload)`, computes each subject's `value` ratio against that
+/// group/workload's `baseline_subject` value, and yields the per-workload
+/// tables in deterministic `(group, workload)` order with rows sorted by
+/// subject. `make_row` builds each lane's own ratio-row type from a source row
+/// and its `Option<ratio>`.
+///
+/// A degenerate baseline (non-finite or `<= 0`) is treated as absent, so the
+/// group's ratios are all `None` rather than inf/NaN poisoning downstream
+/// medians and charts; an individual non-finite ratio is likewise dropped.
+/// Ordering is deterministic (BTreeMap) so digest tables and tests aren't
+/// flaky on directory-read order.
+pub(crate) fn compute_ratios_by_workload<R: RatioInput, O>(
+    rows: &[R],
+    baseline_subject: &str,
+    make_row: impl Fn(&R, Option<f64>) -> O,
+) -> Vec<(String, String, Vec<O>)> {
+    let mut by_key: BTreeMap<(String, String), Vec<&R>> = BTreeMap::new();
     for row in rows {
-        by_key.entry((row.group.clone(), row.workload.clone())).or_default().push(row);
+        by_key.entry((row.group().to_string(), row.workload().to_string())).or_default().push(row);
     }
     by_key
         .into_iter()
-        .map(|((group, workload), group_rows)| {
-            // A degenerate baseline (zero/NaN estimate) would poison every
-            // downstream median/chart with inf/NaN — treat it as absent.
-            let baseline_ns = group_rows
+        .map(|((group, workload), mut group_rows)| {
+            let baseline = group_rows
                 .iter()
-                .find(|r| r.subject == baseline_subject)
-                .map(|r| r.mean_ns)
-                .filter(|ns| ns.is_finite() && *ns > 0.0);
-            let mut ratio_rows: Vec<RatioRow> = group_rows
+                .find(|r| r.subject() == baseline_subject)
+                .map(|r| r.value())
+                .filter(|v| v.is_finite() && *v > 0.0);
+            group_rows.sort_by(|a, b| a.subject().cmp(b.subject()));
+            let ratio_rows: Vec<O> = group_rows
                 .iter()
-                .map(|r| RatioRow {
-                    subject: r.subject.clone(),
-                    mean_ns: r.mean_ns,
-                    ratio_vs_baseline: baseline_ns
-                        .map(|b| r.mean_ns / b)
-                        .filter(|ratio| ratio.is_finite()),
-                })
+                .map(|r| make_row(r, baseline.map(|b| r.value() / b).filter(|x| x.is_finite())))
                 .collect();
-            ratio_rows.sort_by(|a, b| a.subject.cmp(&b.subject));
-            WorkloadRatios { group, workload, rows: ratio_rows }
+            (group, workload, ratio_rows)
         })
         .collect()
+}
+
+/// Groups `rows` by `(group, workload)` and computes each subject's ratio
+/// against that workload's `baseline_subject` row.
+pub fn compute_ratios(rows: &[Row], baseline_subject: &str) -> Vec<WorkloadRatios> {
+    compute_ratios_by_workload(rows, baseline_subject, |r, ratio| RatioRow {
+        subject: r.subject.clone(),
+        mean_ns: r.mean_ns,
+        ratio_vs_baseline: ratio,
+    })
+    .into_iter()
+    .map(|(group, workload, rows)| WorkloadRatios { group, workload, rows })
+    .collect()
 }
 
 /// Convenience: full_id-style key for a row, e.g. `"salt_dynamic_gas/rex5_salt/sstore_100"`

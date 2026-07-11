@@ -14,13 +14,14 @@
 use crate::charts;
 use crate::compare;
 use crate::config::{RepoConfig, Settings};
-use crate::criterion_results::{self, Row};
+use crate::criterion_results::{self, Row, WorkloadRatios};
 use crate::digest;
 use crate::git::{self, CommitMeta};
-use crate::instructions::{self, InstrCollection};
-use crate::state::{State, Thresholds, Verdict};
+use crate::instructions::{self, InstrCollection, InstrWorkloadRatios};
+use crate::lane::Lane;
+use crate::state::{RowHistory, State, Thresholds, Verdict};
 use crate::storage::{CommitRecord, RepoStore};
-use crate::subprocess::drain_stdout_to_stderr;
+use crate::subprocess::run_streaming;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -30,9 +31,10 @@ use std::process::Command;
 /// anything) to do about it. Persisted as `events.json` in the commit dir and
 /// echoed in the CLI's stdout summary.
 ///
-/// `metric` names the lane an alert came from: absent (`None`, skipped in the
-/// JSON) for the walltime lane — so pre-lane consumers see identical events —
-/// and `"instructions"` for the instruction-count lane.
+/// `metric` names the lane an alert came from ([`Lane::metric_field`]):
+/// absent (`None`, skipped in the JSON) for the walltime lane — so pre-lane
+/// consumers see identical events — and `"instructions"` for the
+/// instruction-count lane.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
@@ -59,8 +61,85 @@ pub enum Event {
     Digest { dir: String },
 }
 
-/// The `metric` value instruction-count events carry.
-pub const INSTRUCTIONS_METRIC: &str = "instructions";
+/// The lane-agnostic view of one workload's ratio table — everything the
+/// unified verdict loop ([`check_lane`]) reads from either lane's ratio type.
+trait LaneWorkloadRatios {
+    fn group(&self) -> &str;
+    fn workload(&self) -> &str;
+    /// Each subject and its ratio vs the baseline (`None` = no baseline row).
+    fn subject_ratios(&self) -> impl Iterator<Item = (&str, Option<f64>)>;
+}
+
+impl LaneWorkloadRatios for WorkloadRatios {
+    fn group(&self) -> &str {
+        &self.group
+    }
+    fn workload(&self) -> &str {
+        &self.workload
+    }
+    fn subject_ratios(&self) -> impl Iterator<Item = (&str, Option<f64>)> {
+        self.rows.iter().map(|r| (r.subject.as_str(), r.ratio_vs_baseline))
+    }
+}
+
+impl LaneWorkloadRatios for InstrWorkloadRatios {
+    fn group(&self) -> &str {
+        &self.group
+    }
+    fn workload(&self) -> &str {
+        &self.workload
+    }
+    fn subject_ratios(&self) -> impl Iterator<Item = (&str, Option<f64>)> {
+        self.rows.iter().map(|r| (r.subject.as_str(), r.ratio_vs_baseline))
+    }
+}
+
+/// One lane's regression pass — the verdict protocol both lanes share. Every
+/// row with a ratio is folded into `lane_rows` (that lane's rolling windows
+/// and latches; history is cheap); only headline-family rows emit events,
+/// tagged with the lane's `metric` marker.
+fn check_lane(
+    lane: Lane,
+    ratios: &[impl LaneWorkloadRatios],
+    thresholds: Thresholds,
+    lane_rows: &mut BTreeMap<String, RowHistory>,
+    rolling_window: usize,
+    is_headline: impl Fn(&str) -> bool,
+    events: &mut Vec<Event>,
+) {
+    for wl in ratios {
+        for (subject, ratio) in wl.subject_ratios() {
+            let Some(ratio) = ratio else { continue };
+            let key = criterion_results::row_key(wl.group(), subject, wl.workload());
+            let verdict =
+                State::check_and_record_in(lane_rows, &key, ratio, thresholds, rolling_window);
+            if !is_headline(subject) {
+                continue;
+            }
+            let metric = lane.metric_field().map(str::to_string);
+            match verdict {
+                Verdict::NewRegression { median, current, pct_over } => {
+                    events.push(Event::Regression {
+                        row_key: key,
+                        baseline_median: median,
+                        current,
+                        pct_over,
+                        metric,
+                    });
+                }
+                Verdict::Recovered { median, current } => {
+                    events.push(Event::Recovery {
+                        row_key: key,
+                        baseline_median: median,
+                        current,
+                        metric,
+                    });
+                }
+                Verdict::FirstRun | Verdict::Ok | Verdict::StillRegressed => {}
+            }
+        }
+    }
+}
 
 /// Everything a `run` invocation produced. Serialized (via the CLI) as the
 /// stdout JSON summary for the consuming agent.
@@ -96,21 +175,9 @@ pub fn bench_target(
     if let Some(profile) = bench_profile {
         cmd.args(["--profile", profile]);
     }
-    let mut child = cmd
-        .arg("--")
-        .arg("--output-format")
-        .arg("bencher")
-        // The bencher lines are streamed to stderr instead of inherited.
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn cargo bench --bench {target}: {e}"))?;
-    drain_stdout_to_stderr(&mut child)?;
-    let status = child.wait()?;
-    if !status.success() {
-        anyhow::bail!("cargo bench --bench {target} failed ({status})");
-    }
-    Ok(())
+    // run_streaming pipes the bencher lines to stderr instead of inheriting.
+    cmd.arg("--").arg("--output-format").arg("bencher");
+    run_streaming(cmd, &format!("cargo bench --bench {target}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -274,84 +341,27 @@ pub fn process_results(
     //    Skipped entirely on a re-run of the same sha (see guard above).
     let mut events: Vec<Event> = Vec::new();
     if !is_rerun {
-        for wl in &ratios {
-            for ratio_row in &wl.rows {
-                let Some(ratio) = ratio_row.ratio_vs_baseline else { continue };
-                let key = criterion_results::row_key(&wl.group, &ratio_row.subject, &wl.workload);
-                let verdict = state.check_and_record(
-                    &key,
-                    ratio,
-                    Thresholds {
-                        regression_pct: settings.regression_threshold_pct,
-                        recovery_pct: settings.recovery_threshold_pct,
-                    },
-                    settings.rolling_window,
-                );
-                if !is_headline(&ratio_row.subject) {
-                    continue;
-                }
-                match verdict {
-                    Verdict::NewRegression { median, current, pct_over } => {
-                        events.push(Event::Regression {
-                            row_key: key,
-                            baseline_median: median,
-                            current,
-                            pct_over,
-                            metric: None,
-                        });
-                    }
-                    Verdict::Recovered { median, current } => {
-                        events.push(Event::Recovery {
-                            row_key: key,
-                            baseline_median: median,
-                            current,
-                            metric: None,
-                        });
-                    }
-                    Verdict::FirstRun | Verdict::Ok | Verdict::StillRegressed => {}
-                }
-            }
-        }
-        // The instructions lane runs the same protocol against its own state
-        // map and thresholds; its events are distinguished by `metric`.
-        for wl in instr_ratios.as_deref().unwrap_or_default() {
-            for ratio_row in &wl.rows {
-                let Some(ratio) = ratio_row.ratio_vs_baseline else { continue };
-                let key = criterion_results::row_key(&wl.group, &ratio_row.subject, &wl.workload);
-                let verdict = state.check_and_record_instr(
-                    &key,
-                    ratio,
-                    Thresholds {
-                        regression_pct: settings.instr_regression_threshold_pct,
-                        recovery_pct: settings.instr_recovery_threshold_pct,
-                    },
-                    settings.rolling_window,
-                );
-                if !is_headline(&ratio_row.subject) {
-                    continue;
-                }
-                match verdict {
-                    Verdict::NewRegression { median, current, pct_over } => {
-                        events.push(Event::Regression {
-                            row_key: key,
-                            baseline_median: median,
-                            current,
-                            pct_over,
-                            metric: Some(INSTRUCTIONS_METRIC.to_string()),
-                        });
-                    }
-                    Verdict::Recovered { median, current } => {
-                        events.push(Event::Recovery {
-                            row_key: key,
-                            baseline_median: median,
-                            current,
-                            metric: Some(INSTRUCTIONS_METRIC.to_string()),
-                        });
-                    }
-                    Verdict::FirstRun | Verdict::Ok | Verdict::StillRegressed => {}
-                }
-            }
-        }
+        // Both lanes run the same protocol ([`check_lane`]) against their own
+        // state map and threshold pair. Event order in events.json is stable:
+        // all walltime events first, then the instructions lane's.
+        check_lane(
+            Lane::Walltime,
+            &ratios,
+            settings.thresholds(Lane::Walltime),
+            &mut state.rows,
+            settings.rolling_window,
+            is_headline,
+            &mut events,
+        );
+        check_lane(
+            Lane::Instructions,
+            instr_ratios.as_deref().unwrap_or_default(),
+            settings.thresholds(Lane::Instructions),
+            &mut state.instr_rows,
+            settings.rolling_window,
+            is_headline,
+            &mut events,
+        );
     }
 
     // 4. Digest batching: every digest_batch_size commits, roll up the window
@@ -565,7 +575,7 @@ mod tests {
             baseline_median: 1.0,
             current: 1.05,
             pct_over: 5.0,
-            metric: Some(INSTRUCTIONS_METRIC.to_string()),
+            metric: Lane::Instructions.metric_field().map(str::to_string),
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""metric":"instructions""#), "got {json}");

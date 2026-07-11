@@ -151,29 +151,37 @@ pub fn parse_callgrind_rows(text: &str, source: &str) -> Vec<InstrRow> {
         .collect()
 }
 
+/// Folds rows into one deduplicated, deterministically-ordered list, keyed by
+/// `(group, subject, workload)` (later occurrences win). Counts are
+/// deterministic, so a benchmark appearing more than once (e.g. in a second
+/// profile file, or a re-run target) folds to the same value.
+fn dedupe_rows(rows: impl IntoIterator<Item = InstrRow>) -> Vec<InstrRow> {
+    let mut by_key: BTreeMap<(String, String, String), u64> = BTreeMap::new();
+    for row in rows {
+        by_key.insert((row.group, row.subject, row.workload), row.count);
+    }
+    by_key
+        .into_iter()
+        .map(|((group, subject, workload), count)| InstrRow { group, subject, workload, count })
+        .collect()
+}
+
 /// Parses every `*.out` file in a profile folder and folds the parts into one
 /// deduplicated, deterministically-ordered row list. The runner traces child
 /// processes too (one PID-named file each); only bench-binary processes
-/// contain benchmark parts, so most files contribute nothing. Counts are
-/// deterministic, so a benchmark appearing in more than one file (e.g. a
-/// re-run target) folds to the same value.
+/// contain benchmark parts, so most files contribute nothing.
 pub fn scan_profile_dir(dir: &Path) -> anyhow::Result<Vec<InstrRow>> {
-    let mut by_key: BTreeMap<(String, String, String), u64> = BTreeMap::new();
     let mut paths: Vec<_> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|ext| ext == "out"))
         .collect();
     paths.sort();
+    let mut rows = Vec::new();
     for path in paths {
         let text = std::fs::read_to_string(&path)?;
-        for row in parse_callgrind_rows(&text, &path.display().to_string()) {
-            by_key.insert((row.group, row.subject, row.workload), row.count);
-        }
+        rows.extend(parse_callgrind_rows(&text, &path.display().to_string()));
     }
-    Ok(by_key
-        .into_iter()
-        .map(|((group, subject, workload), count)| InstrRow { group, subject, workload, count })
-        .collect())
+    Ok(dedupe_rows(rows))
 }
 
 // ---------------------------------------------------------------------------
@@ -196,36 +204,33 @@ pub struct InstrWorkloadRatios {
     pub rows: Vec<InstrRatioRow>,
 }
 
+impl crate::criterion_results::RatioInput for InstrRow {
+    fn group(&self) -> &str {
+        &self.group
+    }
+    fn subject(&self) -> &str {
+        &self.subject
+    }
+    fn workload(&self) -> &str {
+        &self.workload
+    }
+    fn value(&self) -> f64 {
+        self.count as f64
+    }
+}
+
 /// Groups `rows` by `(group, workload)` and computes each subject's count
 /// ratio against that workload's `baseline_subject` row — the counts twin of
-/// `criterion_results::compute_ratios`, with the same deterministic ordering
-/// and the same degenerate-baseline guard (a zero-count baseline yields no
-/// ratio, not an inf).
+/// `criterion_results::compute_ratios` (one shared implementation), with the
+/// same deterministic ordering and the same degenerate-baseline guard (a
+/// zero-count baseline yields no ratio, not an inf).
 pub fn compute_instr_ratios(rows: &[InstrRow], baseline_subject: &str) -> Vec<InstrWorkloadRatios> {
-    let mut by_key: BTreeMap<(String, String), Vec<&InstrRow>> = BTreeMap::new();
-    for row in rows {
-        by_key.entry((row.group.clone(), row.workload.clone())).or_default().push(row);
-    }
-    by_key
-        .into_iter()
-        .map(|((group, workload), group_rows)| {
-            let baseline_count = group_rows
-                .iter()
-                .find(|r| r.subject == baseline_subject)
-                .map(|r| r.count)
-                .filter(|count| *count > 0);
-            let mut ratio_rows: Vec<InstrRatioRow> = group_rows
-                .iter()
-                .map(|r| InstrRatioRow {
-                    subject: r.subject.clone(),
-                    count: r.count,
-                    ratio_vs_baseline: baseline_count.map(|b| r.count as f64 / b as f64),
-                })
-                .collect();
-            ratio_rows.sort_by(|a, b| a.subject.cmp(&b.subject));
-            InstrWorkloadRatios { group, workload, rows: ratio_rows }
-        })
-        .collect()
+    crate::criterion_results::compute_ratios_by_workload(rows, baseline_subject, |r, ratio| {
+        InstrRatioRow { subject: r.subject.clone(), count: r.count, ratio_vs_baseline: ratio }
+    })
+    .into_iter()
+    .map(|(group, workload, rows)| InstrWorkloadRatios { group, workload, rows })
+    .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -286,24 +291,17 @@ fn collect_inner(
     }
 
     let mut collection = InstrCollection::default();
-    let mut by_key: BTreeMap<(String, String, String), u64> = BTreeMap::new();
+    let mut rows = Vec::new();
     for target in &repo.bench_targets {
         match collect_target(checkout, repo, cfg, &profile_root.join(target), target) {
-            Ok(rows) => {
-                for row in rows {
-                    by_key.insert((row.group, row.subject, row.workload), row.count);
-                }
-            }
+            Ok(target_rows) => rows.extend(target_rows),
             Err(e) => {
                 eprintln!("instructions lane: target '{target}' failed: {e:#}");
                 collection.failed_targets.push(target.clone());
             }
         }
     }
-    collection.rows = by_key
-        .into_iter()
-        .map(|((group, subject, workload), count)| InstrRow { group, subject, workload, count })
-        .collect();
+    collection.rows = dedupe_rows(rows);
     Some(collection)
 }
 

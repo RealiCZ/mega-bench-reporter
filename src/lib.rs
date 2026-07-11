@@ -12,6 +12,7 @@ pub mod digest;
 pub mod flamegraph;
 pub mod git;
 pub mod instructions;
+pub mod lane;
 pub mod pipeline;
 pub mod state;
 pub mod storage;

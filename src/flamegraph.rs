@@ -11,7 +11,7 @@
 use crate::config::{FlameWorkloadPair, RepoConfig};
 use crate::git;
 use crate::storage::RepoStore;
-use crate::subprocess::drain_stdout_to_stderr;
+use crate::subprocess::{drain_stdout_to_stderr, run_streaming};
 use std::collections::BTreeMap;
 use std::io::{BufReader, Cursor};
 use std::path::{Path, PathBuf};
@@ -243,7 +243,8 @@ fn profile_with_perf(
     scratch: &Path,
 ) -> anyhow::Result<Vec<u8>> {
     let perf_data = scratch.join(format!("{}.perf.data", workload_file_stem(benchmark_id)));
-    let mut record_child = Command::new("perf")
+    let mut record = Command::new("perf");
+    record
         .arg("record")
         .args(["-g", "--call-graph", "dwarf,16384"])
         .arg("-o")
@@ -252,18 +253,10 @@ fn profile_with_perf(
         .arg(bench_bin)
         .args(["--bench", "--exact", "--profile-time"])
         .arg(profile_secs.to_string())
-        .arg(benchmark_id)
-        // The profiled bench prints its own progress on stdout; our stdout is
-        // reserved for the final JSON document, so drain it to stderr.
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn perf record (Linux only): {e}"))?;
-    drain_stdout_to_stderr(&mut record_child)?;
-    let status = record_child.wait()?;
-    if !status.success() {
-        anyhow::bail!("perf record failed for '{benchmark_id}' ({status})");
-    }
+        .arg(benchmark_id);
+    // The profiled bench prints its own progress on stdout; our stdout is
+    // reserved for the final JSON document — run_streaming drains it to stderr.
+    run_streaming(record, &format!("perf record for '{benchmark_id}'"))?;
 
     let mut child = Command::new("perf")
         .arg("script")
@@ -294,6 +287,12 @@ fn profile_with_perf(
 /// (default 1 ms interval; no root, no extra tooling), then inferno's sample
 /// collapsing. Criterion's ~3 s warm-up runs the same workload, so sampling
 /// from process start still measures the intended code.
+///
+/// The bench child is managed inline rather than via
+/// [`crate::subprocess::run_streaming`]: the profiler must attach to the
+/// bench's PID between spawn and drain, and every failure path has to kill
+/// and reap the *sibling* child — a two-process dance the single-child
+/// helper cannot express.
 fn profile_with_sample(
     bench_bin: &Path,
     benchmark_id: &str,

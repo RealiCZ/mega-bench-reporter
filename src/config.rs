@@ -2,6 +2,8 @@
 //! subjects are interpreted. One entry today (mega-evm); the list shape is
 //! what leaves room for more.
 
+use crate::lane::Lane;
+use crate::state::Thresholds;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -123,26 +125,45 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// The resolved (regression, recovery) threshold pair for one lane.
+    pub fn thresholds(&self, lane: Lane) -> Thresholds {
+        match lane {
+            Lane::Walltime => Thresholds {
+                regression_pct: self.regression_threshold_pct,
+                recovery_pct: self.recovery_threshold_pct,
+            },
+            Lane::Instructions => Thresholds {
+                regression_pct: self.instr_regression_threshold_pct,
+                recovery_pct: self.instr_recovery_threshold_pct,
+            },
+        }
+    }
+
     fn resolve(repo: &Tuning, defaults: &Tuning) -> anyhow::Result<Self> {
-        let regression_threshold_pct = repo
-            .regression_threshold_pct
-            .or(defaults.regression_threshold_pct)
-            .unwrap_or(DEFAULT_REGRESSION_THRESHOLD_PCT);
-        let instr_regression_threshold_pct = repo
-            .instr_regression_threshold_pct
-            .or(defaults.instr_regression_threshold_pct)
-            .unwrap_or(DEFAULT_INSTR_REGRESSION_THRESHOLD_PCT);
+        // One resolve + one validate per lane: the walltime and instructions
+        // pairs share the same (regression, recovery) logic and rules, called
+        // twice with each lane's config keys and built-in default.
+        let pick = |repo_val: Option<f64>, default_val: Option<f64>| repo_val.or(default_val);
+        let walltime = Thresholds::resolve(
+            pick(repo.regression_threshold_pct, defaults.regression_threshold_pct),
+            pick(repo.recovery_threshold_pct, defaults.recovery_threshold_pct),
+            DEFAULT_REGRESSION_THRESHOLD_PCT,
+        );
+        let instr = Thresholds::resolve(
+            pick(repo.instr_regression_threshold_pct, defaults.instr_regression_threshold_pct),
+            pick(repo.instr_recovery_threshold_pct, defaults.instr_recovery_threshold_pct),
+            DEFAULT_INSTR_REGRESSION_THRESHOLD_PCT,
+        );
+        // Nonsense values would silently disable alerting or spam it — reject
+        // loudly, walltime pair first, then the instructions pair.
+        walltime.validate("")?;
+        instr.validate("instr_")?;
+
         let settings = Self {
-            regression_threshold_pct,
-            recovery_threshold_pct: repo
-                .recovery_threshold_pct
-                .or(defaults.recovery_threshold_pct)
-                .unwrap_or(regression_threshold_pct),
-            instr_regression_threshold_pct,
-            instr_recovery_threshold_pct: repo
-                .instr_recovery_threshold_pct
-                .or(defaults.instr_recovery_threshold_pct)
-                .unwrap_or(instr_regression_threshold_pct),
+            regression_threshold_pct: walltime.regression_pct,
+            recovery_threshold_pct: walltime.recovery_pct,
+            instr_regression_threshold_pct: instr.regression_pct,
+            instr_recovery_threshold_pct: instr.recovery_pct,
             rolling_window: repo
                 .rolling_window
                 .or(defaults.rolling_window)
@@ -153,29 +174,8 @@ impl Settings {
                 .unwrap_or(DEFAULT_DIGEST_BATCH_SIZE),
             bench_profile: repo.bench_profile.clone().or_else(|| defaults.bench_profile.clone()),
         };
-        // Nonsense values would silently disable alerting (window 0 makes
-        // every run FirstRun) or spam it (threshold <= 0) — reject loudly.
-        if settings.regression_threshold_pct <= 0.0 {
-            anyhow::bail!("regression_threshold_pct must be > 0");
-        }
-        if settings.recovery_threshold_pct <= 0.0 {
-            anyhow::bail!("recovery_threshold_pct must be > 0");
-        }
-        // Recovering above the regression trigger would re-alert on the very
-        // next run — an event-pair generator, the opposite of hysteresis.
-        if settings.recovery_threshold_pct > settings.regression_threshold_pct {
-            anyhow::bail!("recovery_threshold_pct must be <= regression_threshold_pct");
-        }
-        // The instructions pair follows the same rules as the walltime pair.
-        if settings.instr_regression_threshold_pct <= 0.0 {
-            anyhow::bail!("instr_regression_threshold_pct must be > 0");
-        }
-        if settings.instr_recovery_threshold_pct <= 0.0 {
-            anyhow::bail!("instr_recovery_threshold_pct must be > 0");
-        }
-        if settings.instr_recovery_threshold_pct > settings.instr_regression_threshold_pct {
-            anyhow::bail!("instr_recovery_threshold_pct must be <= instr_regression_threshold_pct");
-        }
+        // A zero window makes every run FirstRun (alerting off); a zero batch
+        // size would divide the digest cadence by nothing.
         if settings.rolling_window == 0 {
             anyhow::bail!("rolling_window must be >= 1");
         }

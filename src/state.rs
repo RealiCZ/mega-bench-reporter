@@ -47,6 +47,39 @@ impl Thresholds {
     pub fn uniform(pct: f64) -> Self {
         Self { regression_pct: pct, recovery_pct: pct }
     }
+
+    /// Resolves one lane's `(regression, recovery)` pair from its already
+    /// repo-over-defaults-merged optional values: a missing regression falls
+    /// back to `default_regression`, and a missing recovery follows the
+    /// resolved regression (no hysteresis). The two lanes call this with their
+    /// own keys and built-in default.
+    pub fn resolve(
+        regression: Option<f64>,
+        recovery: Option<f64>,
+        default_regression: f64,
+    ) -> Self {
+        let regression_pct = regression.unwrap_or(default_regression);
+        Self { regression_pct, recovery_pct: recovery.unwrap_or(regression_pct) }
+    }
+
+    /// Rejects the two ways a pair breaks alerting: a non-positive threshold
+    /// (spams every run) and a recovery above the regression trigger (an
+    /// event-pair generator, the opposite of hysteresis). `key_prefix` names
+    /// the config keys in the error (`""` walltime, `"instr_"` instructions).
+    pub fn validate(&self, key_prefix: &str) -> anyhow::Result<()> {
+        if self.regression_pct <= 0.0 {
+            anyhow::bail!("{key_prefix}regression_threshold_pct must be > 0");
+        }
+        if self.recovery_pct <= 0.0 {
+            anyhow::bail!("{key_prefix}recovery_threshold_pct must be > 0");
+        }
+        if self.recovery_pct > self.regression_pct {
+            anyhow::bail!(
+                "{key_prefix}recovery_threshold_pct must be <= {key_prefix}regression_threshold_pct"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// What `check_and_record` found for one row, relative to its history *before*
@@ -154,7 +187,11 @@ impl State {
         Self::check_and_record_in(&mut self.instr_rows, row_key, ratio, thresholds, window)
     }
 
-    fn check_and_record_in(
+    /// The lane-agnostic core of [`Self::check_and_record`]: the unified
+    /// verdict loop drives one lane by handing it that lane's own `rows` map
+    /// (`self.rows` or `self.instr_rows`) so the two lanes share this logic
+    /// without their windows ever mixing.
+    pub(crate) fn check_and_record_in(
         rows: &mut BTreeMap<String, RowHistory>,
         row_key: &str,
         ratio: f64,

@@ -58,6 +58,12 @@ fn subject_rank(subject: &str, order: &[String]) -> (usize, String) {
     }
 }
 
+/// The ratio column's aggregation, shared by both lanes: the worst (max) of
+/// an item's headline-family ratios, `None` when no headline row has one.
+fn worst_ratio(ratios: impl Iterator<Item = f64>) -> Option<f64> {
+    ratios.reduce(f64::max)
+}
+
 /// Assembles the comparison table from parsed rows + ratio tables.
 /// `is_headline` decides which subjects feed the ratio column;
 /// `subject_order` pins the leading columns (unlisted subjects follow
@@ -109,12 +115,12 @@ pub fn build_compare_table(
             };
             let p95_map = p95_by_item.get(&(wl.group.clone(), wl.workload.clone()));
             let p95_us = subjects.iter().map(|s| p95_map.and_then(|m| m.get(s)).copied()).collect();
-            let headline_ratio = wl
-                .rows
-                .iter()
-                .filter(|r| is_headline(&r.subject))
-                .filter_map(|r| r.ratio_vs_baseline)
-                .fold(None, |acc: Option<f64>, r| Some(acc.map_or(r, |a| a.max(r))));
+            let headline_ratio = worst_ratio(
+                wl.rows
+                    .iter()
+                    .filter(|r| is_headline(&r.subject))
+                    .filter_map(|r| r.ratio_vs_baseline),
+            );
             let instr_wl = instr_by_item.get(&(wl.group.clone(), wl.workload.clone()));
             let instr = instr_wl.map(|iwl| {
                 subjects
@@ -123,11 +129,12 @@ pub fn build_compare_table(
                     .collect()
             });
             let instr_headline_ratio = instr_wl.and_then(|iwl| {
-                iwl.rows
-                    .iter()
-                    .filter(|r| is_headline(&r.subject))
-                    .filter_map(|r| r.ratio_vs_baseline)
-                    .fold(None, |acc: Option<f64>, r| Some(acc.map_or(r, |a| a.max(r))))
+                worst_ratio(
+                    iwl.rows
+                        .iter()
+                        .filter(|r| is_headline(&r.subject))
+                        .filter_map(|r| r.ratio_vs_baseline),
+                )
             });
             CompareTableRow { item, p95_us, headline_ratio, instr, instr_headline_ratio }
         })
