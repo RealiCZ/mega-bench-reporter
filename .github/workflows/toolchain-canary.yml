@@ -56,7 +56,9 @@ jobs:
         run: |
           command -v codspeed || { echo '::error::codspeed binary not found after install.sh'; find "$HOME" -maxdepth 4 -name codspeed -type f 2>/dev/null; exit 1; }
           codspeed --version
-          cargo codspeed --version
+          # cargo-codspeed prints its version but exits 1 (clap version
+          # request travels its error path) — don't let bash -e kill the step.
+          (cargo codspeed --version 2>&1 || true) | head -1
           # Best-effort: `codspeed run` performs executor setup itself; this
           # explicit pass just surfaces setup diagnostics early. Root because
           # installing the valgrind fork is a system-level operation.

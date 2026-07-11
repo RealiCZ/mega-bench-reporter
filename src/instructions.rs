@@ -12,7 +12,7 @@
 //! into a nonzero exit AFTER the walltime write sequence completes.
 
 use crate::config::{InstructionsConfig, RepoConfig};
-use crate::subprocess::{run_cmd, run_streaming};
+use crate::subprocess::run_streaming;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
@@ -402,9 +402,34 @@ fn preflight(preflight_path: Option<&str>) -> Result<(String, String), String> {
         if let Some(path) = preflight_path {
             probe.env("PATH", path);
         }
-        match run_cmd(&mut probe, what) {
-            Ok(output) => versions.push(version_token(&output).to_string()),
-            Err(e) => return Err(format!("{what} not usable: {e:#}")),
+        // A probe is usable when its output carries a version banner, even on
+        // a nonzero exit: cargo-codspeed's `--version` prints the banner to
+        // stderr and exits 1 (clap's version request travels its error path;
+        // verified against v5.0.1), so requiring exit 0 would skip the lane
+        // on a perfectly healthy host. Only an exec failure, or versionless
+        // output on a failing exit, is unusable.
+        match probe.output() {
+            Err(e) => return Err(format!("{what} not usable: {e}")),
+            Ok(out) => {
+                let combined = format!(
+                    "{} {}",
+                    String::from_utf8_lossy(&out.stdout).trim(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                let combined = combined.trim();
+                match find_version_token(combined) {
+                    Some(token) => versions.push(token.to_string()),
+                    None if out.status.success() && !combined.is_empty() => {
+                        versions.push(combined.to_string());
+                    }
+                    None => {
+                        return Err(format!(
+                            "{what} not usable: `--version` exited {} without a version banner",
+                            out.status
+                        ));
+                    }
+                }
+            }
         }
     }
     let (codspeed, cargo_codspeed) = (versions.remove(0), versions.remove(0));
@@ -420,14 +445,17 @@ fn preflight(preflight_path: Option<&str>) -> Result<(String, String), String> {
 
 /// The version token — the first whitespace-separated token whose first
 /// character (after an optional leading `v`) is a digit — from a `--version`
-/// line like `cargo-codspeed 5.0.1`. Falls back to the whole trimmed string
-/// when nothing looks like a version, so the visibility line still says
-/// something useful.
-fn version_token(output: &str) -> &str {
+/// line like `cargo-codspeed 5.0.1`, or `None` when nothing looks like one.
+fn find_version_token(output: &str) -> Option<&str> {
     output
         .split_whitespace()
         .find(|tok| tok.trim_start_matches('v').starts_with(|c: char| c.is_ascii_digit()))
-        .unwrap_or_else(|| output.trim())
+}
+
+/// [`find_version_token`] with a fallback to the whole trimmed string, so the
+/// visibility line still says something useful for versionless output.
+fn version_token(output: &str) -> &str {
+    find_version_token(output).unwrap_or_else(|| output.trim())
 }
 
 /// The integer major version of a version token (`5` from `5.0.1`, `6` from
@@ -988,6 +1016,36 @@ version = \"2.10.1\"
         write_exec(&bin.path().join("cargo"), "#!/bin/sh\necho 'cargo-codspeed 6.1.0'\n");
         let out = preflight(Some(bin.path().to_str().unwrap()));
         assert_eq!(out, Ok(("4.18.2".to_string(), "6.1.0".to_string())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_preflight_accepts_version_banner_on_stderr_with_nonzero_exit() {
+        // Regression pin for the real cargo-codspeed 5.0.1: `cargo codspeed
+        // --version` prints its banner (via clap's version-request error
+        // path) and exits 1. The probe must treat that as usable — requiring
+        // exit 0 skipped the lane on a healthy host.
+        let bin = tempfile::tempdir().unwrap();
+        write_exec(&bin.path().join("codspeed"), "#!/bin/sh\necho 'codspeed-runner 4.18.4'\n");
+        write_exec(
+            &bin.path().join("cargo"),
+            "#!/bin/sh\necho 'cargo-codspeed 5.0.1' >&2\nexit 1\n",
+        );
+        let out = preflight(Some(bin.path().to_str().unwrap()));
+        assert_eq!(out, Ok(("4.18.4".to_string(), "5.0.1".to_string())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_preflight_skips_on_nonzero_exit_without_a_version_banner() {
+        // A tool that fails without ever printing a version is genuinely
+        // unusable — the tolerant probe must not swallow that.
+        let bin = tempfile::tempdir().unwrap();
+        write_exec(&bin.path().join("codspeed"), "#!/bin/sh\necho 'broken install' >&2\nexit 1\n");
+        write_exec(&bin.path().join("cargo"), "#!/bin/sh\necho 'cargo-codspeed 5.0.1'\n");
+        let reason = preflight(Some(bin.path().to_str().unwrap())).unwrap_err();
+        assert!(reason.contains("codspeed CLI not usable"), "reason: {reason}");
+        assert!(reason.contains("without a version banner"), "reason: {reason}");
     }
 
     #[cfg(unix)]
