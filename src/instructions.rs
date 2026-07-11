@@ -7,7 +7,9 @@
 //! `[repos.instructions]` config) or skipped (non-Linux host, tools missing),
 //! nothing here runs and the walltime output is byte-identical to before.
 //! A lane failure never fails the run — per-target failures are collected in
-//! `instr_failed_targets` and the walltime data is unaffected.
+//! `instr_failed_targets` and the walltime data is unaffected — unless the
+//! repo opts in via `require_instructions`, which turns a skip or failure
+//! into a nonzero exit AFTER the walltime write sequence completes.
 
 use crate::config::{InstructionsConfig, RepoConfig};
 use crate::subprocess::{run_cmd, run_streaming};
@@ -33,6 +35,17 @@ pub struct InstrRow {
 pub struct InstrCollection {
     pub rows: Vec<InstrRow>,
     pub failed_targets: Vec<String>,
+}
+
+/// What [`collect`] came back with: a collection (possibly with per-target
+/// failures inside), or a whole-lane skip carrying the human-readable reason
+/// — the same text as the stderr note. The reason is data, not just a log
+/// line, because `require_instructions = true` turns it into the run's error
+/// message after the write sequence completes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CollectOutcome {
+    Collected(InstrCollection),
+    Skipped(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -276,20 +289,20 @@ pub fn compute_instr_ratios(rows: &[InstrRow], baseline_subject: &str) -> Vec<In
 /// instrumented build (`cargo codspeed build`), a fresh profile folder, and
 /// an offline runner invocation, then parses every profile written.
 ///
-/// Returns `None` when the lane is skipped entirely — non-Linux host (the
-/// simulation mode needs valgrind), the checkout's `Cargo.lock` missing the
-/// `codspeed-criterion-compat` bench harness, or the host-provisioned tools
-/// missing — each with a one-line stderr note. `os` is a parameter for
-/// testability; callers pass `std::env::consts::OS`. Never fails the
-/// surrounding run: per-target failures land in
-/// [`InstrCollection::failed_targets`].
+/// Returns [`CollectOutcome::Skipped`] (with the reason) when the lane is
+/// skipped entirely — non-Linux host (the simulation mode needs valgrind),
+/// the checkout's `Cargo.lock` missing the `codspeed-criterion-compat` bench
+/// harness, or the host-provisioned tools missing — each with a one-line
+/// stderr note. `os` is a parameter for testability; callers pass
+/// `std::env::consts::OS`. Never fails the surrounding run: per-target
+/// failures land in [`InstrCollection::failed_targets`].
 pub fn collect(
     checkout: &Path,
     repo: &RepoConfig,
     cfg: &InstructionsConfig,
     profile_root: &Path,
     os: &str,
-) -> Option<InstrCollection> {
+) -> CollectOutcome {
     collect_inner(checkout, repo, cfg, profile_root, os, None)
 }
 
@@ -304,21 +317,24 @@ fn collect_inner(
     profile_root: &Path,
     os: &str,
     preflight_path: Option<&str>,
-) -> Option<InstrCollection> {
+) -> CollectOutcome {
     if os != "linux" {
-        eprintln!(
-            "instructions lane: skipped on {os} (CodSpeed simulation mode needs Linux/valgrind)"
-        );
-        return None;
+        let reason = format!("skipped on {os} (CodSpeed simulation mode needs Linux/valgrind)");
+        eprintln!("instructions lane: {reason}");
+        return CollectOutcome::Skipped(reason);
     }
     // Compat-dep probe (before the tool probes): the instrumented build has
     // nothing to trace unless the checkout resolves `codspeed-criterion-compat`.
-    if !compat_dep_present(checkout) {
-        return None;
+    if let Err(reason) = compat_dep_check(checkout) {
+        eprintln!("instructions lane: skipped — {reason}");
+        return CollectOutcome::Skipped(reason);
     }
     // Preflight: both tools are host-provisioned, never installed by us. This
     // also records their versions and warns on a profile-format-version change.
-    preflight(preflight_path)?;
+    if let Err(reason) = preflight(preflight_path) {
+        eprintln!("instructions lane: skipped — {reason}");
+        return CollectOutcome::Skipped(reason);
+    }
 
     let mut collection = InstrCollection::default();
     let mut rows = Vec::new();
@@ -332,35 +348,29 @@ fn collect_inner(
         }
     }
     collection.rows = dedupe_rows(rows);
-    Some(collection)
+    CollectOutcome::Collected(collection)
 }
 
-/// Reads the tracked checkout's own `Cargo.lock` and reports whether it
-/// resolves `codspeed-criterion-compat` — the runner's bench harness, without
+/// Reads the tracked checkout's own `Cargo.lock` and checks that it resolves
+/// `codspeed-criterion-compat` — the runner's bench harness, without
 /// which the instrumented build produces nothing to trace. We read the
 /// checkout's lockfile (not a config knob) so an unmerged bench branch (e.g.
 /// mega-evm PR #337) skips the lane gracefully instead of failing the build.
-/// A missing or unreadable `Cargo.lock` is treated the same as an absent dep:
-/// skip, with a one-line stderr note giving the reason.
-fn compat_dep_present(checkout: &Path) -> bool {
+/// A missing or unreadable `Cargo.lock` is treated the same as an absent dep.
+/// `Err` carries the skip reason for the caller's stderr note (and, under
+/// `require_instructions`, the run's error message).
+fn compat_dep_check(checkout: &Path) -> Result<(), String> {
     const DEP: &str = "codspeed-criterion-compat";
     let lock = checkout.join("Cargo.lock");
-    let text = match std::fs::read_to_string(&lock) {
-        Ok(text) => text,
-        Err(e) => {
-            eprintln!("instructions lane: skipped — cannot read {} ({e})", lock.display());
-            return false;
-        }
-    };
+    let text = std::fs::read_to_string(&lock)
+        .map_err(|e| format!("cannot read {} ({e})", lock.display()))?;
     if lock_has_package(&text, DEP) {
-        true
+        Ok(())
     } else {
-        eprintln!(
-            "instructions lane: skipped — {DEP} not in {} \
-             (bench harness dep absent; is the CodSpeed bench branch merged?)",
+        Err(format!(
+            "{DEP} not in {} (bench harness dep absent; is the CodSpeed bench branch merged?)",
             lock.display()
-        );
-        false
+        ))
     }
 }
 
@@ -377,10 +387,11 @@ fn lock_has_package(lock_text: &str, pkg: &str) -> bool {
 /// emits one visibility line naming both, and — because the callgrind parsing
 /// was validated against the cargo-codspeed 5.x profile format — warns (but
 /// does NOT skip: counts are still attempted) when cargo-codspeed's major
-/// version is not 5. Returns the `(codspeed, cargo-codspeed)` version tokens,
-/// or `None` (lane skipped, with a note) if either tool can't run.
-/// `preflight_path` overrides `PATH` for the probes — a test seam.
-fn preflight(preflight_path: Option<&str>) -> Option<(String, String)> {
+/// version is not 5. Returns the `(codspeed, cargo-codspeed)` version tokens;
+/// `Err` carries the skip reason (which tool can't run, and why) for the
+/// caller's stderr note. `preflight_path` overrides `PATH` for the probes —
+/// a test seam.
+fn preflight(preflight_path: Option<&str>) -> Result<(String, String), String> {
     let mut versions: Vec<String> = Vec::with_capacity(2);
     for (program, args, what) in [
         ("codspeed", &["--version"][..], "codspeed CLI"),
@@ -393,10 +404,7 @@ fn preflight(preflight_path: Option<&str>) -> Option<(String, String)> {
         }
         match run_cmd(&mut probe, what) {
             Ok(output) => versions.push(version_token(&output).to_string()),
-            Err(e) => {
-                eprintln!("instructions lane: skipped — {what} not usable: {e:#}");
-                return None;
-            }
+            Err(e) => return Err(format!("{what} not usable: {e:#}")),
         }
     }
     let (codspeed, cargo_codspeed) = (versions.remove(0), versions.remove(0));
@@ -407,7 +415,7 @@ fn preflight(preflight_path: Option<&str>) -> Option<(String, String)> {
              callgrind parsing was validated against the 5.x profile format and may break"
         );
     }
-    Some((codspeed, cargo_codspeed))
+    Ok((codspeed, cargo_codspeed))
 }
 
 /// The version token — the first whitespace-separated token whose first
@@ -813,7 +821,8 @@ headline_subjects = ["rex5", "rex5_*"]
 
     #[test]
     fn test_collect_skipped_cleanly_on_non_linux() {
-        // Must return None before touching any tool or the filesystem.
+        // Must skip before touching any tool or the filesystem, and the
+        // outcome must carry the reason (require_instructions surfaces it).
         let out = collect(
             Path::new("/nonexistent-checkout"),
             &test_repo_config(),
@@ -821,7 +830,12 @@ headline_subjects = ["rex5", "rex5_*"]
             Path::new("/nonexistent-profiles"),
             "macos",
         );
-        assert_eq!(out, None);
+        assert_eq!(
+            out,
+            CollectOutcome::Skipped(
+                "skipped on macos (CodSpeed simulation mode needs Linux/valgrind)".to_string()
+            )
+        );
     }
 
     /// A checkout whose `Cargo.lock` DOES resolve the compat dep, so the lane
@@ -842,10 +856,12 @@ headline_subjects = ["rex5", "rex5_*"]
         // clears the compat-dep gate and reaches the version preflight — but
         // the injected PATH points nowhere, so neither `codspeed --version`
         // nor `cargo codspeed --version` can spawn (hermetic regardless of
-        // what the host has installed). The lane must skip (None) without
-        // panicking. `None` is exactly the lane-off value the pipeline maps to
-        // a walltime-only run, whose unaffected artifacts the synthetic
-        // pipeline tests pin.
+        // what the host has installed). The lane must skip without panicking,
+        // and the outcome names the unusable tool — with
+        // `require_instructions = true` the pipeline turns exactly this
+        // reason into the run's error after the write sequence; without it,
+        // the pipeline maps the skip to a walltime-only run, whose unaffected
+        // artifacts the synthetic pipeline tests pin.
         let checkout = checkout_with_compat_dep();
         let out = collect_inner(
             checkout.path(),
@@ -855,7 +871,12 @@ headline_subjects = ["rex5", "rex5_*"]
             "linux",
             Some("/nonexistent-bin"),
         );
-        assert_eq!(out, None);
+        match out {
+            CollectOutcome::Skipped(reason) => {
+                assert!(reason.contains("codspeed CLI not usable"), "reason: {reason}");
+            }
+            other => panic!("expected a tools-missing skip, got {other:?}"),
+        }
     }
 
     #[test]
@@ -877,7 +898,7 @@ version = \"2.10.1\"
     }
 
     #[test]
-    fn test_compat_dep_present_reads_the_checkout_lockfile() {
+    fn test_compat_dep_check_reads_the_checkout_lockfile() {
         // With the dep resolved → lane may proceed.
         let with = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -885,28 +906,30 @@ version = \"2.10.1\"
             "[[package]]\nname = \"codspeed-criterion-compat\"\nversion = \"2.10.1\"\n",
         )
         .unwrap();
-        assert!(compat_dep_present(with.path()));
+        assert_eq!(compat_dep_check(with.path()), Ok(()));
 
         // Lockfile present but the dep absent → skip (the graceful pre-merge
-        // path).
+        // path), with a reason naming the missing dep.
         let without = tempfile::tempdir().unwrap();
         std::fs::write(
             without.path().join("Cargo.lock"),
             "[[package]]\nname = \"criterion\"\nversion = \"0.5.1\"\n",
         )
         .unwrap();
-        assert!(!compat_dep_present(without.path()));
+        let reason = compat_dep_check(without.path()).unwrap_err();
+        assert!(reason.contains("codspeed-criterion-compat not in"), "reason: {reason}");
 
         // Missing Cargo.lock (unreadable) → same skip path.
         let missing = tempfile::tempdir().unwrap();
-        assert!(!compat_dep_present(missing.path()));
+        let reason = compat_dep_check(missing.path()).unwrap_err();
+        assert!(reason.contains("cannot read"), "reason: {reason}");
     }
 
     #[test]
     fn test_collect_skips_before_probing_when_compat_dep_absent() {
         // A checkout whose Cargo.lock lacks the compat dep skips the lane up
-        // front — the compat probe runs before the tool preflight, so this is
-        // None even with the real PATH (`None` seam) and needs no host tools.
+        // front — the compat probe runs before the tool preflight, so this
+        // skips even with the real PATH (`None` seam) and needs no host tools.
         let checkout = tempfile::tempdir().unwrap();
         std::fs::write(
             checkout.path().join("Cargo.lock"),
@@ -921,7 +944,12 @@ version = \"2.10.1\"
             "linux",
             None,
         );
-        assert_eq!(out, None);
+        match out {
+            CollectOutcome::Skipped(reason) => {
+                assert!(reason.contains("codspeed-criterion-compat not in"), "reason: {reason}");
+            }
+            other => panic!("expected a compat-dep skip, got {other:?}"),
+        }
     }
 
     #[test]
@@ -959,13 +987,15 @@ version = \"2.10.1\"
         write_exec(&bin.path().join("codspeed"), "#!/bin/sh\necho 'codspeed 4.18.2'\n");
         write_exec(&bin.path().join("cargo"), "#!/bin/sh\necho 'cargo-codspeed 6.1.0'\n");
         let out = preflight(Some(bin.path().to_str().unwrap()));
-        assert_eq!(out, Some(("4.18.2".to_string(), "6.1.0".to_string())));
+        assert_eq!(out, Ok(("4.18.2".to_string(), "6.1.0".to_string())));
     }
 
     #[cfg(unix)]
     #[test]
     fn test_preflight_skips_when_a_tool_cannot_spawn() {
-        // A bogus PATH means neither probe can spawn: skip (None), no panic.
-        assert_eq!(preflight(Some("/nonexistent-bin")), None);
+        // A bogus PATH means neither probe can spawn: a skip reason naming
+        // the first unusable tool, no panic.
+        let reason = preflight(Some("/nonexistent-bin")).unwrap_err();
+        assert!(reason.contains("codspeed CLI not usable"), "reason: {reason}");
     }
 }

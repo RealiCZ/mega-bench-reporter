@@ -228,6 +228,13 @@ pub struct InstructionsConfig {
     /// run everything the instrumented build produced.
     #[serde(default)]
     pub bench_filter: Option<String>,
+    /// `false` (the default) keeps the lane best-effort: a lane skip or a
+    /// lane-failed target never fails the run. `true` makes such a run exit
+    /// nonzero — but only after the complete happy-path write sequence
+    /// (walltime artifacts, events, state, latest.json), so the on-disk data
+    /// stays valid and the nonzero exit is purely a signal to the scheduler.
+    #[serde(default)]
+    pub require_instructions: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -355,10 +362,11 @@ headline_subjects = ["rex5", "rex5_*"]
         let cfg = Config::parse(SAMPLE).expect("parses");
         assert_eq!(cfg.repo("mega-evm").unwrap().instructions, None);
 
-        // Empty section = lane on, no filter.
+        // Empty section = lane on, no filter, best-effort (knob defaults off).
         let cfg = Config::parse(&format!("{SAMPLE}\n[repos.instructions]\n")).expect("parses");
         let instr = cfg.repo("mega-evm").unwrap().instructions.as_ref().expect("lane on");
         assert_eq!(instr.bench_filter, None);
+        assert!(!instr.require_instructions, "require_instructions defaults to false");
 
         let cfg = Config::parse(&format!(
             "{SAMPLE}\n[repos.instructions]\nbench_filter = \"mega_bench\"\n"
@@ -366,6 +374,13 @@ headline_subjects = ["rex5", "rex5_*"]
         .expect("parses");
         let instr = cfg.repo("mega-evm").unwrap().instructions.as_ref().expect("lane on");
         assert_eq!(instr.bench_filter.as_deref(), Some("mega_bench"));
+
+        let cfg = Config::parse(&format!(
+            "{SAMPLE}\n[repos.instructions]\nrequire_instructions = true\n"
+        ))
+        .expect("parses");
+        let instr = cfg.repo("mega-evm").unwrap().instructions.as_ref().expect("lane on");
+        assert!(instr.require_instructions);
     }
 
     #[test]
@@ -428,9 +443,11 @@ headline_subjects = ["rex5", "rex5_*"]
         let cfg = Config::parse(include_str!("../repos.toml")).expect("repos.toml parses");
         let repo = cfg.repo("mega-evm").expect("mega-evm entry");
         cfg.settings(repo).expect("settings resolve");
-        // The instructions lane ships enabled for mega-evm, unfiltered.
+        // The instructions lane ships enabled for mega-evm, unfiltered and
+        // best-effort (the require_instructions knob stays commented out).
         let instr = repo.instructions.as_ref().expect("instructions lane configured");
         assert_eq!(instr.bench_filter, None);
+        assert!(!instr.require_instructions);
         assert!(repo.flamegraph.is_some(), "flamegraph config still parses next to it");
     }
 

@@ -17,7 +17,7 @@ use crate::config::{RepoConfig, Settings};
 use crate::criterion_results::{self, Row, WorkloadRatios};
 use crate::digest;
 use crate::git::{self, CommitMeta};
-use crate::instructions::{self, InstrCollection, InstrWorkloadRatios};
+use crate::instructions::{self, CollectOutcome, InstrWorkloadRatios};
 use crate::lane::Lane;
 use crate::state::{RowHistory, State, Thresholds, Verdict};
 use crate::storage::{CommitRecord, RepoStore};
@@ -329,9 +329,12 @@ fn speed_bar_items(
 
 /// The whole post-bench stage for one commit:
 /// parse → record → charts → rolling-median regression check → digest batch.
-/// `instr` is the instructions lane's collection — `None` when the lane is
-/// off or was skipped, in which case every artifact is byte-identical to a
-/// walltime-only run.
+/// `instr` is the instructions lane's collection outcome — `None` when the
+/// lane is off or was not collected (`--skip-bench` regen with nothing to
+/// carry forward), `Skipped` when it was attempted and self-skipped. In both
+/// of those cases every artifact is byte-identical to a walltime-only run;
+/// the skip reason matters only to the `require_instructions` gate at the
+/// very end.
 pub fn process_results(
     repo: &RepoConfig,
     settings: &Settings,
@@ -339,8 +342,15 @@ pub fn process_results(
     criterion_dir: &Path,
     meta: &CommitMeta,
     failed_targets: Vec<String>,
-    instr: Option<InstrCollection>,
+    instr: Option<CollectOutcome>,
 ) -> anyhow::Result<RunOutcome> {
+    // The skip reason rides along untouched until after the writes: acting on
+    // it earlier would violate "state is written last, nothing half-applied".
+    let (instr, instr_skip_reason) = match instr {
+        Some(CollectOutcome::Collected(c)) => (Some(c), None),
+        Some(CollectOutcome::Skipped(reason)) => (None, Some(reason)),
+        None => (None, None),
+    };
     let rows = criterion_results::scan(criterion_dir)?;
     let ratios = criterion_results::compute_ratios(&rows, &repo.baseline_subject);
     let instr_ratios =
@@ -576,6 +586,28 @@ pub fn process_results(
     // Discovery pointer: always points at the newest completed run.
     store.write_latest(&meta.sha, &commit_dir)?;
 
+    // require_instructions gate — deliberately the LAST thing before Ok: the
+    // complete happy-path write sequence (raw.json, charts, events, state,
+    // latest.json) has finished, so everything on disk is exactly what a
+    // best-effort run would have left and the nonzero exit is purely a
+    // signal to the scheduler.
+    if repo.instructions.as_ref().is_some_and(|cfg| cfg.require_instructions) {
+        if let Some(reason) = instr_skip_reason {
+            anyhow::bail!(
+                "require_instructions = true but the instructions lane was skipped: {reason} \
+                 (all walltime artifacts, events, state, and latest.json were written first)"
+            );
+        }
+        if let Some(failed) = &record.instr_failed_targets {
+            anyhow::bail!(
+                "require_instructions = true but {} instructions-lane target(s) failed: {} \
+                 (all walltime artifacts, events, state, and latest.json were written first)",
+                failed.len(),
+                failed.join(", ")
+            );
+        }
+    }
+
     Ok(RunOutcome {
         commit_dir,
         failed_targets,
@@ -610,6 +642,9 @@ pub fn run_commit_pipeline(
 
     let criterion_dir = criterion_results::criterion_dir_for(&checkout);
     let mut failed_targets = Vec::new();
+    // --skip-bench: the instructions data carried forward from the previous
+    // raw.json of the sha being regenerated (the lane is never re-collected).
+    let mut carried_instr: Option<instructions::InstrCollection> = None;
     if skip_bench {
         // Dev/regen mode: reuse the checkout's criterion tree to re-render
         // charts/records. The tree's provenance is only known for the last
@@ -630,19 +665,28 @@ pub fn run_commit_pipeline(
             );
         }
         // Preserve the original run's failed-target markers instead of
-        // silently erasing them from the regenerated record.
-        let record = CommitRecord::new(
+        // silently erasing them from the regenerated record, and carry its
+        // instructions blocks forward — the callgrind profiles are not kept
+        // around to re-parse, so the previous raw.json is the only source.
+        // Previous record absent (or without instr data) → regenerate as
+        // today; malformed → warn and regenerate without instructions data,
+        // never fail the regen.
+        let probe = CommitRecord::new(
             sha.to_string(),
             meta.date.clone(),
             meta.rustc.clone(),
             repo.baseline_subject.clone(),
         );
-        if let Ok(dir) = store.commit_dir(&record) {
-            if let Ok(text) = std::fs::read_to_string(dir.join("raw.json")) {
-                if let Ok(existing) = serde_json::from_str::<CommitRecord>(&text) {
-                    failed_targets = existing.failed_targets;
-                }
+        match store.load_commit_record(&probe) {
+            Ok(Some(existing)) => {
+                carried_instr = existing.instr_collection();
+                failed_targets = existing.failed_targets;
             }
+            Ok(None) => {}
+            Err(e) => eprintln!(
+                "instructions lane: previous raw.json for {sha} is unreadable — regenerating \
+                 without carried instructions data: {e:#}"
+            ),
         }
     } else {
         // Stale results from a previous commit's run must not leak into this one.
@@ -666,13 +710,16 @@ pub fn run_commit_pipeline(
 
     // Instructions lane: collected after the walltime benches on the same
     // checkout, only when configured. `collect` handles its own skipping
-    // (non-Linux, tools missing) and never fails the run. Not collected in
-    // --skip-bench regen mode — unlike the criterion tree, the callgrind
-    // profiles are not kept around to re-parse.
+    // (non-Linux, tools missing) and never fails the run here — a skip or a
+    // lane-failed target only matters to the require_instructions gate at
+    // the very end of process_results, after everything is written. Not
+    // re-collected in --skip-bench regen mode — unlike the criterion tree,
+    // the callgrind profiles are not kept around to re-parse, so the
+    // previous record's instructions data (if any) rides in instead.
     let instr = if skip_bench {
-        None
+        carried_instr.map(CollectOutcome::Collected)
     } else {
-        repo.instructions.as_ref().and_then(|cfg| {
+        repo.instructions.as_ref().map(|cfg| {
             instructions::collect(
                 &checkout,
                 repo,

@@ -5,7 +5,7 @@
 
 use mega_bench_reporter::config::Config;
 use mega_bench_reporter::git::CommitMeta;
-use mega_bench_reporter::instructions::{InstrCollection, InstrRow};
+use mega_bench_reporter::instructions::{CollectOutcome, InstrCollection, InstrRow};
 use mega_bench_reporter::pipeline::{process_results, Event, InstrVerdict};
 use mega_bench_reporter::state::State;
 use mega_bench_reporter::storage::{CommitRecord, RepoStore};
@@ -279,7 +279,7 @@ fn test_instructions_lane_regression_recovery_and_rebaseline() {
             &scratch,
             &meta(i),
             vec![],
-            Some(instr_collection(salt_count)),
+            Some(CollectOutcome::Collected(instr_collection(salt_count))),
         )
         .unwrap()
     };
@@ -381,8 +381,16 @@ fn test_instr_failed_targets_are_marked_in_record_and_outcome() {
     write_criterion_tree(&scratch, 2.0);
     let mut instr = instr_collection(20_000);
     instr.failed_targets = vec!["mega_bench".to_string()];
-    let outcome =
-        process_results(repo, &settings, &store, &scratch, &meta(0), vec![], Some(instr)).unwrap();
+    let outcome = process_results(
+        repo,
+        &settings,
+        &store,
+        &scratch,
+        &meta(0),
+        vec![],
+        Some(CollectOutcome::Collected(instr)),
+    )
+    .unwrap();
 
     assert_eq!(outcome.instr_failed_targets, Some(vec!["mega_bench".to_string()]));
     let raw: serde_json::Value = serde_json::from_str(
@@ -441,7 +449,7 @@ fn test_rerunning_same_sha_with_instr_does_not_double_count() {
             &scratch,
             &meta(0),
             vec![],
-            Some(instr_collection(20_000)),
+            Some(CollectOutcome::Collected(instr_collection(20_000))),
         )
         .unwrap()
     };
@@ -482,6 +490,7 @@ fn test_walltime_regression_annotated_with_instructions_verdict() {
                 std::fs::remove_dir_all(&scratch).unwrap();
             }
             write_criterion_tree(&scratch, salt_ratio);
+            let instr = instr.map(CollectOutcome::Collected);
             process_results(repo, &settings, &store, &scratch, &meta(i), vec![], instr).unwrap()
         };
 
@@ -538,7 +547,7 @@ fn test_digest_over_mixed_instr_commits_has_instr_series_and_chart() {
             std::fs::remove_dir_all(&scratch).unwrap();
         }
         write_criterion_tree(&scratch, 2.0);
-        let instr = (i % 2 == 0).then(|| instr_collection(20_000));
+        let instr = (i % 2 == 0).then(|| CollectOutcome::Collected(instr_collection(20_000)));
         let out =
             process_results(repo, &settings, &store, &scratch, &meta(i), vec![], instr).unwrap();
         for ev in &out.events {
@@ -591,7 +600,7 @@ fn test_trend_metric_instructions_happy_and_empty() {
                 std::fs::remove_dir_all(&scratch).unwrap();
             }
             write_criterion_tree(&scratch, 2.0);
-            let instr = with_instr.then(|| instr_collection(20_000));
+            let instr = with_instr.then(|| CollectOutcome::Collected(instr_collection(20_000)));
             process_results(repo, &settings, &store, &scratch, &meta(i), vec![], instr).unwrap();
         }
         let records: Vec<_> =
@@ -660,4 +669,222 @@ fn test_failed_targets_are_marked_not_silently_dropped() {
     )
     .unwrap();
     assert_eq!(raw["failed_targets"][0], "block_bench");
+}
+
+#[test]
+fn test_require_instructions_skip_or_failure_errors_after_full_writes() {
+    // `require_instructions = true` turns a skipped lane — or a lane-failed
+    // target — into a nonzero exit, but only AFTER the complete happy-path
+    // write sequence: everything on disk must be exactly what a best-effort
+    // run would have written (README invariant: "state is written last,
+    // nothing half-applied"); the error is a signal, not a data problem.
+    let cfg =
+        Config::parse(&format!("{CONFIG}\n[repos.instructions]\nrequire_instructions = true\n"))
+            .unwrap();
+    let repo = cfg.repo("mega-evm").unwrap();
+    let settings = cfg.settings(repo).unwrap();
+
+    // Case 1: the lane skipped entirely (the preflight seam's tools-missing
+    // outcome); the captured reason travels into the error message.
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RepoStore::new(&tmp.path().join("data"), "mega-evm");
+    let scratch = tmp.path().join("criterion");
+    write_criterion_tree(&scratch, 2.0);
+    let err = process_results(
+        repo,
+        &settings,
+        &store,
+        &scratch,
+        &meta(0),
+        vec![],
+        Some(CollectOutcome::Skipped("codspeed CLI not usable: spawn failed".into())),
+    )
+    .expect_err("require_instructions + skipped lane must fail the run");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("require_instructions"), "error names the knob: {msg}");
+    assert!(msg.contains("codspeed CLI not usable"), "error names the skip reason: {msg}");
+
+    // The walltime write sequence finished before the error fired.
+    let commit_dir = store.root().join("commits").join(format!("20260701-{}", &meta(0).sha[..7]));
+    let raw_text = std::fs::read_to_string(commit_dir.join("raw.json")).unwrap();
+    assert!(!raw_text.contains("\"instr\""), "skipped lane leaves no instr blocks");
+    assert!(commit_dir.join("compare_bars.png").is_file());
+    assert!(commit_dir.join("compare_table.json").is_file());
+    let events: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(commit_dir.join("events.json")).unwrap())
+            .unwrap();
+    assert_eq!(events, serde_json::json!([]), "events.json written (empty first run)");
+    let state = State::load(&store.state_path()).unwrap();
+    assert_eq!(state.last_seen_sha.as_deref(), Some(meta(0).sha.as_str()), "state saved");
+    assert!(state.rows.contains_key("salt_dynamic_gas/rex5_salt/sstore_100"));
+    let latest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(store.root().join("latest.json")).unwrap())
+            .unwrap();
+    assert_eq!(latest["sha"], meta(0).sha.as_str(), "latest.json updated");
+
+    // Case 2: the lane ran but a bench target failed collection — the error
+    // names the target, and the successful rows' data still landed first.
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RepoStore::new(&tmp.path().join("data"), "mega-evm");
+    let scratch = tmp.path().join("criterion");
+    write_criterion_tree(&scratch, 2.0);
+    let mut instr = instr_collection(20_000);
+    instr.failed_targets = vec!["mega_bench".to_string()];
+    let err = process_results(
+        repo,
+        &settings,
+        &store,
+        &scratch,
+        &meta(0),
+        vec![],
+        Some(CollectOutcome::Collected(instr)),
+    )
+    .expect_err("require_instructions + lane-failed target must fail the run");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("require_instructions"), "error names the knob: {msg}");
+    assert!(msg.contains("mega_bench"), "error names the failed target: {msg}");
+    let commit_dir = store.root().join("commits").join(format!("20260701-{}", &meta(0).sha[..7]));
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(commit_dir.join("raw.json")).unwrap())
+            .unwrap();
+    assert_eq!(raw["instr_failed_targets"][0], "mega_bench");
+    assert_eq!(raw["groups"]["salt_dynamic_gas"]["rex5_salt/sstore_100"]["instr"]["count"], 20_000);
+    let state = State::load(&store.state_path()).unwrap();
+    assert_eq!(state.last_seen_sha.as_deref(), Some(meta(0).sha.as_str()));
+    assert!(state.instr_rows.contains_key("salt_dynamic_gas/rex5_salt/sstore_100"));
+}
+
+#[test]
+fn test_require_instructions_absent_or_false_skip_stays_best_effort() {
+    // With the knob absent or explicitly false, a skipped lane keeps today's
+    // behavior exactly: Ok, quiet, artifacts byte-identical to a
+    // walltime-only run with no `[repos.instructions]` at all.
+    let run_into = |config: &str, instr: Option<CollectOutcome>| -> (String, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::parse(config).unwrap();
+        let repo = cfg.repo("mega-evm").unwrap();
+        let settings = cfg.settings(repo).unwrap();
+        let store = RepoStore::new(&tmp.path().join("data"), "mega-evm");
+        let scratch = tmp.path().join("criterion");
+        write_criterion_tree(&scratch, 2.0);
+        let outcome =
+            process_results(repo, &settings, &store, &scratch, &meta(0), vec![], instr).unwrap();
+        assert!(outcome.events.is_empty());
+        assert_eq!(outcome.instr_failed_targets, None);
+        (
+            std::fs::read_to_string(outcome.commit_dir.join("raw.json")).unwrap(),
+            std::fs::read_to_string(outcome.commit_dir.join("compare_table.json")).unwrap(),
+        )
+    };
+
+    // Today's baseline: lane off entirely.
+    let (control_raw, control_table) = run_into(CONFIG, None);
+    for knob in ["", "require_instructions = false\n"] {
+        let config = format!("{CONFIG}\n[repos.instructions]\n{knob}");
+        let skipped = Some(CollectOutcome::Skipped(
+            "skipped on macos (CodSpeed simulation mode needs Linux/valgrind)".into(),
+        ));
+        let (raw, table) = run_into(&config, skipped);
+        assert_eq!(raw, control_raw, "raw.json byte-identical (knob: {knob:?})");
+        assert_eq!(table, control_table, "compare_table.json byte-identical (knob: {knob:?})");
+    }
+}
+
+#[test]
+fn test_skip_bench_regen_carries_instr_blocks_byte_identical() {
+    // The --skip-bench carry-forward: a re-render reads the previous raw.json
+    // for the sha, reconstructs the lane collection from its rows, and
+    // re-attaches it — instr blocks (and the compare-table columns derived
+    // from them) come out byte-identical. A previous record without instr
+    // data regenerates exactly as today.
+    let cfg = Config::parse(CONFIG).unwrap();
+    let repo = cfg.repo("mega-evm").unwrap();
+    let settings = cfg.settings(repo).unwrap();
+
+    // Locator for the previous record — the same probe record the pipeline's
+    // --skip-bench branch builds from the commit meta.
+    let probe = || {
+        CommitRecord::new(
+            meta(0).sha.clone(),
+            meta(0).date.clone(),
+            meta(0).rustc.clone(),
+            "revm_pinned".to_string(),
+        )
+    };
+
+    // Original run WITH instructions data.
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RepoStore::new(&tmp.path().join("data"), "mega-evm");
+    let scratch = tmp.path().join("criterion");
+    write_criterion_tree(&scratch, 2.0);
+    let out = process_results(
+        repo,
+        &settings,
+        &store,
+        &scratch,
+        &meta(0),
+        vec![],
+        Some(CollectOutcome::Collected(instr_collection(20_000))),
+    )
+    .unwrap();
+    let raw_path = out.commit_dir.join("raw.json");
+    let table_path = out.commit_dir.join("compare_table.json");
+    let original_raw = std::fs::read_to_string(&raw_path).unwrap();
+    let original_table = std::fs::read_to_string(&table_path).unwrap();
+    assert!(original_raw.contains("\"instr\""), "sanity: the original record carries instr data");
+
+    // What the --skip-bench branch does: read the previous record, carry its
+    // instr collection forward, re-render under the same sha.
+    let previous = store
+        .load_commit_record(&probe())
+        .unwrap()
+        .expect("previous raw.json for the last processed sha");
+    let carried = previous.instr_collection().expect("previous record carries instr data");
+    let regen = process_results(
+        repo,
+        &settings,
+        &store,
+        &scratch,
+        &meta(0),
+        vec![],
+        Some(CollectOutcome::Collected(carried)),
+    )
+    .unwrap();
+    assert!(regen.events.is_empty(), "regen of the same sha is a rerun: no events");
+    assert_eq!(
+        std::fs::read_to_string(&raw_path).unwrap(),
+        original_raw,
+        "raw.json (instr blocks included) byte-identical after the carry-forward regen"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&table_path).unwrap(),
+        original_table,
+        "compare_table.json instr columns byte-identical after the carry-forward regen"
+    );
+
+    // A previous raw.json WITHOUT instr data → nothing to carry → the regen
+    // is unchanged from today.
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RepoStore::new(&tmp.path().join("data"), "mega-evm");
+    let scratch = tmp.path().join("criterion");
+    write_criterion_tree(&scratch, 2.0);
+    let out = process_results(repo, &settings, &store, &scratch, &meta(0), vec![], None).unwrap();
+    let raw_path = out.commit_dir.join("raw.json");
+    let original_raw = std::fs::read_to_string(&raw_path).unwrap();
+    let previous = store.load_commit_record(&probe()).unwrap().expect("previous raw.json");
+    assert_eq!(previous.instr_collection(), None, "no instr data to carry");
+    process_results(repo, &settings, &store, &scratch, &meta(0), vec![], None).unwrap();
+    assert_eq!(std::fs::read_to_string(&raw_path).unwrap(), original_raw);
+
+    // The helper's edges, as the pipeline consumes them: an absent previous
+    // record is Ok(None) (regenerate as today); a malformed one is Err — the
+    // pipeline warns (`instructions lane:` prefix) and regenerates without
+    // instr data rather than failing the regen.
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RepoStore::new(&tmp.path().join("data"), "mega-evm");
+    assert!(store.load_commit_record(&probe()).unwrap().is_none(), "absent → Ok(None)");
+    let dir = store.commits_dir().join(format!("20260701-{}", &meta(0).sha[..7]));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("raw.json"), "{not json").unwrap();
+    assert!(store.load_commit_record(&probe()).is_err(), "malformed → Err, caller regenerates");
 }

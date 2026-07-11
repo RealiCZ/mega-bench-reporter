@@ -54,6 +54,14 @@ subject_order = [
 # with the codspeed CLI + cargo-codspeed provisioned; skipped (with a stderr
 # note) elsewhere. No bench_filter = run every built bench.
 [repos.instructions]
+# Make a run whose instructions lane skips (non-Linux host, tools missing,
+# compat dep absent) or fails any target exit nonzero — only after all
+# walltime artifacts, events, state, and latest.json are written, so the
+# on-disk data stays valid and the exit code is purely a scheduler signal.
+# Unset (false) = the lane stays best-effort. Turn on once the host is
+# provisioned so a broken installation cannot silently produce
+# walltime-only runs.
+# require_instructions = true
 
 [repos.flamegraph]
 bench_target = "mega_bench"
