@@ -12,7 +12,12 @@ Checks, in order:
   3. SKILL.md frontmatter: opens with `---`, single-line `name:` equal to the
      directory id, single-line `description:` that is non-empty, <= 1024 chars,
      and starts with "Use when" (discovery convention).
-  4. Every relative markdown link in skills/**/*.md resolves from its file.
+  4. Every relative markdown link in skills/**/*.md resolves from its file,
+     and the same holds for the repo-root README.md and TODO.md.
+  5. Every fenced ```json block under skills/ parses as JSON — the contract
+     docs teach consumers by example, so a malformed example is a doc bug.
+     Deliberate fragments that should not parse standalone must use a
+     different fence tag (```jsonc or plain ```).
 
 Exit 0 with a one-line summary, or exit 1 listing every failure.
 """
@@ -97,6 +102,29 @@ def check_links(md_path, skills_root, errors):
             errors.append(f"{md_path.relative_to(skills_root.parent)}: broken link -> {target}")
 
 
+JSON_FENCE_RE = re.compile(r"^```json\s*$(.*?)^```\s*$", re.MULTILINE | re.DOTALL)
+
+
+def check_json_fences(md_path, repo_root, errors):
+    """A ```json fence must hold one or more whitespace-separated JSON values
+    (contract docs routinely show several example objects in one fence)."""
+    decoder = json.JSONDecoder()
+    for i, block in enumerate(JSON_FENCE_RE.findall(md_path.read_text(encoding="utf-8")), 1):
+        pos, text = 0, block.strip()
+        while pos < len(text):
+            try:
+                _, end = decoder.raw_decode(text, pos)
+            except json.JSONDecodeError as e:
+                errors.append(
+                    f"{md_path.relative_to(repo_root)}: ```json block #{i} is not valid JSON"
+                    f" ({e.msg}) — fix it or retag the fence (```jsonc)"
+                )
+                break
+            pos = end
+            while pos < len(text) and text[pos].isspace():
+                pos += 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent,
@@ -141,6 +169,10 @@ def main():
 
     for md in sorted(skills.rglob("*.md")):
         check_links(md, skills, errors)
+        check_json_fences(md, root, errors)
+    for name in ("README.md", "TODO.md"):
+        if (root / name).exists():
+            check_links(root / name, skills, errors)
 
     if errors:
         print(f"FAIL: {len(errors)} problem(s)", file=sys.stderr)
