@@ -122,7 +122,7 @@ to walltime-only.
 
 ### 9. Hand off to scheduling
 
-Wire the poll loop / cron per the repo's `skill/references/discovery.md` and
+Wire the poll loop / cron per the repo's `skills/mega-bench-data/references/discovery.md` and
 `cli.md` (BB9 polls `latest.json`; flamegraph is plain nightly cron). After ~20
 real runs, recalibrate `instr_regression_threshold_pct` from `state.json`'s
 `instr_rows.*.recent_ratios` (see repo TODO item 20).

@@ -2,7 +2,7 @@
 //! "a commit landed" into structured data on disk: raw metrics, charts, and
 //! factual events (regression / recovery / digest). Data only: composing and
 //! delivering reports (e.g. Lark cards) is the consuming agent's job, guided
-//! by the repo-root `skill/` docs.
+//! by the repo-root `skills/mega-bench-data/` docs.
 
 pub mod charts;
 pub mod compare;

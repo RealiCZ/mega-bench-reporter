@@ -4,7 +4,7 @@
 //!
 //! This tool produces DATA ONLY — raw metrics, charts, and factual events.
 //! Composing and delivering Lark cards is entirely the consuming agent's job,
-//! guided by `skill/`.
+//! guided by `skills/mega-bench-data/`.
 //!
 //! Split in two layers: the bench runner (`bench_target`, with the git side
 //! in [`crate::git`]) and the pure post-bench stage ([`process_results`]) that
@@ -789,7 +789,7 @@ mod tests {
 
     #[test]
     fn test_walltime_event_serializes_instructions_annotation() {
-        // The pinned shape from skill/references/events.md: the annotation is
+        // The pinned shape from skills/mega-bench-data/references/events.md: the annotation is
         // a `{ ratio_delta_pct, verdict }` object, ratio_delta_pct first.
         let event = Event::Regression {
             row_key: "salt_dynamic_gas/rex5_salt/sstore_100".into(),
