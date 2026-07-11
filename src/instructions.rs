@@ -50,12 +50,14 @@ pub struct InstrCollection {
 /// ```
 ///
 /// The `events:` line names the columns of the following `totals:` line;
-/// callgrind omits trailing zero-valued columns, so missing values are 0.
-/// A *present* token that fails to parse is different — the profile is
-/// malformed, so the part is skipped with a warning naming `source` (the
-/// profile file): recording it as 0 would feed a bogus 0.0 ratio into the
-/// rolling window. Parts triggered by anything other than a client request
-/// (e.g. `Program termination`) carry no payload and are skipped here.
+/// callgrind omits trailing zero-valued columns, so a short totals is normal
+/// as long as it still reaches the Ir column. Two anomalies are skipped with a
+/// warning naming `source` (the profile file) instead of recording a bogus 0
+/// — which would flow into the rolling window as a 0.0 ratio: a *present*
+/// token that fails to parse (malformed profile), and a totals line too short
+/// to reach the Ir column at all (truncated relative to its events header).
+/// Parts triggered by anything other than a client request (e.g. `Program
+/// termination`) carry no payload and are skipped here.
 fn parse_callgrind_parts(text: &str, source: &str) -> Vec<(String, u64)> {
     const CLIENT_REQUEST: &str = "desc: Trigger: Client Request:";
     let mut parts = Vec::new();
@@ -86,8 +88,20 @@ fn parse_callgrind_parts(text: &str, source: &str) -> Vec<(String, u64)> {
                 );
                 continue;
             };
-            // Trailing zero-valued events are omitted by callgrind.
-            let ir = values.get(ir_index).copied().unwrap_or(0);
+            // Callgrind omits trailing zero-valued events, so a short totals
+            // is normal AS LONG AS it still reaches the Ir column. A totals
+            // line too short to reach Ir (any column index) is malformed
+            // relative to its events header: skip it with a warning rather
+            // than record a bogus 0 — a 0 count would flow into the rolling
+            // window as a 0.0 ratio (same policy as a malformed token).
+            let Some(&ir) = values.get(ir_index) else {
+                eprintln!(
+                    "instructions lane: totals for part '{payload}' in {source} has {} field(s), \
+                     too few to reach the Ir column (index {ir_index}) — skipped",
+                    values.len()
+                );
+                continue;
+            };
             parts.push((payload, ir));
         }
     }
@@ -134,10 +148,31 @@ fn uri_to_triple(uri: &str) -> Option<(String, String, String)> {
     Some((group, subject, workload))
 }
 
+/// A callgrind profile's `creator:` line names the tool that wrote it (e.g.
+/// `creator: callgrind-3.26.0.codspeed5`). We only know how to read the
+/// callgrind text format; if the first `creator:` line names something else
+/// (e.g. the experimental `tracegrind`, which writes a different `.tgtrace`
+/// layout) that is a profile-format-drift tripwire — this returns the
+/// offending creator so the caller can skip the whole file rather than
+/// mis-parse it. A callgrind creator, or no creator line at all (older/partial
+/// formats omit it), returns `None`: parse as usual.
+fn non_callgrind_creator(text: &str) -> Option<&str> {
+    let creator = text.lines().find_map(|line| line.strip_prefix("creator:"))?.trim();
+    (!creator.starts_with("callgrind-")).then_some(creator)
+}
+
 /// Parses one callgrind text profile into keyed rows, skipping non-bench
 /// parts (metadata, program termination). `source` names the profile in
-/// anomaly warnings (malformed totals).
+/// anomaly warnings (malformed totals, creator drift). A whole file whose
+/// `creator:` line is not callgrind is skipped (returns no rows).
 pub fn parse_callgrind_rows(text: &str, source: &str) -> Vec<InstrRow> {
+    if let Some(creator) = non_callgrind_creator(text) {
+        eprintln!(
+            "instructions lane: {source} was written by '{creator}', not callgrind — \
+             file skipped (profile-format drift?)"
+        );
+        return Vec::new();
+    }
     parse_callgrind_parts(text, source)
         .into_iter()
         .filter_map(|(uri, count)| {
@@ -242,10 +277,12 @@ pub fn compute_instr_ratios(rows: &[InstrRow], baseline_subject: &str) -> Vec<In
 /// an offline runner invocation, then parses every profile written.
 ///
 /// Returns `None` when the lane is skipped entirely — non-Linux host (the
-/// simulation mode needs valgrind) or the host-provisioned tools missing —
-/// with a one-line stderr note. `os` is a parameter for testability; callers
-/// pass `std::env::consts::OS`. Never fails the surrounding run: per-target
-/// failures land in [`InstrCollection::failed_targets`].
+/// simulation mode needs valgrind), the checkout's `Cargo.lock` missing the
+/// `codspeed-criterion-compat` bench harness, or the host-provisioned tools
+/// missing — each with a one-line stderr note. `os` is a parameter for
+/// testability; callers pass `std::env::consts::OS`. Never fails the
+/// surrounding run: per-target failures land in
+/// [`InstrCollection::failed_targets`].
 pub fn collect(
     checkout: &Path,
     repo: &RepoConfig,
@@ -274,21 +311,14 @@ fn collect_inner(
         );
         return None;
     }
-    // Preflight: both tools are host-provisioned, never installed by us.
-    for (program, args, what) in [
-        ("codspeed", &["--version"][..], "codspeed CLI"),
-        ("cargo", &["codspeed", "--version"][..], "cargo-codspeed"),
-    ] {
-        let mut probe = Command::new(program);
-        probe.args(args);
-        if let Some(path) = preflight_path {
-            probe.env("PATH", path);
-        }
-        if let Err(e) = run_cmd(&mut probe, what) {
-            eprintln!("instructions lane: skipped — {what} not usable: {e:#}");
-            return None;
-        }
+    // Compat-dep probe (before the tool probes): the instrumented build has
+    // nothing to trace unless the checkout resolves `codspeed-criterion-compat`.
+    if !compat_dep_present(checkout) {
+        return None;
     }
+    // Preflight: both tools are host-provisioned, never installed by us. This
+    // also records their versions and warns on a profile-format-version change.
+    preflight(preflight_path)?;
 
     let mut collection = InstrCollection::default();
     let mut rows = Vec::new();
@@ -303,6 +333,99 @@ fn collect_inner(
     }
     collection.rows = dedupe_rows(rows);
     Some(collection)
+}
+
+/// Reads the tracked checkout's own `Cargo.lock` and reports whether it
+/// resolves `codspeed-criterion-compat` — the runner's bench harness, without
+/// which the instrumented build produces nothing to trace. We read the
+/// checkout's lockfile (not a config knob) so an unmerged bench branch (e.g.
+/// mega-evm PR #337) skips the lane gracefully instead of failing the build.
+/// A missing or unreadable `Cargo.lock` is treated the same as an absent dep:
+/// skip, with a one-line stderr note giving the reason.
+fn compat_dep_present(checkout: &Path) -> bool {
+    const DEP: &str = "codspeed-criterion-compat";
+    let lock = checkout.join("Cargo.lock");
+    let text = match std::fs::read_to_string(&lock) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("instructions lane: skipped — cannot read {} ({e})", lock.display());
+            return false;
+        }
+    };
+    if lock_has_package(&text, DEP) {
+        true
+    } else {
+        eprintln!(
+            "instructions lane: skipped — {DEP} not in {} \
+             (bench harness dep absent; is the CodSpeed bench branch merged?)",
+            lock.display()
+        );
+        false
+    }
+}
+
+/// Does a `Cargo.lock`'s text resolve a `[[package]]` named `pkg`? Cargo writes
+/// each package's name on its own `name = "<pkg>"` line, so an exact trimmed
+/// match is precise and needs no full TOML parse.
+fn lock_has_package(lock_text: &str, pkg: &str) -> bool {
+    let needle = format!("name = \"{pkg}\"");
+    lock_text.lines().any(|line| line.trim() == needle)
+}
+
+/// Preflight the two host-provisioned tools (`codspeed --version`,
+/// `cargo codspeed --version`), which we never install. Captures each version,
+/// emits one visibility line naming both, and — because the callgrind parsing
+/// was validated against the cargo-codspeed 5.x profile format — warns (but
+/// does NOT skip: counts are still attempted) when cargo-codspeed's major
+/// version is not 5. Returns the `(codspeed, cargo-codspeed)` version tokens,
+/// or `None` (lane skipped, with a note) if either tool can't run.
+/// `preflight_path` overrides `PATH` for the probes — a test seam.
+fn preflight(preflight_path: Option<&str>) -> Option<(String, String)> {
+    let mut versions: Vec<String> = Vec::with_capacity(2);
+    for (program, args, what) in [
+        ("codspeed", &["--version"][..], "codspeed CLI"),
+        ("cargo", &["codspeed", "--version"][..], "cargo-codspeed"),
+    ] {
+        let mut probe = Command::new(program);
+        probe.args(args);
+        if let Some(path) = preflight_path {
+            probe.env("PATH", path);
+        }
+        match run_cmd(&mut probe, what) {
+            Ok(output) => versions.push(version_token(&output).to_string()),
+            Err(e) => {
+                eprintln!("instructions lane: skipped — {what} not usable: {e:#}");
+                return None;
+            }
+        }
+    }
+    let (codspeed, cargo_codspeed) = (versions.remove(0), versions.remove(0));
+    eprintln!("instructions lane: codspeed {codspeed}, cargo-codspeed {cargo_codspeed}");
+    if major_version(&cargo_codspeed) != Some(5) {
+        eprintln!(
+            "instructions lane: warning — cargo-codspeed {cargo_codspeed} is not a 5.x release; \
+             callgrind parsing was validated against the 5.x profile format and may break"
+        );
+    }
+    Some((codspeed, cargo_codspeed))
+}
+
+/// The version token — the first whitespace-separated token whose first
+/// character (after an optional leading `v`) is a digit — from a `--version`
+/// line like `cargo-codspeed 5.0.1`. Falls back to the whole trimmed string
+/// when nothing looks like a version, so the visibility line still says
+/// something useful.
+fn version_token(output: &str) -> &str {
+    output
+        .split_whitespace()
+        .find(|tok| tok.trim_start_matches('v').starts_with(|c: char| c.is_ascii_digit()))
+        .unwrap_or_else(|| output.trim())
+}
+
+/// The integer major version of a version token (`5` from `5.0.1`, `6` from
+/// `v6.2.0`), or `None` if it does not lead with an integer.
+fn major_version(token: &str) -> Option<u64> {
+    token.trim_start_matches('v').split('.').next()?.parse().ok()
 }
 
 /// Build + run + parse for one bench target. The profile folder is recreated
@@ -422,13 +545,14 @@ totals: 7 42
         let rows = parse_callgrind_rows(text, "fixture.out");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].count, 42);
-        // And a totals line too short to reach the Ir column reads as 0.
+        // A totals line too short to REACH the Ir column is malformed relative
+        // to its events header — the part is skipped, never recorded as 0.
         let text = "\
 events: Dr Dw Ir
 desc: Trigger: Client Request: b.rs::m::g::s/w
 totals: 7
 ";
-        assert_eq!(parse_callgrind_rows(text, "fixture.out")[0].count, 0);
+        assert!(parse_callgrind_rows(text, "fixture.out").is_empty());
     }
 
     #[test]
@@ -453,6 +577,60 @@ totals: 34 1
         assert_eq!(subjects, vec!["before", "after"]);
         assert_eq!(rows[0].count, 12);
         assert_eq!(rows[1].count, 34);
+    }
+
+    #[test]
+    fn test_parse_skips_part_when_totals_too_short_to_reach_ir() {
+        // Ir sits at a later column here (index 2), so the guard must hold for
+        // any column index, not just 0: a totals line with too few fields to
+        // reach Ir is malformed and skipped with a warning — recording 0 would
+        // feed a bogus 0.0 ratio into the rolling window (same policy as a
+        // malformed token). Parts before/after with enough fields still parse.
+        let text = "\
+events: Dr Dw Ir
+desc: Trigger: Client Request: b.rs::m::g::before/w
+totals: 1 2 30
+desc: Trigger: Client Request: b.rs::m::g::short/w
+totals: 7
+desc: Trigger: Client Request: b.rs::m::g::after/w
+totals: 4 5 60
+";
+        let rows = parse_callgrind_rows(text, "short.out");
+        let subjects: Vec<&str> = rows.iter().map(|r| r.subject.as_str()).collect();
+        assert_eq!(subjects, vec!["before", "after"]);
+        // No 0-count row was recorded for the skipped short part.
+        assert!(rows.iter().all(|r| r.count != 0));
+        assert_eq!(rows[0].count, 30);
+        assert_eq!(rows[1].count, 60);
+    }
+
+    #[test]
+    fn test_parse_skips_file_with_non_callgrind_creator() {
+        // The experimental tracegrind tool writes a different layout under a
+        // different creator (`.tgtrace` files); treat any non-`callgrind-`
+        // creator as profile-format drift and skip the whole file rather than
+        // mis-parse it.
+        let drift = "\
+# callgrind format
+creator: tracegrind-1.0.0
+events: Ir Dr
+desc: Trigger: Client Request: b.rs::m::g::s/w
+totals: 42 1
+";
+        assert!(parse_callgrind_rows(drift, "drift.out").is_empty());
+
+        // The same profile under a callgrind creator parses normally.
+        let ok = drift.replace("tracegrind-1.0.0", "callgrind-3.26.0.codspeed5");
+        assert_eq!(parse_callgrind_rows(&ok, "ok.out").len(), 1);
+
+        // No creator line at all → parse as today (older/partial formats omit
+        // it in some profile parts).
+        let no_creator = "\
+events: Ir Dr
+desc: Trigger: Client Request: b.rs::m::g::s/w
+totals: 42 1
+";
+        assert_eq!(parse_callgrind_rows(no_creator, "old.out").len(), 1);
     }
 
     #[test]
@@ -646,17 +824,31 @@ headline_subjects = ["rex5", "rex5_*"]
         assert_eq!(out, None);
     }
 
+    /// A checkout whose `Cargo.lock` DOES resolve the compat dep, so the lane
+    /// clears the compat-dep gate and reaches the tool preflight.
+    fn checkout_with_compat_dep() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.lock"),
+            "[[package]]\nname = \"codspeed-criterion-compat\"\nversion = \"2.10.1\"\n",
+        )
+        .unwrap();
+        dir
+    }
+
     #[test]
     fn test_collect_skipped_cleanly_when_preflight_tools_missing() {
-        // os IS linux, but the preflight PATH points nowhere, so neither
-        // `codspeed --version` nor `cargo codspeed --version` can spawn —
-        // hermetic regardless of what the host has installed. The lane must
-        // skip (None) without panicking and before touching the filesystem
-        // (both paths are nonexistent). `None` is exactly the lane-off value
-        // the pipeline maps to a walltime-only run, whose unaffected
-        // artifacts the synthetic pipeline tests pin.
+        // os IS linux and the checkout resolves the compat dep, so the lane
+        // clears the compat-dep gate and reaches the version preflight — but
+        // the injected PATH points nowhere, so neither `codspeed --version`
+        // nor `cargo codspeed --version` can spawn (hermetic regardless of
+        // what the host has installed). The lane must skip (None) without
+        // panicking. `None` is exactly the lane-off value the pipeline maps to
+        // a walltime-only run, whose unaffected artifacts the synthetic
+        // pipeline tests pin.
+        let checkout = checkout_with_compat_dep();
         let out = collect_inner(
-            Path::new("/nonexistent-checkout"),
+            checkout.path(),
             &test_repo_config(),
             &InstructionsConfig::default(),
             Path::new("/nonexistent-profiles"),
@@ -664,5 +856,116 @@ headline_subjects = ["rex5", "rex5_*"]
             Some("/nonexistent-bin"),
         );
         assert_eq!(out, None);
+    }
+
+    #[test]
+    fn test_lock_has_package_matches_only_the_package_name_line() {
+        let lock = "\
+[[package]]
+name = \"criterion\"
+version = \"0.5.1\"
+
+[[package]]
+name = \"codspeed-criterion-compat\"
+version = \"2.10.1\"
+";
+        assert!(lock_has_package(lock, "codspeed-criterion-compat"));
+        assert!(lock_has_package(lock, "criterion"));
+        assert!(!lock_has_package(lock, "codspeed-divan-compat"));
+        // A substring of a resolved name must not count as a match.
+        assert!(!lock_has_package(lock, "codspeed-criterion"));
+    }
+
+    #[test]
+    fn test_compat_dep_present_reads_the_checkout_lockfile() {
+        // With the dep resolved → lane may proceed.
+        let with = tempfile::tempdir().unwrap();
+        std::fs::write(
+            with.path().join("Cargo.lock"),
+            "[[package]]\nname = \"codspeed-criterion-compat\"\nversion = \"2.10.1\"\n",
+        )
+        .unwrap();
+        assert!(compat_dep_present(with.path()));
+
+        // Lockfile present but the dep absent → skip (the graceful pre-merge
+        // path).
+        let without = tempfile::tempdir().unwrap();
+        std::fs::write(
+            without.path().join("Cargo.lock"),
+            "[[package]]\nname = \"criterion\"\nversion = \"0.5.1\"\n",
+        )
+        .unwrap();
+        assert!(!compat_dep_present(without.path()));
+
+        // Missing Cargo.lock (unreadable) → same skip path.
+        let missing = tempfile::tempdir().unwrap();
+        assert!(!compat_dep_present(missing.path()));
+    }
+
+    #[test]
+    fn test_collect_skips_before_probing_when_compat_dep_absent() {
+        // A checkout whose Cargo.lock lacks the compat dep skips the lane up
+        // front — the compat probe runs before the tool preflight, so this is
+        // None even with the real PATH (`None` seam) and needs no host tools.
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::write(
+            checkout.path().join("Cargo.lock"),
+            "[[package]]\nname = \"criterion\"\nversion = \"0.5.1\"\n",
+        )
+        .unwrap();
+        let out = collect_inner(
+            checkout.path(),
+            &test_repo_config(),
+            &InstructionsConfig::default(),
+            Path::new("/nonexistent-profiles"),
+            "linux",
+            None,
+        );
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn test_version_token_and_major_version() {
+        assert_eq!(version_token("cargo-codspeed 5.0.1"), "5.0.1");
+        assert_eq!(version_token("codspeed 4.18.0"), "4.18.0");
+        // A leading `v` is kept in the display token but ignored for the major.
+        assert_eq!(version_token("v6.2.0"), "v6.2.0");
+        // Nothing version-shaped → the whole trimmed string.
+        assert_eq!(version_token("  nightly build  "), "nightly build");
+
+        assert_eq!(major_version("5.0.1"), Some(5));
+        assert_eq!(major_version("v6.2.0"), Some(6));
+        assert_eq!(major_version("18.0.0"), Some(18));
+        assert_eq!(major_version("nightly"), None);
+    }
+
+    #[cfg(unix)]
+    fn write_exec(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_preflight_captures_versions_and_warns_without_skipping_off_major_five() {
+        // Fake host tools on an injected PATH: the preflight must capture both
+        // versions and, for a non-5 cargo-codspeed major, WARN but not skip —
+        // it returns the parsed version tokens (Some), so counts are still
+        // attempted. Hermetic regardless of what the host has installed.
+        let bin = tempfile::tempdir().unwrap();
+        write_exec(&bin.path().join("codspeed"), "#!/bin/sh\necho 'codspeed 4.18.2'\n");
+        write_exec(&bin.path().join("cargo"), "#!/bin/sh\necho 'cargo-codspeed 6.1.0'\n");
+        let out = preflight(Some(bin.path().to_str().unwrap()));
+        assert_eq!(out, Some(("4.18.2".to_string(), "6.1.0".to_string())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_preflight_skips_when_a_tool_cannot_spawn() {
+        // A bogus PATH means neither probe can spawn: skip (None), no panic.
+        assert_eq!(preflight(Some("/nonexistent-bin")), None);
     }
 }
