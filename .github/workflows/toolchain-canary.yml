@@ -52,7 +52,11 @@ jobs:
           command -v codspeed || { echo '::error::codspeed binary not found after install.sh'; find "$HOME" -maxdepth 4 -name codspeed -type f 2>/dev/null; exit 1; }
           codspeed --version
           cargo codspeed --version
-          codspeed setup
+          # Installing the valgrind fork is a system-level operation — plain
+          # `codspeed setup` exits 1 silently without root. sudo drops the
+          # user PATH, hence the resolved absolute path.
+          sudo "$(command -v codspeed)" setup
+          valgrind --version
       - name: Build fixture benches under instrumentation
         working-directory: fixtures/codspeed-canary
         run: cargo codspeed build
