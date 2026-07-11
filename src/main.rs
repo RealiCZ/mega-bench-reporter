@@ -2,7 +2,7 @@
 //! stdout — a summary of what the run produced and which factual events
 //! occurred. All logs go to stderr.
 //! This tool produces data only; composing/sending Lark cards is the
-//! consuming agent's job (see `skill/`).
+//! consuming agent's job (see `skills/mega-bench-data/`).
 
 use clap::{Parser, Subcommand, ValueEnum};
 use mega_bench_reporter::config::Config;

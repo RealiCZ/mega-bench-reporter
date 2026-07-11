@@ -6,7 +6,7 @@ None of these block using the tool; they need a joint decision or a follow-up ou
 ## Contract / integration (BB9 side)
 
 1. ~~Output contract is `{"cards": [...]}`.~~ **Superseded (user decision, 2026-07-02): the reporter renders no cards at all.**
-   It emits factual events (`events.json` + stdout summary) and a discovery pointer (`latest.json`); BB9 composes/sends cards itself following `skill/references/lark-card.md` (incl. the red/yellow/green `--template` color standard) and dedups with its own last-posted-sha marker (`skill/references/discovery.md`).
+   It emits factual events (`events.json` + stdout summary) and a discovery pointer (`latest.json`); BB9 composes/sends cards itself following `skills/mega-bench-data/references/lark-card.md` (incl. the red/yellow/green `--template` color standard) and dedups with its own last-posted-sha marker (`skills/mega-bench-data/references/discovery.md`).
 2. ~~Lark markdown table rendering.~~ **Resolved:** tested on the Lark side, renders fine.
    Additionally, the per-commit comparison table is now emitted as `compare_table.json` (not a PNG) so the relaying agent can assemble a native table.
 3. ~~Flamegraph SVGs cannot be embedded in cards.~~ **Obsolete:** the flamegraph pipeline is now archive-only (user decision, 2026-07-02) — no card, nothing for BB9 to post; SVGs are viewed directly from `flame/<day>/`.
@@ -35,7 +35,7 @@ None of these block using the tool; they need a joint decision or a follow-up ou
 6d. ~~Recovery has no hysteresis.~~ **Resolved (knob added, off by default):** `recovery_threshold_pct` in `repos.toml` — a latched row recovers only when back within it (validated `<= regression_threshold_pct`); between the two thresholds it stays latched and quiet.
    Unset = same as the regression threshold, i.e. exactly the old behavior; turn it on (e.g. 2.5 against the 5.0 regression threshold) if real runs show alternating regression/recovery pairs.
 6c. ~~Accepted-regression workflow is manual.~~ **Resolved:** the `rebaseline` subcommand clears matching rows' history + latch from `state.json` (`--row <key-or-prefix*>`, repeatable); the next run re-baselines them as FirstRun with no alert.
-   See `skill/references/cli.md`.
+   See `skills/mega-bench-data/references/cli.md`.
 7. **Same-day short-sha collision.**
    Commit dirs are keyed `<YYYYMMDD>-<7-char-sha>`; two same-day commits sharing a 7-char prefix would overwrite each other (probability ~1e-8 per pair, accepted).
 
@@ -89,4 +89,4 @@ None of these block using the tool; they need a joint decision or a follow-up ou
 16. `repos.toml` ships an `https://` clone URL (plan sketched ssh) so the optional `GITHUB_TOKEN` credential-helper path works.
 17. The flamegraph pipeline always runs `cargo bench --no-run` and relies on cargo's cache instead of an explicit "reuse if same-day" check.
 18. The plan's 火焰图 card (Task 2.1 last step) was dropped: the nightly flamegraph is archive-only per user decision (2026-07-02); `flame/<day>/` on disk is the deliverable.
-19. The whole card-rendering layer (Task 1.6 templates, card JSON output contract) was removed per user decision (2026-07-02): the reporter is a pure data producer (events + latest.json + charts + JSON), and card composition lives in `skill/references/lark-card.md` for the consuming agent. mega-evm-specific knowledge moved out of code into config (`baseline_subject`, `headline_subjects`, `subject_order`) and `skill/references/repos/mega-evm.md` — adding a repo is config + one doc file.
+19. The whole card-rendering layer (Task 1.6 templates, card JSON output contract) was removed per user decision (2026-07-02): the reporter is a pure data producer (events + latest.json + charts + JSON), and card composition lives in `skills/mega-bench-data/references/lark-card.md` for the consuming agent. mega-evm-specific knowledge moved out of code into config (`baseline_subject`, `headline_subjects`, `subject_order`) and `skills/mega-bench-data/references/repos/mega-evm.md` — adding a repo is config + one doc file.

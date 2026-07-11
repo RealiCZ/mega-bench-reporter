@@ -5,7 +5,7 @@ Every commit on a tracked branch gets benched with criterion, every subject is c
 
 **Data only, by design.**
 The tool renders no cards, sends no messages, and holds no messaging credentials.
-A consuming agent (e.g. BB9) polls a single pointer file, reads the data, and composes whatever reports it wants — the repo-root [`skill/`](skill/SKILL.md) documents everything it needs.
+A consuming agent (e.g. BB9) polls a single pointer file, reads the data, and composes whatever reports it wants — the repo-root [`skills/mega-bench-data/`](skills/mega-bench-data/SKILL.md) documents everything it needs.
 
 ![roles and flows](docs/flow-roles.png)
 
@@ -69,7 +69,7 @@ stdout is one JSON summary — `{repo, sha, output_dir, failed_targets, events}`
 
 Event semantics in one breath: a headline row rising more than `regression_threshold_pct` (default 10%) above the median of its last `rolling_window` (default 20) healthy runs records a regression event, latches (no repeats), and unlatches with a recovery event; regressed values never enter the window, so a sustained regression cannot rebaseline itself.
 The instructions lane runs the same protocol over deterministic instruction counts with its own thresholds (`instr_regression_threshold_pct`, default 2%); its events carry `"metric": "instructions"`, and every walltime alert notes what instructions did for the same row (`instructions.verdict`).
-Full schemas and rules: [`skill/references/data-layout.md`](skill/references/data-layout.md), [`skill/references/events.md`](skill/references/events.md).
+Full schemas and rules: [`skills/mega-bench-data/references/data-layout.md`](skills/mega-bench-data/references/data-layout.md), [`skills/mega-bench-data/references/events.md`](skills/mega-bench-data/references/events.md).
 
 ## Configuration (`repos.toml`)
 
@@ -101,20 +101,20 @@ workloads = [
 ]
 ```
 
-Adding a tracked repo = one `[[repos]]` entry + one `skill/references/repos/<name>.md` — no code change.
+Adding a tracked repo = one `[[repos]]` entry + one `skills/mega-bench-data/references/repos/<name>.md` — no code change.
 
 ## For consuming agents
 
-The skill is the contract; start at [`skill/SKILL.md`](skill/SKILL.md) and route from there:
+The skill is the contract; start at [`skills/mega-bench-data/SKILL.md`](skills/mega-bench-data/SKILL.md) and route from there:
 
 | task | doc |
 |---|---|
-| invoke the CLI, flags, stdout shape | [`cli.md`](skill/references/cli.md) |
-| find new runs, dedup by last-posted sha, recover from crashes | [`discovery.md`](skill/references/discovery.md) |
-| interpret events and tuning | [`events.md`](skill/references/events.md) |
-| every file and schema | [`data-layout.md`](skill/references/data-layout.md) |
-| compose a Lark card (field mapping, red/yellow/green standard, verified example) | [`lark-card.md`](skill/references/lark-card.md) |
-| mega-evm subject/group meanings | [`repos/mega-evm.md`](skill/references/repos/mega-evm.md) |
+| invoke the CLI, flags, stdout shape | [`cli.md`](skills/mega-bench-data/references/cli.md) |
+| find new runs, dedup by last-posted sha, recover from crashes | [`discovery.md`](skills/mega-bench-data/references/discovery.md) |
+| interpret events and tuning | [`events.md`](skills/mega-bench-data/references/events.md) |
+| every file and schema | [`data-layout.md`](skills/mega-bench-data/references/data-layout.md) |
+| compose a Lark card (field mapping, red/yellow/green standard, verified example) | [`lark-card.md`](skills/mega-bench-data/references/lark-card.md) |
+| mega-evm subject/group meanings | [`repos/mega-evm.md`](skills/mega-bench-data/references/repos/mega-evm.md) |
 
 ## Operations
 

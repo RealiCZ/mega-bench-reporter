@@ -38,8 +38,10 @@ for that dir — treat as `[]`.
   instruction-count lane. Instructions events use the same latch protocol but
   their own state (`state.json → instr_rows`), their own thresholds
   (`instr_regression_threshold_pct`, default 2%, and
-  `instr_recovery_threshold_pct`), and ratios over deterministic counts — so any
-  instructions regression is a real code-path change, not noise.
+  `instr_recovery_threshold_pct`), and ratios over deterministic counts:
+  instruction counts are byte-identical across repeat runs on the same commit/host,
+  so a latched instructions regression is a real code-path change, not machine
+  noise — however small the percentage.
 - `instructions` — optional, on **walltime** regression/recovery events only:
   what the instructions lane saw for the same row when the walltime alert
   fired. `verdict` is `"flat" | "up" | "down" | "missing"`. `"missing"` (with

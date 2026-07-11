@@ -1,0 +1,23 @@
+{
+  "skills": [
+    {
+      "id": "mega-bench-data",
+      "kind": "contract",
+      "audience": "consumer-agent",
+      "platform": ["any"]
+    },
+    {
+      "id": "provision-instructions-lane",
+      "kind": "runbook",
+      "audience": "operator-agent",
+      "platform": ["linux"],
+      "requires": [
+        "codspeed CLI 4.x",
+        "cargo-codspeed 5.0.1",
+        "valgrind via codspeed setup",
+        "Foundry",
+        "Rust toolchain"
+      ]
+    }
+  ]
+}

@@ -52,8 +52,7 @@ The commit-dir date is the commit's committer date, not the run date.
 - `instr` — the instructions lane's numbers, present only when that lane ran and
   produced a count for the row: `count` = CPU instructions retired (callgrind `Ir`)
   for one traced iteration, `ratio_vs_baseline` = same semantics as the walltime
-  ratio but over counts. Counts are **deterministic** (byte-identical across
-  repeat runs on the same commit/host).
+  ratio but over counts. Counts are **deterministic** (see [`events.md`](events.md)).
 - `instr_failed_targets` — bench targets whose instructions-lane build/run failed;
   absent when the lane is off, skipped, or fully clean. Independent of
   `failed_targets` (the walltime marker).

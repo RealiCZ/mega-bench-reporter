@@ -2,3 +2,6 @@
 .DS_Store
 /data
 /work
+
+# Claude Code harness scratch (agent worktrees)
+.claude/worktrees/

@@ -1,8 +1,8 @@
 # Repo notes: mega-evm
 
-What the subjects and groups mean for the `mega-evm` entry. (The core skill docs are
-repo-agnostic; per-repo domain knowledge lives here. Adding a tracked repo = a new
-`[[repos]]` config entry + a file like this.)
+What the subjects and groups mean for the `mega-evm` entry. The core skill docs are
+repo-agnostic; per-repo domain knowledge lives here. (Adding a tracked repo:
+see [`SKILL.md`](../../SKILL.md).)
 
 Config for this repo: `baseline_subject = "revm_pinned"`,
 `headline_subjects = ["rex5", "rex5_*"]`.
@@ -38,9 +38,8 @@ CodSpeed runner's offline simulation mode.
   first-iteration lazy initialization (allocator warmup, `lazy_static`/`OnceCell`
   fills), which a walltime mean amortizes away. Level shifts between the two
   lanes are therefore expected; compare each lane against its own history.
-- Counts are **deterministic**: byte-identical across repeat runs of the same
-  commit on the same host. Any latched instructions regression is a real
-  code-path change.
+- Counts are **deterministic**: a latched instructions regression is a real
+  code-path change (see [`events.md`](../events.md)).
 - Counts are **architecture-pinned**: an x86_64 count and an aarch64 count of
   the same code differ by ISA, not by performance. The deployment host is
   x86_64 — never compare stored counts across hosts of different architectures,
