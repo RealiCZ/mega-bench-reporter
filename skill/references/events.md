@@ -31,7 +31,8 @@ for that dir — treat as `[]`.
   and quiet in between). Fires once.
 - `digest` — every `digest_batch_size` (default 10) commits; `dir` (repo-relative)
   holds `summary.json` + `trend.png` (plus the instructions lane's
-  `instr_trend.png`, see [`data-layout.md`](data-layout.md)) for the window.
+  `instr_trend.png` when the window has instructions data, see
+  [`data-layout.md`](data-layout.md)) for the window.
 - `metric` — which lane a regression/recovery came from: **absent = walltime**
   (unchanged from before the field existed), `"instructions"` = the
   instruction-count lane. Instructions events use the same latch protocol but
@@ -47,7 +48,10 @@ for that dir — treat as `[]`.
   `(current_instr_ratio / instr_rolling_median - 1) * 100` — the same
   pre-update median the instructions lane's own check compares against — and
   the verdict is `"up"` if `ratio_delta_pct >= instr_regression_threshold_pct`,
-  `"down"` if `<= -instr_regression_threshold_pct`, else `"flat"`. A walltime
+  `"down"` if `<= -instr_regression_threshold_pct`, else `"flat"`. The verdict is
+  computed from the exact delta **before** the 2-decimal rounding of the serialized
+  `ratio_delta_pct`, so an exact-boundary case may show e.g.
+  `ratio_delta_pct: 2.0, verdict: "flat"`. A walltime
   regression with instructions `"flat"` is likely machine noise or a layout
   effect; with `"up"` it is corroborated by a real code-path change (card
   wording in [`lark-card.md`](lark-card.md)).

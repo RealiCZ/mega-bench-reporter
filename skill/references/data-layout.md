@@ -13,7 +13,7 @@ Everything is under `<data-root>/<repo>/`:
 | `commits/<YYYYMMDD>-<shortsha>/dist_<group>[_<workload>].png` | violin plot of per-call time distributions (`/` in workloads becomes `_`) |
 | `digests/<YYYYMMDD>-<first>..<last>/summary.json` | last-N-commits headline series: per-row `ratios[]`, `first`, `last`, `median`; the optional `instr_series` mirrors it for the instructions lane |
 | `digests/<YYYYMMDD>-<first>..<last>/trend.png` | headline ratios over the digest window, red rings on threshold-tripping points |
-| `digests/<YYYYMMDD>-<first>..<last>/instr_trend.png` | instructions ratios over the digest window, same chart style; red rings on instructions-threshold-tripping points; commits without instructions data are gaps |
+| `digests/<YYYYMMDD>-<first>..<last>/instr_trend.png` | instructions ratios over the digest window, same chart style; red rings on instructions-threshold-tripping points; commits without instructions data are gaps — written only when the window has instructions data |
 | `trends/<YYYYMMDD>-<first>..<last>/` | manual `trend` runs — same `summary.json` + `trend.png` shape as a digest (with `--metric instructions`: `instr_trend.png` + `summary.json` with `instr_series`), never produced automatically |
 | `flame/<YYYYMMDD>/<workload>.svg` | flame graph of one benchmark id (nightly, archive-only — open directly in a browser) |
 | `flame/<YYYYMMDD>/<workload>_diff.svg` | differential flame graph, feature vs baseline (red = grew, blue = shrank) |

@@ -120,6 +120,7 @@ impl InstrAnnotationCtx<'_> {
             .instr_rows
             .get(row_key)
             .and_then(|h| median_opt(&h.recent_ratios))
+            // Divide-by-zero guard: unreachable with positive ratios, fails safe to `missing`.
             .filter(|m| *m > 0.0);
         match (current, median) {
             (Some(current), Some(median)) => {
@@ -685,7 +686,8 @@ pub fn run_commit_pipeline(
             Ok(None) => {}
             Err(e) => eprintln!(
                 "instructions lane: previous raw.json for {sha} is unreadable — regenerating \
-                 without carried instructions data: {e:#}"
+                 without carried instructions data and with the previous walltime failed-target \
+                 markers reset: {e:#}"
             ),
         }
     } else {

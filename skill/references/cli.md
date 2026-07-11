@@ -37,7 +37,10 @@ record events, update `state.json` and `latest.json`.
 - `--skip-bench` re-renders artifacts from the checkout's existing criterion tree —
   dev/regen only; it accepts only the last processed sha, and it never re-collects
   the instructions lane (the previous raw.json's instructions data is carried
-  forward instead of being dropped).
+  forward instead of being dropped). Under `require_instructions = true` this
+  carry-forward feeds the gate: a regen whose previous record had no instructions
+  data passes the gate silently, while one whose previous record carried
+  `instr_failed_targets` re-fails the gate on every re-render (both deliberate).
 
 ## stdout summary
 
@@ -57,6 +60,10 @@ Exactly one JSON document (logs go to stderr); the same facts are durable on dis
 `instr_failed_targets` appears next to `failed_targets` only when the
 instructions lane ran and some target failed; instructions-lane events carry
 `"metric": "instructions"` (see [`events.md`](events.md)).
+
+On a `require_instructions` failure the run exits nonzero **without** emitting this
+stdout JSON summary — the anyhow error on stderr is the signal; every fact still
+lands durably on disk.
 
 ## Manual trend chart (read-only)
 
