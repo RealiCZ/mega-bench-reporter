@@ -216,6 +216,7 @@ mod tests {
             package: None,
             tuning: Default::default(),
             flamegraph: None,
+            instructions: None,
         }
     }
 

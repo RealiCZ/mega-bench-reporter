@@ -4,14 +4,34 @@
 //! This tool produces data only; composing/sending Lark cards is the
 //! consuming agent's job (see `skill/`).
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use mega_bench_reporter::config::Config;
+use mega_bench_reporter::lane::Lane;
 use mega_bench_reporter::pipeline::Event;
 use mega_bench_reporter::state::State;
 use mega_bench_reporter::storage::RepoStore;
 use mega_bench_reporter::{digest, flamegraph, pipeline};
 use serde::Serialize;
 use std::path::PathBuf;
+
+/// The `trend --metric` choice. Its own type (rather than deriving `ValueEnum`
+/// on the library's `Lane`) keeps clap out of the library; it maps 1:1 to
+/// [`Lane`].
+#[derive(ValueEnum, Clone, Copy, Debug, Default)]
+enum MetricArg {
+    #[default]
+    Walltime,
+    Instructions,
+}
+
+impl From<MetricArg> for Lane {
+    fn from(metric: MetricArg) -> Self {
+        match metric {
+            MetricArg::Walltime => Lane::Walltime,
+            MetricArg::Instructions => Lane::Instructions,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "mega-bench-reporter", version, about)]
@@ -88,6 +108,11 @@ enum Command {
         /// `salt_dynamic_gas/*`); default = the configured headline rows.
         #[arg(long = "row")]
         rows: Vec<String>,
+        /// Which lane to chart: `walltime` (default) → `trend.png`, or
+        /// `instructions` → `instr_trend.png` (errors if the window has no
+        /// instructions data).
+        #[arg(long, value_enum, default_value_t = MetricArg::Walltime)]
+        metric: MetricArg,
         /// Output directory (default
         /// `<data-root>/<repo>/trends/<day>-<first>..<last>`).
         #[arg(long)]
@@ -123,6 +148,10 @@ struct CliOutput {
     /// Bench targets that failed this run (already marked in raw.json).
     /// Always present — a stable shape is easier on consumers.
     failed_targets: Vec<String>,
+    /// Instructions-lane per-target failures. Absent when the lane is off,
+    /// skipped, or fully clean — pre-lane consumers see an unchanged summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instr_failed_targets: Option<Vec<String>>,
     /// Factual events from this run (regression / recovery / digest).
     events: Vec<Event>,
 }
@@ -158,6 +187,7 @@ fn run() -> anyhow::Result<()> {
                 sha,
                 output_dir: outcome.commit_dir,
                 failed_targets: outcome.failed_targets,
+                instr_failed_targets: outcome.instr_failed_targets,
                 events: outcome.events,
             }
         }
@@ -175,11 +205,12 @@ fn run() -> anyhow::Result<()> {
                 sha: outcome.sha,
                 output_dir: outcome.flame_dir,
                 failed_targets: Vec::new(),
+                instr_failed_targets: None,
                 // Archive-only: the flamegraph subcommand never emits events.
                 events: Vec::new(),
             }
         }
-        Command::Trend { repo, config, data_root, last, from, to, rows, out } => {
+        Command::Trend { repo, config, data_root, last, from, to, rows, metric, out } => {
             let cfg = Config::load(&config)?;
             let repo_cfg = cfg.repo(&repo)?;
             let settings = cfg.settings(repo_cfg)?;
@@ -194,6 +225,8 @@ fn run() -> anyhow::Result<()> {
                 &repo_cfg.headline_label(),
                 |s| repo_cfg.is_headline(s),
                 settings.regression_threshold_pct,
+                settings.instr_regression_threshold_pct,
+                metric.into(),
                 &window,
                 digest::TrendRequest { row_patterns: &rows, out },
             )?;

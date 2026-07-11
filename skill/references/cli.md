@@ -10,17 +10,37 @@ mega-bench-reporter run --repo <name> --sha <full-sha> \
 What it does: clone/fetch the repo into `<work-root>/<repo>` (default
 `<data-root>/_checkouts`), check out the sha (submodules included), run
 `cargo bench -p <package> --bench <target> -- --output-format bencher` per configured
-target (the exact invocation the tracked repo's CI uses; a `bench_profile` config adds
-`--profile <p>`), parse criterion's JSON tree, compute ratios against the configured
-`baseline_subject`, render charts + table JSON, record events, update `state.json`
-and `latest.json`.
+target (the invocation the scheduled walltime layer standardized on; a
+`bench_profile` config adds `--profile <p>`), parse criterion's JSON tree, compute
+ratios against the configured `baseline_subject`, render charts + table JSON,
+record events, update `state.json` and `latest.json`.
 
 - A failing bench target lands in `failed_targets` and is skipped; the run only
   fails when every target fails.
+- With `[repos.instructions]` configured, the instructions lane runs after the
+  walltime benches on the same checkout: per target, an instrumented build
+  (`cargo codspeed build`) plus an offline `codspeed run --skip-upload --mode
+  simulation`, parsed into per-row instruction counts. Linux-only (valgrind);
+  on other hosts, or when the `codspeed` CLI / `cargo-codspeed` are missing, the
+  lane is skipped with a stderr note and the run proceeds walltime-only. A
+  lane-failing target lands in `instr_failed_targets`; the lane never fails the
+  run — unless `require_instructions` says so (next bullet).
+- `require_instructions = false` (the `[repos.instructions]` default) keeps the
+  lane best-effort. Set it to `true` to make a run whose instructions lane
+  skips (non-Linux host, tools missing, the tracked repo's codspeed compat
+  dependency absent) or fails any target exit nonzero — but only **after** all
+  walltime artifacts, events, and state are fully written: the data on disk
+  remains valid and `latest.json` is updated; the nonzero exit is the signal
+  to the scheduler.
 - No need to hold a live connection: launch detached, wait for exit, read the files
   (see [`discovery.md`](discovery.md)).
 - `--skip-bench` re-renders artifacts from the checkout's existing criterion tree —
-  dev/regen only; it accepts only the last processed sha.
+  dev/regen only; it accepts only the last processed sha, and it never re-collects
+  the instructions lane (the previous raw.json's instructions data is carried
+  forward instead of being dropped). Under `require_instructions = true` this
+  carry-forward feeds the gate: a regen whose previous record had no instructions
+  data passes the gate silently, while one whose previous record carried
+  `instr_failed_targets` re-fails the gate on every re-render (both deliberate).
 
 ## stdout summary
 
@@ -37,11 +57,20 @@ Exactly one JSON document (logs go to stderr); the same facts are durable on dis
 }
 ```
 
+`instr_failed_targets` appears next to `failed_targets` only when the
+instructions lane ran and some target failed; instructions-lane events carry
+`"metric": "instructions"` (see [`events.md`](events.md)).
+
+On a `require_instructions` failure the run exits nonzero **without** emitting this
+stdout JSON summary — the anyhow error on stderr is the signal; every fact still
+lands durably on disk.
+
 ## Manual trend chart (read-only)
 
 ```
 mega-bench-reporter trend --repo <name> --config repos.toml --data-root <dir> \
-    [--last N] [--from <sha-prefix>] [--to <sha-prefix>] [--row <key>]... [--out <dir>]
+    [--last N] [--from <sha-prefix>] [--to <sha-prefix>] [--row <key>]... \
+    [--metric walltime|instructions] [--out <dir>]
 ```
 
 Charts an arbitrary window of **already-stored** commits — nothing is benched,
@@ -55,6 +84,11 @@ without waiting for the next digest.
 - Rows: defaults to the configured headline family; `--row` (repeatable,
   exact key or trailing `*`, e.g. `--row 'salt_dynamic_gas/*'`) charts any
   stored row instead, including non-headline ones.
+- Metric: `--metric walltime|instructions` picks the lane (default
+  `walltime`). `instructions` renders the instructions series over the
+  requested window into the same `trends/<range>/` layout — `instr_trend.png`
+  plus a `summary.json` with `instr_series` — and errors with a clear message
+  if the window has no instructions data.
 - Output: `summary.json` + `trend.png` (same shape as a digest) under
   `<data-root>/<repo>/trends/<day>-<first7>..<last7>/`, or `--out <dir>`.
 - stdout: one JSON document — `{repo, output_dir, commits, rows}`.
@@ -71,7 +105,10 @@ A sustained regression stays latched forever (frozen baseline, quiet after the
 one alert). When the team decides the new level is acceptable, clear the
 affected rows: their rolling history and regression latch are removed from
 `state.json`, and the next run re-baselines them (FirstRun — no alert, fresh
-window at the new level).
+window at the new level). A matching pattern clears the row from **both**
+lanes — the walltime history (`rows`) and the instructions history
+(`instr_rows`) — so an accepted new level never leaves a stale latch in the
+other lane.
 
 - `--row` is required and repeatable: exact row key or trailing `*`
   (e.g. `--row 'salt_dynamic_gas/rex5_salt/*'`). A pattern matching nothing
@@ -96,10 +133,15 @@ nothing to relay — plain cron is enough; view `flame/<day>/*.svg` in a browser
 ## Environment and safety
 
 - Exit 0 = success. Runs take as long as the benches take (tens of minutes) — no
-  short timeouts.
+  short timeouts. With `require_instructions = true`, a run whose instructions
+  lane skipped or failed exits nonzero even though its walltime data landed in
+  full (see the per-commit run section).
 - `GITHUB_TOKEN` env var: only needed for private repos (https clone URLs use it via
   a git credential helper; the token never appears in argv).
 - Concurrency: a per-repo lock (`<data-root>/<repo>/.lock`) makes a second
   invocation fail fast. Never run two invocations for the same repo at once.
 - The box needs: `git`, a Rust toolchain, whatever the tracked repo's build needs
-  (mega-evm: Foundry), and `perf` on Linux for flamegraphs.
+  (mega-evm: Foundry), `perf` on Linux for flamegraphs, and — for the instructions
+  lane — the `codspeed` CLI, `cargo-codspeed`, and valgrind (`codspeed setup`),
+  all host-provisioned; the reporter never installs them, it skips the lane when
+  they are missing.

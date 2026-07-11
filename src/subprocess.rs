@@ -17,6 +17,24 @@ pub fn run_cmd(cmd: &mut Command, what: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Runs a command to completion with stdout streamed to our stderr (via
+/// [`drain_stdout_to_stderr`]) and stderr inherited; a non-zero exit becomes
+/// an error. For long-running tools whose progress output should reach the
+/// invoker's logs live instead of being buffered.
+pub fn run_streaming(mut cmd: Command, what: &str) -> anyhow::Result<()> {
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn {what} ({cmd:?}): {e}"))?;
+    drain_stdout_to_stderr(&mut child)?;
+    let status = child.wait()?;
+    if !status.success() {
+        anyhow::bail!("{what} failed ({status})");
+    }
+    Ok(())
+}
+
 /// Streams a child's piped stdout to our stderr — our own stdout is reserved
 /// for the one JSON document each subcommand prints. If the drain breaks, the
 /// child is killed and reaped so a running bench/profiler can't outlive the
@@ -45,6 +63,13 @@ mod tests {
     #[test]
     fn test_run_cmd_nonzero_exit_is_error_with_context() {
         let err = run_cmd(&mut Command::new("false"), "false-cmd").unwrap_err();
+        assert!(err.to_string().contains("false-cmd failed"));
+    }
+
+    #[test]
+    fn test_run_streaming_success_and_nonzero_exit() {
+        run_streaming(Command::new("echo"), "echo").unwrap();
+        let err = run_streaming(Command::new("false"), "false-cmd").unwrap_err();
         assert!(err.to_string().contains("false-cmd failed"));
     }
 

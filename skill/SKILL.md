@@ -7,8 +7,10 @@ description: Use when operating mega-bench-reporter or consuming its output - tr
 
 `mega-bench-reporter` continuously measures a repo's benchmark overhead against a
 configured baseline (for mega-evm: vanilla `revm_pinned`) and produces **data only**:
-raw metrics JSON, charts, and factual events. It never talks to Lark and renders no
-cards — discovering results, composing cards, and delivering them is entirely the
+raw metrics JSON, charts, and factual events. Two metric lanes exist: walltime
+(always on) and deterministic CPU instruction counts (opt-in per repo, Linux-only;
+events from it carry `"metric": "instructions"`). It never talks to Lark and renders
+no cards — discovering results, composing cards, and delivering them is entirely the
 consuming agent's job, following these docs.
 
 ## Commands
@@ -17,12 +19,14 @@ consuming agent's job, following these docs.
 |---|---|
 | `mega-bench-reporter run --repo <name> --sha <sha> --config repos.toml --data-root <dir>` | per-commit pipeline: bench → parse → charts + table JSON → store → events (regression/recovery/digest) |
 | `mega-bench-reporter flamegraph --repo <name> --config repos.toml --data-root <dir>` | nightly flame-graph archive into `flame/<day>/` — no events, nothing to relay |
-| `mega-bench-reporter trend --repo <name> --config repos.toml --data-root <dir> [--last N \| --from <sha> --to <sha>] [--row <key>]...` | manual trend chart over any stored-commit window into `trends/` — read-only, independent of the automatic digest |
+| `mega-bench-reporter trend --repo <name> --config repos.toml --data-root <dir> [--last N \| --from <sha> --to <sha>] [--row <key>]... [--metric walltime\|instructions]` | manual trend chart over any stored-commit window into `trends/` — either lane, read-only, independent of the automatic digest |
 | `mega-bench-reporter rebaseline --repo <name> --data-root <dir> --row <key-or-prefix*>...` | accept a latched regression as the new normal: clear the rows' history + latch from `state.json`; next run re-baselines them (no alert). Only on an explicit human decision |
 
-Ground rules: exit 0 = success; stdout = one JSON summary (facts are durable on disk
-regardless); stderr = logs; runs take tens of minutes — no short timeouts; a per-repo
-lock rejects concurrent invocations; `GITHUB_TOKEN` only for private repos.
+Ground rules: exit 0 = success (except `require_instructions = true`, which turns a
+skipped/failed instructions lane into a nonzero exit — see `cli.md`); stdout = one
+JSON summary (facts are durable on disk regardless); stderr = logs; runs take tens of
+minutes — no short timeouts; a per-repo lock rejects concurrent invocations;
+`GITHUB_TOKEN` only for private repos.
 
 ## Routing — which doc for what
 

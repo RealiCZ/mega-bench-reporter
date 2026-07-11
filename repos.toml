@@ -15,12 +15,21 @@ regression_threshold_pct = 5.0
 # threshold, i.e. no hysteresis; set lower if alternating regression/recovery
 # event pairs show up from rows oscillating around the threshold.
 # recovery_threshold_pct = 2.5
+# Instructions lane: event when a headline row's instruction-count ratio
+# rises more than this % over its rolling median (built-in: 2.0). Counts are
+# deterministic — the threshold only needs headroom for incidental codegen
+# shifts, not run-to-run noise; recalibrate after ~20 real runs.
+# instr_regression_threshold_pct = 2.0
+# Instructions-lane recovery threshold (hysteresis; must be <= the
+# instructions regression threshold). Unset = same as that threshold.
+# instr_recovery_threshold_pct = 1.0
 # How many healthy (non-regressed) runs feed the rolling median.
 rolling_window = 20
 # Commits per trend digest.
 digest_batch_size = 10
-# Cargo profile for `cargo bench`. Unset = cargo's default bench profile,
-# which is exactly what mega-evm's CI (benchmark.yml) uses.
+# Cargo profile for `cargo bench`. Unset = cargo's default bench profile —
+# keeping numbers comparable with the scheduled walltime layer (mega-evm's
+# per-PR walltime flow has been superseded by CodSpeed instruction-count CI).
 # bench_profile = "profiling"
 
 [[repos]]
@@ -39,6 +48,20 @@ subject_order = [
   "revm_pinned", "revm_latest", "op_revm_pinned", "op_revm_latest",
   "equivalence", "mini_rex", "rex4", "rex5",
 ]
+
+# Instruction-count lane (CodSpeed runner offline mode): deterministic Ir
+# counts per benchmark beside the walltime numbers. Only runs on Linux hosts
+# with the codspeed CLI + cargo-codspeed provisioned; skipped (with a stderr
+# note) elsewhere. No bench_filter = run every built bench.
+[repos.instructions]
+# Make a run whose instructions lane skips (non-Linux host, tools missing,
+# compat dep absent) or fails any target exit nonzero — only after all
+# walltime artifacts, events, state, and latest.json are written, so the
+# on-disk data stays valid and the exit code is purely a scheduler signal.
+# Unset (false) = the lane stays best-effort. Turn on once the host is
+# provisioned so a broken installation cannot silently produce
+# walltime-only runs.
+# require_instructions = true
 
 [repos.flamegraph]
 bench_target = "mega_bench"

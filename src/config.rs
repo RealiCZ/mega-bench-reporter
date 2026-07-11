@@ -2,6 +2,8 @@
 //! subjects are interpreted. One entry today (mega-evm); the list shape is
 //! what leaves room for more.
 
+use crate::lane::Lane;
+use crate::state::Thresholds;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -33,6 +35,10 @@ pub struct RepoConfig {
     /// not available for this repo.
     #[serde(default)]
     pub flamegraph: Option<FlamegraphConfig>,
+    /// Instruction-count lane settings; absent = the lane is off and the
+    /// output is byte-identical to a walltime-only run.
+    #[serde(default)]
+    pub instructions: Option<InstructionsConfig>,
 }
 
 impl RepoConfig {
@@ -83,13 +89,23 @@ pub struct Tuning {
     /// Commits per trend digest (built-in: 10).
     pub digest_batch_size: Option<u32>,
     /// Cargo profile for `cargo bench` runs. Unset = cargo's default bench
-    /// profile — the same invocation mega-evm's CI uses. Set to `"profiling"`
-    /// to bench the debug-symbol build the flamegraph pipeline uses.
+    /// profile — comparable with the scheduled walltime layer. Set to
+    /// `"profiling"` to bench the debug-symbol build the flamegraph pipeline
+    /// uses.
     pub bench_profile: Option<String>,
+    /// Instructions lane: alert when a headline row's instruction-count ratio
+    /// rises more than this % over its rolling median (built-in: 2). Counts
+    /// are deterministic, so the threshold only needs headroom for incidental
+    /// codegen shifts, not run-to-run noise.
+    pub instr_regression_threshold_pct: Option<f64>,
+    /// Instructions lane recovery threshold (hysteresis; must be <= the
+    /// instructions regression threshold). Unset = that threshold.
+    pub instr_recovery_threshold_pct: Option<f64>,
 }
 
 /// Built-in defaults used when neither the repo nor `[defaults]` sets a knob.
 const DEFAULT_REGRESSION_THRESHOLD_PCT: f64 = 10.0;
+const DEFAULT_INSTR_REGRESSION_THRESHOLD_PCT: f64 = 2.0;
 const DEFAULT_ROLLING_WINDOW: usize = 20;
 const DEFAULT_DIGEST_BATCH_SIZE: u32 = 10;
 
@@ -99,23 +115,55 @@ pub struct Settings {
     pub regression_threshold_pct: f64,
     /// Defaults to `regression_threshold_pct` when not configured.
     pub recovery_threshold_pct: f64,
+    /// Instructions lane; unused (but still resolved) when the lane is off.
+    pub instr_regression_threshold_pct: f64,
+    /// Defaults to `instr_regression_threshold_pct` when not configured.
+    pub instr_recovery_threshold_pct: f64,
     pub rolling_window: usize,
     pub digest_batch_size: u32,
     pub bench_profile: Option<String>,
 }
 
 impl Settings {
+    /// The resolved (regression, recovery) threshold pair for one lane.
+    pub fn thresholds(&self, lane: Lane) -> Thresholds {
+        match lane {
+            Lane::Walltime => Thresholds {
+                regression_pct: self.regression_threshold_pct,
+                recovery_pct: self.recovery_threshold_pct,
+            },
+            Lane::Instructions => Thresholds {
+                regression_pct: self.instr_regression_threshold_pct,
+                recovery_pct: self.instr_recovery_threshold_pct,
+            },
+        }
+    }
+
     fn resolve(repo: &Tuning, defaults: &Tuning) -> anyhow::Result<Self> {
-        let regression_threshold_pct = repo
-            .regression_threshold_pct
-            .or(defaults.regression_threshold_pct)
-            .unwrap_or(DEFAULT_REGRESSION_THRESHOLD_PCT);
+        // One resolve + one validate per lane: the walltime and instructions
+        // pairs share the same (regression, recovery) logic and rules, called
+        // twice with each lane's config keys and built-in default.
+        let pick = |repo_val: Option<f64>, default_val: Option<f64>| repo_val.or(default_val);
+        let walltime = Thresholds::resolve(
+            pick(repo.regression_threshold_pct, defaults.regression_threshold_pct),
+            pick(repo.recovery_threshold_pct, defaults.recovery_threshold_pct),
+            DEFAULT_REGRESSION_THRESHOLD_PCT,
+        );
+        let instr = Thresholds::resolve(
+            pick(repo.instr_regression_threshold_pct, defaults.instr_regression_threshold_pct),
+            pick(repo.instr_recovery_threshold_pct, defaults.instr_recovery_threshold_pct),
+            DEFAULT_INSTR_REGRESSION_THRESHOLD_PCT,
+        );
+        // Nonsense values would silently disable alerting or spam it — reject
+        // loudly, walltime pair first, then the instructions pair.
+        walltime.validate("")?;
+        instr.validate("instr_")?;
+
         let settings = Self {
-            regression_threshold_pct,
-            recovery_threshold_pct: repo
-                .recovery_threshold_pct
-                .or(defaults.recovery_threshold_pct)
-                .unwrap_or(regression_threshold_pct),
+            regression_threshold_pct: walltime.regression_pct,
+            recovery_threshold_pct: walltime.recovery_pct,
+            instr_regression_threshold_pct: instr.regression_pct,
+            instr_recovery_threshold_pct: instr.recovery_pct,
             rolling_window: repo
                 .rolling_window
                 .or(defaults.rolling_window)
@@ -126,19 +174,8 @@ impl Settings {
                 .unwrap_or(DEFAULT_DIGEST_BATCH_SIZE),
             bench_profile: repo.bench_profile.clone().or_else(|| defaults.bench_profile.clone()),
         };
-        // Nonsense values would silently disable alerting (window 0 makes
-        // every run FirstRun) or spam it (threshold <= 0) — reject loudly.
-        if settings.regression_threshold_pct <= 0.0 {
-            anyhow::bail!("regression_threshold_pct must be > 0");
-        }
-        if settings.recovery_threshold_pct <= 0.0 {
-            anyhow::bail!("recovery_threshold_pct must be > 0");
-        }
-        // Recovering above the regression trigger would re-alert on the very
-        // next run — an event-pair generator, the opposite of hysteresis.
-        if settings.recovery_threshold_pct > settings.regression_threshold_pct {
-            anyhow::bail!("recovery_threshold_pct must be <= regression_threshold_pct");
-        }
+        // A zero window makes every run FirstRun (alerting off); a zero batch
+        // size would divide the digest cadence by nothing.
         if settings.rolling_window == 0 {
             anyhow::bail!("rolling_window must be >= 1");
         }
@@ -180,6 +217,24 @@ fn default_profile_secs() -> u64 {
 
 fn default_retention_days() -> u32 {
     30
+}
+
+/// Instruction-count lane settings (CodSpeed runner offline mode). Presence
+/// of the section turns the lane on; it only ever runs on Linux hosts with
+/// the `codspeed` CLI and `cargo-codspeed` installed.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct InstructionsConfig {
+    /// Optional benchmark filter appended to `cargo codspeed run`; unset =
+    /// run everything the instrumented build produced.
+    #[serde(default)]
+    pub bench_filter: Option<String>,
+    /// `false` (the default) keeps the lane best-effort: a lane skip or a
+    /// lane-failed target never fails the run. `true` makes such a run exit
+    /// nonzero — but only after the complete happy-path write sequence
+    /// (walltime artifacts, events, state, latest.json), so the on-disk data
+    /// stays valid and the nonzero exit is purely a signal to the scheduler.
+    #[serde(default)]
+    pub require_instructions: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -294,9 +349,50 @@ headline_subjects = ["rex5", "rex5_*"]
         assert_eq!(settings.regression_threshold_pct, 10.0);
         // Unset recovery threshold = the regression threshold (no hysteresis).
         assert_eq!(settings.recovery_threshold_pct, 10.0);
+        // The instructions lane's deterministic counts get a tight built-in.
+        assert_eq!(settings.instr_regression_threshold_pct, 2.0);
+        assert_eq!(settings.instr_recovery_threshold_pct, 2.0);
         assert_eq!(settings.rolling_window, 20);
         assert_eq!(settings.digest_batch_size, 10);
         assert_eq!(settings.bench_profile, None);
+    }
+
+    #[test]
+    fn test_instructions_lane_off_by_default_and_parses_with_or_without_filter() {
+        let cfg = Config::parse(SAMPLE).expect("parses");
+        assert_eq!(cfg.repo("mega-evm").unwrap().instructions, None);
+
+        // Empty section = lane on, no filter, best-effort (knob defaults off).
+        let cfg = Config::parse(&format!("{SAMPLE}\n[repos.instructions]\n")).expect("parses");
+        let instr = cfg.repo("mega-evm").unwrap().instructions.as_ref().expect("lane on");
+        assert_eq!(instr.bench_filter, None);
+        assert!(!instr.require_instructions, "require_instructions defaults to false");
+
+        let cfg = Config::parse(&format!(
+            "{SAMPLE}\n[repos.instructions]\nbench_filter = \"mega_bench\"\n"
+        ))
+        .expect("parses");
+        let instr = cfg.repo("mega-evm").unwrap().instructions.as_ref().expect("lane on");
+        assert_eq!(instr.bench_filter.as_deref(), Some("mega_bench"));
+
+        let cfg = Config::parse(&format!(
+            "{SAMPLE}\n[repos.instructions]\nrequire_instructions = true\n"
+        ))
+        .expect("parses");
+        let instr = cfg.repo("mega-evm").unwrap().instructions.as_ref().expect("lane on");
+        assert!(instr.require_instructions);
+    }
+
+    #[test]
+    fn test_settings_instr_recovery_threshold_follows_instr_regression_threshold() {
+        // Only the instructions regression threshold set: recovery follows it.
+        let cfg = Config::parse(&format!("{SAMPLE}\ninstr_regression_threshold_pct = 1.0\n"))
+            .expect("parses");
+        let settings = cfg.settings(cfg.repo("mega-evm").unwrap()).unwrap();
+        assert_eq!(settings.instr_regression_threshold_pct, 1.0);
+        assert_eq!(settings.instr_recovery_threshold_pct, 1.0);
+        // The instructions pair is independent of the walltime pair.
+        assert_eq!(settings.regression_threshold_pct, 10.0);
     }
 
     #[test]
@@ -327,6 +423,10 @@ headline_subjects = ["rex5", "rex5_*"]
             "recovery_threshold_pct = 0.0",
             // Recovering above the regression trigger would flap.
             "regression_threshold_pct = 5.0\nrecovery_threshold_pct = 8.0",
+            // The instructions pair follows the same validation.
+            "instr_regression_threshold_pct = -1.0",
+            "instr_recovery_threshold_pct = 0.0",
+            "instr_regression_threshold_pct = 2.0\ninstr_recovery_threshold_pct = 3.0",
         ] {
             let cfg = Config::parse(&format!("{SAMPLE}\n{bad}\n")).expect("parses");
             assert!(
@@ -334,6 +434,21 @@ headline_subjects = ["rex5", "rex5_*"]
                 "'{bad}' should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn test_shipped_repos_toml_parses_and_resolves() {
+        // The checked-in config must stay loadable: a syntax error or an
+        // out-of-range knob would otherwise only surface on the prod box.
+        let cfg = Config::parse(include_str!("../repos.toml")).expect("repos.toml parses");
+        let repo = cfg.repo("mega-evm").expect("mega-evm entry");
+        cfg.settings(repo).expect("settings resolve");
+        // The instructions lane ships enabled for mega-evm, unfiltered and
+        // best-effort (the require_instructions knob stays commented out).
+        let instr = repo.instructions.as_ref().expect("instructions lane configured");
+        assert_eq!(instr.bench_filter, None);
+        assert!(!instr.require_instructions);
+        assert!(repo.flamegraph.is_some(), "flamegraph config still parses next to it");
     }
 
     #[test]

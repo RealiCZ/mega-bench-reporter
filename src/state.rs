@@ -21,6 +21,11 @@ pub struct State {
     pub last_seen_sha: Option<String>,
     pub commits_since_digest: u32,
     pub rows: BTreeMap<String, RowHistory>,
+    /// The instructions lane's rolling windows and latches, keyed by the same
+    /// row-key strings as `rows`. Empty when the lane is off — and then not
+    /// serialized, so pre-lane state files round-trip unchanged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub instr_rows: BTreeMap<String, RowHistory>,
 }
 
 /// Detection thresholds for [`State::check_and_record`], both in percent over
@@ -41,6 +46,39 @@ impl Thresholds {
     /// No hysteresis: recover in the same band the row regressed past.
     pub fn uniform(pct: f64) -> Self {
         Self { regression_pct: pct, recovery_pct: pct }
+    }
+
+    /// Resolves one lane's `(regression, recovery)` pair from its already
+    /// repo-over-defaults-merged optional values: a missing regression falls
+    /// back to `default_regression`, and a missing recovery follows the
+    /// resolved regression (no hysteresis). The two lanes call this with their
+    /// own keys and built-in default.
+    pub fn resolve(
+        regression: Option<f64>,
+        recovery: Option<f64>,
+        default_regression: f64,
+    ) -> Self {
+        let regression_pct = regression.unwrap_or(default_regression);
+        Self { regression_pct, recovery_pct: recovery.unwrap_or(regression_pct) }
+    }
+
+    /// Rejects the two ways a pair breaks alerting: a non-positive threshold
+    /// (spams every run) and a recovery above the regression trigger (an
+    /// event-pair generator, the opposite of hysteresis). `key_prefix` names
+    /// the config keys in the error (`""` walltime, `"instr_"` instructions).
+    pub fn validate(&self, key_prefix: &str) -> anyhow::Result<()> {
+        if self.regression_pct <= 0.0 {
+            anyhow::bail!("{key_prefix}regression_threshold_pct must be > 0");
+        }
+        if self.recovery_pct <= 0.0 {
+            anyhow::bail!("{key_prefix}recovery_threshold_pct must be > 0");
+        }
+        if self.recovery_pct > self.regression_pct {
+            anyhow::bail!(
+                "{key_prefix}recovery_threshold_pct must be <= {key_prefix}regression_threshold_pct"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -133,10 +171,37 @@ impl State {
         thresholds: Thresholds,
         window: usize,
     ) -> Verdict {
+        Self::check_and_record_in(&mut self.rows, row_key, ratio, thresholds, window)
+    }
+
+    /// [`Self::check_and_record`] for the instructions lane: identical
+    /// semantics against the row's history in `instr_rows` — the two lanes'
+    /// windows and latches never mix.
+    pub fn check_and_record_instr(
+        &mut self,
+        row_key: &str,
+        ratio: f64,
+        thresholds: Thresholds,
+        window: usize,
+    ) -> Verdict {
+        Self::check_and_record_in(&mut self.instr_rows, row_key, ratio, thresholds, window)
+    }
+
+    /// The lane-agnostic core of [`Self::check_and_record`]: the unified
+    /// verdict loop drives one lane by handing it that lane's own `rows` map
+    /// (`self.rows` or `self.instr_rows`) so the two lanes share this logic
+    /// without their windows ever mixing.
+    pub(crate) fn check_and_record_in(
+        rows: &mut BTreeMap<String, RowHistory>,
+        row_key: &str,
+        ratio: f64,
+        thresholds: Thresholds,
+        window: usize,
+    ) -> Verdict {
         // compute_ratios filters non-finite ratios at the source; a NaN here
         // would otherwise surface as a confusing panic inside median's sort.
         debug_assert!(ratio.is_finite(), "non-finite ratio for {row_key}");
-        let entry = self.rows.entry(row_key.to_string()).or_default();
+        let entry = rows.entry(row_key.to_string()).or_default();
         let verdict = if entry.recent_ratios.is_empty() {
             Verdict::FirstRun
         } else {
@@ -168,21 +233,24 @@ impl State {
 
     /// Accepts a new performance level for the rows matching `patterns`
     /// (exact row keys or trailing-`*` prefixes): drops their rolling history
-    /// AND their regression latch, so the next run re-baselines them as
-    /// FirstRun — no alert, fresh window. Returns the cleared row keys.
-    /// This is the `rebaseline` subcommand's core; the alternative was
-    /// hand-editing state.json.
+    /// AND their regression latch — in BOTH lanes' maps — so the next run
+    /// re-baselines them as FirstRun: no alert, fresh window. Returns the
+    /// cleared row keys (deduplicated across lanes). This is the `rebaseline`
+    /// subcommand's core; the alternative was hand-editing state.json.
     pub fn clear_rows(&mut self, patterns: &[String]) -> Vec<String> {
-        let matched: Vec<String> = self
-            .rows
-            .keys()
-            .filter(|key| patterns.iter().any(|p| crate::config::star_pattern_matches(p, key)))
-            .cloned()
-            .collect();
-        for key in &matched {
-            self.rows.remove(key);
+        let mut matched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for rows in [&mut self.rows, &mut self.instr_rows] {
+            let keys: Vec<String> = rows
+                .keys()
+                .filter(|key| patterns.iter().any(|p| crate::config::star_pattern_matches(p, key)))
+                .cloned()
+                .collect();
+            for key in keys {
+                rows.remove(&key);
+                matched.insert(key);
+            }
         }
-        matched
+        matched.into_iter().collect()
     }
 
     /// Bumps the digest counter; returns `true` when it has reached
@@ -408,6 +476,72 @@ mod tests {
         assert!(state.bump_digest_counter(10), "10th commit should fire the digest");
         state.reset_digest_counter();
         assert_eq!(state.commits_since_digest, 0);
+    }
+
+    #[test]
+    fn test_pre_lane_state_file_deserializes_and_stays_byte_stable() {
+        // A state.json written before the instructions lane existed (no
+        // instr_rows key) must load unchanged...
+        let pre_lane = r#"{
+  "last_seen_sha": "abc123",
+  "commits_since_digest": 3,
+  "rows": {
+    "g/rex5/w": {
+      "recent_ratios": [2.0, 2.01],
+      "currently_regressed": false
+    }
+  }
+}"#;
+        let state: State = serde_json::from_str(pre_lane).unwrap();
+        assert_eq!(state.rows["g/rex5/w"].recent_ratios.len(), 2);
+        assert!(state.instr_rows.is_empty());
+        // ...and re-serialize without an instr_rows key while the lane is
+        // off, so lane-off state files keep their pre-lane shape.
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        assert!(!json.contains("instr_rows"), "empty instr_rows must not serialize: {json}");
+
+        // With the lane on, the key appears and round-trips.
+        let mut state = state;
+        state.check_and_record_instr("g/rex5/w", 1.5, Thresholds::uniform(2.0), 20);
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        assert!(json.contains("instr_rows"));
+        let reloaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(reloaded, state);
+    }
+
+    #[test]
+    fn test_instr_lane_history_is_independent_of_walltime() {
+        let mut state = State::default();
+        let key = "g/rex5/w";
+        // Same key, different lanes: the walltime window must not see the
+        // instructions values and vice versa.
+        for _ in 0..3 {
+            state.check_and_record(key, 2.0, Thresholds::uniform(10.0), 20);
+            state.check_and_record_instr(key, 1.0, Thresholds::uniform(2.0), 20);
+        }
+        // +5% on instructions: fires on the instructions lane...
+        assert!(matches!(
+            state.check_and_record_instr(key, 1.05, Thresholds::uniform(2.0), 20),
+            Verdict::NewRegression { .. }
+        ));
+        // ...while the walltime lane at its own level stays quiet.
+        assert_eq!(state.check_and_record(key, 2.0, Thresholds::uniform(10.0), 20), Verdict::Ok);
+        assert!(state.instr_rows[key].currently_regressed);
+        assert!(!state.rows[key].currently_regressed);
+    }
+
+    #[test]
+    fn test_clear_rows_clears_both_lanes_and_dedupes_keys() {
+        let mut state = State::default();
+        state.check_and_record("g/rex5/w", 2.0, Thresholds::uniform(10.0), 20);
+        state.check_and_record_instr("g/rex5/w", 1.0, Thresholds::uniform(2.0), 20);
+        state.check_and_record_instr("g/rex5/instr_only", 1.0, Thresholds::uniform(2.0), 20);
+
+        let cleared = state.clear_rows(&["g/*".to_string()]);
+        // The shared key is reported once, the instr-only key found too.
+        assert_eq!(cleared, vec!["g/rex5/instr_only".to_string(), "g/rex5/w".to_string()]);
+        assert!(state.rows.is_empty());
+        assert!(state.instr_rows.is_empty());
     }
 
     #[test]

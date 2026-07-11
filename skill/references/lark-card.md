@@ -20,12 +20,14 @@ its `commit_dir` is where this run's files live. Then pull exactly these fields:
 |---|---|---|
 | commit sha (short = first 7) | `latest.json` | `sha` |
 | what happened (the trigger for the card) | `<commit_dir>/events.json` | `[].type`: `regression` / `recovery` / `digest` |
-| regression detail rows | `events.json` | per event: `row_key`, `baseline_median`, `current`, `pct_over` |
-| partially-failed bench targets | `<commit_dir>/raw.json` | `failed_targets` (absent = none) |
+| regression detail rows | `events.json` | per event: `row_key`, `baseline_median`, `current`, `pct_over`, `metric` (absent = walltime, `"instructions"` = instruction-count lane) |
+| corroboration of a walltime alert | `events.json` | per walltime regression/recovery event: `instructions.{ratio_delta_pct, verdict}` — optional; `verdict`: `flat` / `up` / `down` / `missing` (wording in §2) |
+| partially-failed bench targets | `<commit_dir>/raw.json` | `failed_targets`, `instr_failed_targets` (absent = none) |
+| any row's instruction count | `raw.json` | `groups.<group>.<subject>[/<workload>].instr.{count, ratio_vs_baseline}` (absent = the instructions lane didn't run) |
 | the numbers table | `<commit_dir>/compare_table.json` | `subjects[]`, `rows[]: {item, p95_us[], headline_ratio}`, `baseline_subject`, `headline_label` |
 | any row's exact mean/ratio | `raw.json` | `groups.<group>.<subject>[/<workload>].{ns, ratio_vs_baseline}` |
-| digest data (when events has `digest`) | `<data-root>/<repo>/<event.dir>/summary.json` | `commits[]`, `rows[]: {row_key, ratios[], first, last, median}` |
-| chart images | `commit_dir` / digest dir | `compare_bars.png`, `dist_*.png`, `trend.png` (see §4) |
+| digest data (when events has `digest`) | `<data-root>/<repo>/<event.dir>/summary.json` | `commits[]`, `rows[]: {row_key, ratios[], first, last, median}`, `instr_series[]` (optional — the instructions-lane counterpart to `rows`, same shape, `null` where a commit has no instructions data) |
+| chart images | `commit_dir` / digest dir | `compare_bars.png`, `instr_bars.png`, `dist_*.png`, `trend.png`, `instr_trend.png` (see §4) |
 
 Ratio semantics: `ratio_vs_baseline` is a TIME ratio against `baseline_subject`
 (**1.0 = as fast as the baseline, 2.0 = twice as slow, <1.0 = faster**). `pct_over` is
@@ -46,6 +48,28 @@ how far the current ratio sits above the row's rolling median, in percent.
   do not post again (see `discovery.md`).
 - Show ratios with two decimals and an `×` suffix (`2.09×`); show `pct_over` signed
   (`+15.0%`). Keep the card scannable.
+- **Instructions events** (`metric: "instructions"`): treat exactly like walltime
+  ones for the color standard — any regression event is red. Counts are
+  deterministic, so there is no noise to second-guess: a latched instructions
+  regression is a real code-path change, however small the percentage. Label the
+  line with the lane (e.g. a `[instructions]` prefix) so it isn't read as a
+  walltime slowdown; `instr_failed_targets` non-empty counts as "numbers
+  incomplete" for the yellow rule, same as `failed_targets`.
+- **Corroboration line** (the optional `instructions` field on a **walltime**
+  regression/recovery event): render it as its own line right under the event
+  line — never fold it into the walltime numbers. Wording per `verdict`:
+  - 🔴 `up` — "corroborated real regression — instructions
+    {{+ratio_delta_pct}}% too". The strongest signal a card can carry.
+  - ✅ `flat` — "likely machine noise / layout effect — instructions steady
+    ({{ratio_delta_pct}}%)".
+  - ⚠️ `down` — instructions moved down past the threshold while walltime
+    rose: not corroborated, but inconclusive — show the signed delta and let
+    the reader judge.
+  - `missing` (`ratio_delta_pct: null`) — no instructions signal for this row
+    (no data this run, or no rolling median yet): write `—`, don't imply
+    corroboration either way.
+  The header color standard above is unchanged (a walltime regression stays
+  red whatever the verdict); the corroboration line only adds interpretation.
 
 ---
 
@@ -81,8 +105,10 @@ Regression example — replace every `{{…}}`:
 Recovery uses the same shape with `--template green`, a ✅ title, and
 `back to {{current}}× (median {{baseline_median}}×)` lines. Digest cards: build a table
 from `summary.json.rows` (`row_key` / `median` / `first` / `last`) and attach
-`trend.png`. If your Lark stack uses card v1: move `body.elements` to top-level
-`elements` and swap `markdown` for `div`+`lark_md`.
+`trend.png`; when the digest has `instr_series`, mirror the table for the
+instructions lane (same fields) and attach `instr_trend.png` beside it. If your
+Lark stack uses card v1: move `body.elements` to top-level `elements` and swap
+`markdown` for `div`+`lark_md`.
 
 **Mixed events in one run** (a `digest` can coincide with regressions/recoveries —
 they are independent cadences): send the regression/recovery card for the commit AND a
@@ -106,12 +132,18 @@ Lark cards cannot embed a file path — upload the PNG first
 `image_key`. Candidates, all inside the commit/digest dir:
 
 - `compare_bars.png` — relative speed per test item, baseline = 100%.
+- `instr_bars.png` — relative instruction count per test item, baseline = 100%
+  (only present when the commit has instructions data).
 - `dist_<group>_<workload>.png` — per-call distribution of an affected row
   (derive the filename from the event's `row_key`: `dist_<group>_<workload>.png`
   with `/` → `_`, subject dropped; a row with no workload part is just
   `dist_<group>.png`).
 - `trend.png` (digest dir) — headline ratios across the window, red rings on
   threshold-tripping points.
+- `instr_trend.png` (digest dir) — the instructions lane's trend, same style
+  (rings on instructions-threshold-tripping points; commits without
+  instructions data are gaps). The natural attachment for an
+  instructions-event card.
 
 Flame-graph SVGs (`flame/<day>/`) are archive-only and not embeddable; if you ever
 share them, post as file messages.
@@ -151,5 +183,7 @@ From the reporter's own verified end-to-end run (minibench, sha `cef2a4d`):
       `summary.json` — nothing from memory.
 - [ ] Header color follows §2 (red/yellow/green standard).
 - [ ] One line per event, sorted by `pct_over` descending, signs and `×` correct.
+- [ ] Walltime event lines carry their corroboration wording (§2) when the
+      event has the `instructions` field.
 - [ ] `img_key` came from uploading **this run's** image.
 - [ ] `latest.json.sha` differs from the last sha you posted; record it after sending.

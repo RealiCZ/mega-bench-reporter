@@ -16,6 +16,7 @@
 //! of truth; PNGs are derived artifacts.
 
 use crate::criterion_results::WorkloadRatios;
+use crate::instructions::{InstrCollection, InstrRow, InstrWorkloadRatios};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -30,6 +31,21 @@ pub struct RowRecord {
     /// `mean_ns / baseline mean_ns` for the same `(group, workload)`;
     /// `None` when the group/workload has no baseline row. The baseline
     /// subject's name is recorded at the record level (`baseline_subject`).
+    pub ratio_vs_baseline: Option<f64>,
+    /// Instruction-count numbers; absent (not `null`) when the instructions
+    /// lane was off or produced nothing for this row, so lane-off records are
+    /// byte-identical to pre-lane ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instr: Option<InstrRecord>,
+}
+
+/// One row's instruction-count numbers inside `raw.json` (`instr` field).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InstrRecord {
+    /// CPU instructions retired (callgrind `Ir`) for one traced iteration.
+    pub count: u64,
+    /// `count / baseline count` for the same `(group, workload)`; `None`
+    /// when the group/workload has no baseline count.
     pub ratio_vs_baseline: Option<f64>,
 }
 
@@ -48,6 +64,10 @@ pub struct CommitRecord {
     /// silently dropped; their rows are simply absent from `groups`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed_targets: Vec<String>,
+    /// Bench targets whose instructions-lane build/run failed. Absent when
+    /// the lane is off or every target collected fine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instr_failed_targets: Option<Vec<String>>,
     /// `group -> row ("subject" or "subject/workload") -> numbers`.
     pub groups: BTreeMap<String, BTreeMap<String, RowRecord>>,
 }
@@ -60,6 +80,7 @@ impl CommitRecord {
             rustc,
             baseline_subject,
             failed_targets: Vec::new(),
+            instr_failed_targets: None,
             groups: BTreeMap::new(),
         }
     }
@@ -71,10 +92,67 @@ impl CommitRecord {
             for row in &wl.rows {
                 group.insert(
                     row_name(&row.subject, &wl.workload),
-                    RowRecord { ns: row.mean_ns, ratio_vs_baseline: row.ratio_vs_baseline },
+                    RowRecord {
+                        ns: row.mean_ns,
+                        ratio_vs_baseline: row.ratio_vs_baseline,
+                        instr: None,
+                    },
                 );
             }
         }
+    }
+
+    /// Attaches the instructions lane's counts/ratios to existing rows. A
+    /// count whose row the walltime lane did not produce (e.g. its walltime
+    /// target failed while the instrumented run succeeded) has no `RowRecord`
+    /// to attach to — `ns` is a required field of the stable schema — and is
+    /// skipped with a stderr note; its history is still tracked in
+    /// `state.json`.
+    pub fn add_instr_ratios(&mut self, ratios: &[InstrWorkloadRatios]) {
+        for wl in ratios {
+            for row in &wl.rows {
+                let name = row_name(&row.subject, &wl.workload);
+                match self.groups.get_mut(&wl.group).and_then(|g| g.get_mut(&name)) {
+                    Some(record) => {
+                        record.instr = Some(InstrRecord {
+                            count: row.count,
+                            ratio_vs_baseline: row.ratio_vs_baseline,
+                        });
+                    }
+                    None => eprintln!(
+                        "instructions lane: no walltime row for {}/{name} — count not recorded \
+                         in raw.json",
+                        wl.group
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Reconstructs the instructions collection embedded in this record's
+    /// rows — the carry-forward source for `--skip-bench` regeneration, which
+    /// never re-collects the lane. The row-name split is lossless because a
+    /// subject never contains `/` (criterion's function_id splits at the
+    /// FIRST `/`, exactly like this). `None` when the record carries no
+    /// instructions data at all, so a walltime-only record regenerates
+    /// byte-identically to today.
+    pub fn instr_collection(&self) -> Option<InstrCollection> {
+        let mut rows = Vec::new();
+        for (group, group_rows) in &self.groups {
+            for (name, row) in group_rows {
+                let Some(instr) = &row.instr else { continue };
+                let (subject, workload) = match name.split_once('/') {
+                    Some((subject, workload)) => (subject.to_string(), workload.to_string()),
+                    None => (name.clone(), String::new()),
+                };
+                rows.push(InstrRow { group: group.clone(), subject, workload, count: instr.count });
+            }
+        }
+        let failed_targets = self.instr_failed_targets.clone().unwrap_or_default();
+        if rows.is_empty() && failed_targets.is_empty() {
+            return None;
+        }
+        Some(InstrCollection { rows, failed_targets })
     }
 
     pub fn short_sha(&self) -> &str {
@@ -164,6 +242,26 @@ impl RepoStore {
         std::fs::create_dir_all(&dir)?;
         write_atomic(&dir.join("raw.json"), &serde_json::to_string_pretty(record)?)?;
         Ok(dir)
+    }
+
+    /// Loads the stored `raw.json` for one commit's directory (located by
+    /// `record`'s date + sha, the same way [`Self::commit_dir`] names it).
+    /// `Ok(None)` = nothing stored there yet; `Err` = a raw.json is present
+    /// but unreadable or unparseable — the `--skip-bench` carry-forward
+    /// caller warns and regenerates without it instead of failing.
+    pub fn load_commit_record(
+        &self,
+        record: &CommitRecord,
+    ) -> anyhow::Result<Option<CommitRecord>> {
+        let path = self.commit_dir(record)?.join("raw.json");
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+        let parsed = serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
+        Ok(Some(parsed))
     }
 
     /// Loads every `commits/*/raw.json`, sorted by record date (oldest first).
@@ -316,6 +414,144 @@ mod tests {
             CommitRecord::new(sha.into(), date.into(), "rustc 1.86.0".into(), "revm_pinned".into());
         r.add_ratios(&sample_ratios());
         r
+    }
+
+    /// `raw.json` bytes for a lane-off record, captured by serializing this
+    /// exact record with the pre-instructions-lane code. Guards the core
+    /// compatibility contract: with the lane off, the record must serialize
+    /// byte-identically to before the lane existed.
+    const PRE_LANE_GOLDEN: &str = r#"{
+  "commit": "abcdef0123456789abcdef0123456789abcdef01",
+  "date": "2026-07-02T10:00:00Z",
+  "rustc": "rustc 1.86.0 (05f9846f8 2025-03-31)",
+  "baseline_subject": "revm_pinned",
+  "failed_targets": [
+    "block_bench"
+  ],
+  "groups": {
+    "empty_transaction": {
+      "rex5": {
+        "ns": 9000.0,
+        "ratio_vs_baseline": null
+      }
+    },
+    "salt_dynamic_gas": {
+      "revm_pinned/sstore_100": {
+        "ns": 14000.0,
+        "ratio_vs_baseline": 1.0
+      },
+      "rex5_salt/sstore_100": {
+        "ns": 28000.0,
+        "ratio_vs_baseline": 2.0
+      }
+    }
+  }
+}"#;
+
+    #[test]
+    fn test_lane_off_record_serializes_byte_identical_to_pre_lane_golden() {
+        let mut record = CommitRecord::new(
+            "abcdef0123456789abcdef0123456789abcdef01".into(),
+            "2026-07-02T10:00:00Z".into(),
+            "rustc 1.86.0 (05f9846f8 2025-03-31)".into(),
+            "revm_pinned".into(),
+        );
+        record.add_ratios(&sample_ratios());
+        record.failed_targets = vec!["block_bench".to_string()];
+        assert_eq!(serde_json::to_string_pretty(&record).unwrap(), PRE_LANE_GOLDEN);
+        // And a pre-lane file (no instr fields) still deserializes.
+        let parsed: CommitRecord = serde_json::from_str(PRE_LANE_GOLDEN).unwrap();
+        assert_eq!(parsed, record);
+    }
+
+    #[test]
+    fn test_instr_ratios_attach_to_rows_and_roundtrip() {
+        let mut record = record("abcdef0123456789", "2026-07-02T10:00:00Z");
+        record.add_instr_ratios(&[
+            InstrWorkloadRatios {
+                group: "salt_dynamic_gas".into(),
+                workload: "sstore_100".into(),
+                rows: vec![crate::instructions::InstrRatioRow {
+                    subject: "rex5_salt".into(),
+                    count: 25_000,
+                    ratio_vs_baseline: Some(2.5),
+                }],
+            },
+            // A count without a walltime row is skipped, not a panic and not
+            // a phantom RowRecord.
+            InstrWorkloadRatios {
+                group: "missing_group".into(),
+                workload: String::new(),
+                rows: vec![crate::instructions::InstrRatioRow {
+                    subject: "rex5".into(),
+                    count: 1,
+                    ratio_vs_baseline: None,
+                }],
+            },
+        ]);
+        let row = &record.groups["salt_dynamic_gas"]["rex5_salt/sstore_100"];
+        assert_eq!(row.instr, Some(InstrRecord { count: 25_000, ratio_vs_baseline: Some(2.5) }));
+        // The sibling row without instr data keeps its plain shape.
+        assert_eq!(record.groups["salt_dynamic_gas"]["revm_pinned/sstore_100"].instr, None);
+        assert!(!record.groups.contains_key("missing_group"));
+
+        let json = serde_json::to_string_pretty(&record).unwrap();
+        let parsed: CommitRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, record);
+    }
+
+    #[test]
+    fn test_instr_collection_reconstructs_rows_and_failed_targets() {
+        // The carry-forward source: counts come back with the exact
+        // (group, subject, workload) triples they were stored under —
+        // including a bare row (no workload) — plus the failure markers.
+        let mut rec = record("abcdef0123456789", "2026-07-02T10:00:00Z");
+        rec.add_instr_ratios(&[
+            InstrWorkloadRatios {
+                group: "salt_dynamic_gas".into(),
+                workload: "sstore_100".into(),
+                rows: vec![crate::instructions::InstrRatioRow {
+                    subject: "rex5_salt".into(),
+                    count: 25_000,
+                    ratio_vs_baseline: Some(2.5),
+                }],
+            },
+            InstrWorkloadRatios {
+                group: "empty_transaction".into(),
+                workload: String::new(),
+                rows: vec![crate::instructions::InstrRatioRow {
+                    subject: "rex5".into(),
+                    count: 9_000,
+                    ratio_vs_baseline: None,
+                }],
+            },
+        ]);
+        rec.instr_failed_targets = Some(vec!["block_bench".to_string()]);
+
+        let collection = rec.instr_collection().expect("instr data present");
+        assert_eq!(collection.failed_targets, vec!["block_bench".to_string()]);
+        let mut rows = collection.rows;
+        rows.sort_by(|a, b| (&a.group, &a.subject).cmp(&(&b.group, &b.subject)));
+        assert_eq!(
+            rows,
+            vec![
+                InstrRow {
+                    group: "empty_transaction".into(),
+                    subject: "rex5".into(),
+                    workload: String::new(),
+                    count: 9_000,
+                },
+                InstrRow {
+                    group: "salt_dynamic_gas".into(),
+                    subject: "rex5_salt".into(),
+                    workload: "sstore_100".into(),
+                    count: 25_000,
+                },
+            ]
+        );
+
+        // A record without any instructions data has nothing to carry.
+        assert_eq!(record("abcdef0123456789", "2026-07-02T10:00:00Z").instr_collection(), None);
     }
 
     #[test]
