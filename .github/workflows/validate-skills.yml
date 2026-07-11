@@ -1,0 +1,27 @@
+# Keeps skills/ honest: registry.json conforms to registry.schema.json, every
+# skills/<id>/SKILL.md is registered (and vice versa), frontmatter follows the
+# discovery conventions, and all relative markdown links resolve.
+# Mirrors loop-engineering's validate-patterns gate; stdlib-only, no installs.
+name: validate-skills
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "skills/**"
+      - "scripts/validate_skills.py"
+      - ".github/workflows/validate-skills.yml"
+  pull_request:
+    paths:
+      - "skills/**"
+      - "scripts/validate_skills.py"
+      - ".github/workflows/validate-skills.yml"
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate skills registry, frontmatter, and links
+        run: python3 scripts/validate_skills.py

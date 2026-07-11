@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mega-bench-reporter skills registry",
+  "description": "Machine-readable index of the repo's agent skills. One entry per skills/<id>/ directory; CI keeps the two in sync. Descriptions live in each SKILL.md's frontmatter, never here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["skills"],
+  "properties": {
+    "skills": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "audience", "platform"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*$",
+            "description": "Directory name under skills/; must equal the SKILL.md frontmatter name"
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["contract", "runbook"],
+            "description": "contract = consumed continuously (data/API semantics); runbook = executed step-by-step with verification gates"
+          },
+          "audience": {
+            "type": "string",
+            "enum": ["consumer-agent", "operator-agent", "human"],
+            "description": "Who is expected to follow this skill"
+          },
+          "platform": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "enum": ["any", "linux", "macos"] },
+            "description": "Where the skill's instructions can actually be executed"
+          },
+          "requires": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 },
+            "description": "Host-provisioned tools the skill assumes; omit when none beyond the repo itself"
+          }
+        }
+      }
+    }
+  }
+}
