@@ -48,20 +48,28 @@ jobs:
             if [ -x "$d/codspeed" ]; then echo "$d" >> "$GITHUB_PATH"; fi
           done
       - name: Verify toolchain and set up valgrind
+        env:
+          # The runner's local logger swallows output in non-TTY contexts at
+          # the default level — force verbose plain logs so failures are
+          # diagnosable from the CI log.
+          CODSPEED_LOG: debug
         run: |
           command -v codspeed || { echo '::error::codspeed binary not found after install.sh'; find "$HOME" -maxdepth 4 -name codspeed -type f 2>/dev/null; exit 1; }
           codspeed --version
           cargo codspeed --version
-          # Installing the valgrind fork is a system-level operation — plain
-          # `codspeed setup` exits 1 silently without root. sudo drops the
-          # user PATH, hence the resolved absolute path.
-          sudo "$(command -v codspeed)" setup
-          valgrind --version
+          # Best-effort: `codspeed run` performs executor setup itself; this
+          # explicit pass just surfaces setup diagnostics early. Root because
+          # installing the valgrind fork is a system-level operation.
+          sudo --preserve-env=CODSPEED_LOG "$(command -v codspeed)" setup || echo "::warning::explicit codspeed setup exited $? — relying on codspeed run's own setup"
+          codspeed setup status || true
+          valgrind --version || true
       - name: Build fixture benches under instrumentation
         working-directory: fixtures/codspeed-canary
         run: cargo codspeed build
       - name: Collect profiles offline (the lane's exact invocation)
         working-directory: fixtures/codspeed-canary
+        env:
+          CODSPEED_LOG: debug
         run: |
           PROF="$RUNNER_TEMP/canary-profiles"
           mkdir -p "$PROF"
