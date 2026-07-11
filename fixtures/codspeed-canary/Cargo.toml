@@ -1,0 +1,24 @@
+# Toolchain canary fixture: the smallest crate that exercises the exact
+# collection pipeline the instructions lane runs on the production host
+# (cargo codspeed build -> codspeed run --skip-upload -> callgrind profiles).
+# Deliberately NOT version-pinned to codspeed-criterion-compat beyond the
+# major, and no Cargo.lock is committed: the weekly canary must resolve the
+# LATEST toolchain so upstream drift fails here before it reaches the host.
+[package]
+name = "codspeed-canary"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+criterion = { package = "codspeed-criterion-compat", version = "5", default-features = false }
+
+[[bench]]
+name = "canary"
+harness = false
+
+# Detach from any enclosing workspace so the reporter's own cargo commands
+# never build or lock this crate.
+[workspace]

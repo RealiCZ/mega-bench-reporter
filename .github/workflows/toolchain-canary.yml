@@ -1,0 +1,84 @@
+# Weekly early-warning for the instructions lane's #1 accepted risk: the
+# CodSpeed runner's --skip-upload flag is a hidden debug flag and the profile
+# folder layout is an undocumented internal. This job installs the LATEST
+# toolchain (deliberately unpinned, unlike the pinned production host), runs
+# the exact offline collection pipeline the lane uses against a tiny fixture
+# crate, and parses the profiles with the reporter's own parser. Upstream
+# drift turns this red (and opens an issue) before it can reach mega-engineer.
+name: toolchain-canary
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "fixtures/codspeed-canary/**"
+      - "examples/parse_profile_dir.rs"
+      - "src/instructions.rs"
+      - ".github/workflows/toolchain-canary.yml"
+
+permissions:
+  contents: read
+  issues: write # for the on-failure alert issue (scheduled runs only)
+
+concurrency:
+  group: toolchain-canary-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  canary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install latest cargo-codspeed (unpinned by design)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-codspeed
+      - name: Install latest codspeed CLI (the runbook's install path)
+        run: |
+          curl -fsSL https://codspeed.io/install.sh | bash
+          # The install script's target dir is not contractual; cover the
+          # plausible locations and fail visibly if none has the binary —
+          # an install-path change upstream is itself canary-worthy drift.
+          for d in "$HOME/.codspeed/bin" "$HOME/.codspeed" "$HOME/.local/bin" /usr/local/bin; do
+            if [ -x "$d/codspeed" ]; then echo "$d" >> "$GITHUB_PATH"; fi
+          done
+      - name: Verify toolchain and set up valgrind
+        run: |
+          command -v codspeed || { echo '::error::codspeed binary not found after install.sh'; find "$HOME" -maxdepth 4 -name codspeed -type f 2>/dev/null; exit 1; }
+          codspeed --version
+          cargo codspeed --version
+          codspeed setup
+      - name: Build fixture benches under instrumentation
+        working-directory: fixtures/codspeed-canary
+        run: cargo codspeed build
+      - name: Collect profiles offline (the lane's exact invocation)
+        working-directory: fixtures/codspeed-canary
+        run: |
+          PROF="$RUNNER_TEMP/canary-profiles"
+          mkdir -p "$PROF"
+          echo "PROF=$PROF" >> "$GITHUB_ENV"
+          codspeed run --skip-upload --mode simulation --profile-folder "$PROF" -- cargo codspeed run
+          ls -la "$PROF"
+      - name: Parse profiles with the reporter's parser
+        run: cargo run --release --locked --example parse_profile_dir -- "$PROF"
+      - name: Open an alert issue on scheduled failure
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          existing=$(gh issue list --label toolchain-canary --state open --json number --jq length)
+          if [ "$existing" = "0" ]; then
+            gh issue create \
+              --title "toolchain-canary: latest CodSpeed toolchain broke offline collection" \
+              --label toolchain-canary \
+              --body "The weekly canary failed against the LATEST codspeed CLI / cargo-codspeed: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+Do NOT upgrade the toolchain on the production host until this is understood (the host stays on the pinned versions from skills/provision-instructions-lane). Likely drift points: --skip-upload flag, profile folder layout, callgrind file format (creator line), install.sh location."
+          else
+            echo "open canary issue already exists — not duplicating"
+          fi
