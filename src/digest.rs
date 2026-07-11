@@ -4,7 +4,8 @@
 
 use crate::charts::{self, TrendSeries};
 use crate::config::star_pattern_matches;
-use crate::storage::{short_sha, CommitRecord, RepoStore};
+use crate::lane::Lane;
+use crate::storage::{short_sha, CommitRecord, RepoStore, RowRecord};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -38,6 +39,13 @@ pub struct DigestSummary {
     pub rows: Vec<SummaryRow>,
     /// Union of the window's failed bench targets (deduped, sorted).
     pub failed_targets: Vec<String>,
+    /// The instructions lane's counterpart to `rows`: same structure, each
+    /// `ratios` value the commit's instructions `ratio_vs_baseline` (`null`
+    /// for commits without instructions data). `None` — omitted from the JSON,
+    /// keeping lane-off digests byte-identical — when no window commit carries
+    /// any instructions ratio for a headline row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instr_series: Option<Vec<SummaryRow>>,
 }
 
 fn median_of(values: &[f64]) -> Option<f64> {
@@ -50,14 +58,17 @@ fn median_of(values: &[f64]) -> Option<f64> {
     Some(if n % 2 == 1 { sorted[n / 2] } else { (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0 })
 }
 
-/// Extracts the headline rows' ratio series from the window's records.
-pub fn build_summary(
+/// One lane's headline-row series across the window: `row_key -> per-commit
+/// value` (null-padded to the window length, aligned to `records`' order),
+/// then table-ready `SummaryRow`s sorted by median descending. `value_of`
+/// pulls the lane's scalar out of a stored row — `ratio_vs_baseline` for the
+/// walltime series, the nested instructions ratio for the instructions one. A
+/// row that never has a value in the window does not appear.
+fn collect_series(
     records: &[CommitRecord],
-    is_headline: impl Fn(&str) -> bool,
-) -> DigestSummary {
-    let commits: Vec<String> = records.iter().map(|r| r.commit.clone()).collect();
-
-    // row_key -> per-commit ratios.
+    is_headline: &impl Fn(&str) -> bool,
+    value_of: impl Fn(&RowRecord) -> Option<f64>,
+) -> Vec<SummaryRow> {
     let mut series: BTreeMap<String, Vec<Option<f64>>> = BTreeMap::new();
     for (i, record) in records.iter().enumerate() {
         for (group, rows) in &record.groups {
@@ -66,10 +77,10 @@ pub fn build_summary(
                 if !is_headline(subject) {
                     continue;
                 }
-                let Some(ratio) = row.ratio_vs_baseline else { continue };
+                let Some(value) = value_of(row) else { continue };
                 series
                     .entry(format!("{group}/{row_name}"))
-                    .or_insert_with(|| vec![None; records.len()])[i] = Some(ratio);
+                    .or_insert_with(|| vec![None; records.len()])[i] = Some(value);
             }
         }
     }
@@ -93,6 +104,25 @@ pub fn build_summary(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.row_key.cmp(&b.row_key))
     });
+    rows
+}
+
+/// Extracts the headline rows' ratio series from the window's records — the
+/// walltime `rows` plus, when any commit carries instructions data for a
+/// headline row, the instructions `instr_series`.
+pub fn build_summary(
+    records: &[CommitRecord],
+    is_headline: impl Fn(&str) -> bool,
+) -> DigestSummary {
+    let commits: Vec<String> = records.iter().map(|r| r.commit.clone()).collect();
+
+    let rows = collect_series(records, &is_headline, |row| row.ratio_vs_baseline);
+    let instr_rows = collect_series(records, &is_headline, |row| {
+        row.instr.as_ref().and_then(|i| i.ratio_vs_baseline)
+    });
+    // Present only when the lane produced at least one non-null headline point
+    // in the window — otherwise omitted so lane-off digests stay byte-stable.
+    let instr_series = (!instr_rows.is_empty()).then_some(instr_rows);
 
     let mut failed: Vec<String> =
         records.iter().flat_map(|r| r.failed_targets.iter().cloned()).collect();
@@ -105,6 +135,7 @@ pub fn build_summary(
         commits,
         rows,
         failed_targets: failed,
+        instr_series,
     }
 }
 
@@ -134,50 +165,60 @@ pub struct DigestOutcome {
     pub dir: PathBuf,
 }
 
-/// Writes a window's `summary.json` + `trend.png` into `dir` — shared by the
-/// automatic digest and the manual `trend` subcommand.
-fn write_window_artifacts(
-    dir: &Path,
-    title: &str,
-    regression_threshold_pct: f64,
-    records: &[CommitRecord],
-    summary: &DigestSummary,
-) -> anyhow::Result<()> {
+/// Writes a window's `summary.json` into `dir` (created if needed) — shared by
+/// the automatic digest and the manual `trend` subcommand.
+fn write_summary_json(dir: &Path, summary: &DigestSummary) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
     std::fs::write(dir.join("summary.json"), serde_json::to_string_pretty(summary)?)?;
+    Ok(())
+}
 
-    // Trend chart: the biggest-overhead rows (summary is sorted by median
-    // descending), capped so the chart stays readable.
+/// Renders one lane's trend PNG from its `SummaryRow`s: the biggest-overhead
+/// rows (already sorted by median descending), capped so the chart stays
+/// readable, with red rings on the points that tripped `threshold_pct` vs the
+/// window's prior median. `y_desc` names the value axis for the lane.
+fn render_trend_png(
+    path: &Path,
+    title: &str,
+    y_desc: &str,
+    records: &[CommitRecord],
+    rows: &[SummaryRow],
+    threshold_pct: f64,
+) -> anyhow::Result<()> {
     let commit_labels: Vec<String> = records.iter().map(|r| r.short_sha().to_string()).collect();
-    let trend_series: Vec<TrendSeries> = summary
-        .rows
+    let trend_series: Vec<TrendSeries> = rows
         .iter()
         .take(TREND_MAX_SERIES)
         .map(|row| TrendSeries {
             label: row.row_key.clone(),
             ratios: row.ratios.clone(),
-            alerts: alert_markers(&row.ratios, regression_threshold_pct),
+            alerts: alert_markers(&row.ratios, threshold_pct),
         })
         .collect();
-    let baseline_subject = &records.last().expect("non-empty window").baseline_subject;
-    charts::render_trend(
-        &dir.join("trend.png"),
-        title,
-        baseline_subject,
-        &commit_labels,
-        &trend_series,
-    )
+    charts::render_trend(path, title, y_desc, &commit_labels, &trend_series)
 }
 
-/// Builds the digest directory (`summary.json` + `trend.png`) from the
+/// The walltime trend chart's y-axis label for `baseline`.
+fn walltime_y_desc(baseline: &str) -> String {
+    format!("time ratio vs {baseline} — lower is better")
+}
+
+/// The instructions trend chart's y-axis label for `baseline`.
+fn instr_y_desc(baseline: &str) -> String {
+    format!("instruction ratio vs {baseline} — lower is better")
+}
+
+/// Builds the digest directory (`summary.json` + `trend.png`, plus
+/// `instr_trend.png` when the window carries instructions data) from the
 /// window's records (oldest first). Pure data — the consumer composes its own
-/// report from `summary.json` and the chart.
+/// report from `summary.json` and the charts.
 pub fn build_digest(
     store: &RepoStore,
     repo_name: &str,
     headline_label: &str,
     is_headline: impl Fn(&str) -> bool,
     regression_threshold_pct: f64,
+    instr_regression_threshold_pct: f64,
     records: &[CommitRecord],
 ) -> anyhow::Result<DigestOutcome> {
     if records.is_empty() {
@@ -194,7 +235,29 @@ pub fn build_digest(
     let last = records.last().expect("non-empty");
     let dir = store.digest_dir(&last.day()?, &summary.first_commit, &summary.last_commit);
     let title = format!("{repo_name} headline ({headline_label}) — last {} commits", records.len());
-    write_window_artifacts(&dir, &title, regression_threshold_pct, records, &summary)?;
+    let baseline = &last.baseline_subject;
+    write_summary_json(&dir, &summary)?;
+    render_trend_png(
+        &dir.join("trend.png"),
+        &title,
+        &walltime_y_desc(baseline),
+        records,
+        &summary.rows,
+        regression_threshold_pct,
+    )?;
+    // The instructions trend rides alongside whenever the window has any
+    // instructions data — same chart style, instructions thresholds for the
+    // red rings, `null` commits drawn as gaps.
+    if let Some(instr_rows) = &summary.instr_series {
+        render_trend_png(
+            &dir.join("instr_trend.png"),
+            &format!("{title} — instructions"),
+            &instr_y_desc(baseline),
+            records,
+            instr_rows,
+            instr_regression_threshold_pct,
+        )?;
+    }
     Ok(DigestOutcome { dir })
 }
 
@@ -228,6 +291,7 @@ pub fn select_window(
     Ok(records.drain(lo..=hi).collect())
 }
 
+#[derive(Debug)]
 pub struct TrendOutcome {
     pub dir: PathBuf,
     /// Row keys that made it into `summary.json`, biggest median first.
@@ -246,13 +310,20 @@ pub struct TrendRequest<'a> {
 
 /// The manual counterpart of the digest: charts an arbitrary window of
 /// already-stored records into `trends/` (or `request.out`). Read-only — no
-/// bench, no state, no events, no digest counter.
+/// bench, no state, no events, no digest counter. `metric` picks the lane:
+/// `Walltime` renders `trend.png` (errors when the window has no walltime
+/// headline ratios), `Instructions` renders `instr_trend.png` (errors when the
+/// window has no instructions data). `summary.json` carries both series
+/// regardless, so the JSON is the full picture either way.
+#[allow(clippy::too_many_arguments)]
 pub fn build_adhoc_trend(
     store: &RepoStore,
     repo_name: &str,
     headline_label: &str,
     is_headline: impl Fn(&str) -> bool,
     regression_threshold_pct: f64,
+    instr_regression_threshold_pct: f64,
+    metric: Lane,
     records: &[CommitRecord],
     request: TrendRequest<'_>,
 ) -> anyhow::Result<TrendOutcome> {
@@ -268,10 +339,17 @@ pub fn build_adhoc_trend(
         (build_summary(records, |_| true), row_patterns.join(", "))
     };
     if !row_patterns.is_empty() {
-        summary.rows.retain(|r| row_patterns.iter().any(|p| star_pattern_matches(p, &r.row_key)));
+        let matches =
+            |r: &SummaryRow| row_patterns.iter().any(|p| star_pattern_matches(p, &r.row_key));
+        summary.rows.retain(matches);
+        if let Some(instr) = summary.instr_series.as_mut() {
+            instr.retain(matches);
+        }
     }
-    if summary.rows.is_empty() {
-        anyhow::bail!("no '{scope}' rows with a baseline ratio in the requested window");
+    // A row filter that emptied the instructions series drops it entirely, so
+    // the `Instructions` metric's empty-window check below fires correctly.
+    if summary.instr_series.as_ref().is_some_and(|s| s.is_empty()) {
+        summary.instr_series = None;
     }
 
     let last = records.last().expect("non-empty");
@@ -279,24 +357,59 @@ pub fn build_adhoc_trend(
         Some(dir) => dir,
         None => store.trend_dir(&last.day()?, &summary.first_commit, &summary.last_commit),
     };
-    let title = format!(
-        "{repo_name} ({scope}) — {}..{} ({} commits)",
-        short_sha(&summary.first_commit),
-        short_sha(&summary.last_commit),
-        records.len()
-    );
-    write_window_artifacts(&dir, &title, regression_threshold_pct, records, &summary)?;
-    Ok(TrendOutcome {
-        dir,
-        rows: summary.rows.iter().map(|r| r.row_key.clone()).collect(),
-        commits: summary.commits.clone(),
-    })
+    let baseline = &last.baseline_subject;
+    let first7 = short_sha(&summary.first_commit).to_string();
+    let last7 = short_sha(&summary.last_commit).to_string();
+    let n = records.len();
+
+    // The chosen lane drives the empty-window error, which chart is drawn, and
+    // the returned row list; `summary.json` (both series) is written either way.
+    let chart_rows: Vec<String> = match metric {
+        Lane::Walltime => {
+            if summary.rows.is_empty() {
+                anyhow::bail!("no '{scope}' rows with a baseline ratio in the requested window");
+            }
+            write_summary_json(&dir, &summary)?;
+            let title = format!("{repo_name} ({scope}) — {first7}..{last7} ({n} commits)");
+            render_trend_png(
+                &dir.join("trend.png"),
+                &title,
+                &walltime_y_desc(baseline),
+                records,
+                &summary.rows,
+                regression_threshold_pct,
+            )?;
+            summary.rows.iter().map(|r| r.row_key.clone()).collect()
+        }
+        Lane::Instructions => {
+            let Some(instr_rows) = summary.instr_series.as_ref() else {
+                anyhow::bail!(
+                    "no '{scope}' rows with an instructions ratio in the requested window — \
+                     is the instructions lane enabled for these commits?"
+                );
+            };
+            write_summary_json(&dir, &summary)?;
+            let title =
+                format!("{repo_name} ({scope}) — instructions — {first7}..{last7} ({n} commits)");
+            render_trend_png(
+                &dir.join("instr_trend.png"),
+                &title,
+                &instr_y_desc(baseline),
+                records,
+                instr_rows,
+                instr_regression_threshold_pct,
+            )?;
+            instr_rows.iter().map(|r| r.row_key.clone()).collect()
+        }
+    };
+
+    Ok(TrendOutcome { dir, rows: chart_rows, commits: summary.commits.clone() })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::RowRecord;
+    use crate::storage::{InstrRecord, RowRecord};
 
     fn record_with(
         sha: &str,
@@ -347,6 +460,27 @@ mod tests {
 
     fn rex5_family(subject: &str) -> bool {
         subject == "rex5" || subject.starts_with("rex5_")
+    }
+
+    /// Like [`window`], but the `rex5_salt` headline row also carries
+    /// instructions ratios on even-indexed commits — odd commits have no
+    /// instructions data, so their positions must fall out as `null` in the
+    /// instructions series (the null-padding contract).
+    fn window_with_instr() -> Vec<CommitRecord> {
+        let mut records = window();
+        for (i, record) in records.iter_mut().enumerate() {
+            if i % 2 != 0 {
+                continue;
+            }
+            let salt = record
+                .groups
+                .get_mut("salt_dynamic_gas")
+                .unwrap()
+                .get_mut("rex5_salt/sstore_100")
+                .unwrap();
+            salt.instr = Some(InstrRecord { count: 25_000, ratio_vs_baseline: Some(2.5) });
+        }
+        records
     }
 
     #[test]
@@ -400,6 +534,8 @@ mod tests {
             "rex5, rex5_*",
             rex5_family,
             10.0,
+            2.0,
+            Lane::Walltime,
             &records,
             TrendRequest { row_patterns: &["salt_dynamic_gas/rex4/*".to_string()], out: None },
         )
@@ -417,6 +553,8 @@ mod tests {
             "rex5, rex5_*",
             rex5_family,
             10.0,
+            2.0,
+            Lane::Walltime,
             &records,
             TrendRequest { row_patterns: &[], out: None },
         )
@@ -430,10 +568,122 @@ mod tests {
             "rex5, rex5_*",
             rex5_family,
             10.0,
+            2.0,
+            Lane::Walltime,
             &records,
             TrendRequest { row_patterns: &["nope/*".to_string()], out: None },
         )
         .is_err());
+    }
+
+    #[test]
+    fn test_build_summary_instr_series_null_padding_and_omission() {
+        // Lane off (no instr anywhere): instr_series is None and omitted from
+        // the serialized summary, keeping lane-off digests byte-stable.
+        let summary = build_summary(&window(), rex5_family);
+        assert!(summary.instr_series.is_none());
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(!json.contains("instr_series"), "lane-off summary must not mention it: {json}");
+
+        // Lane on for even commits only: the instructions series carries the
+        // salt row, null-padded at the odd commits with no instructions data.
+        let summary = build_summary(&window_with_instr(), rex5_family);
+        let instr = summary.instr_series.expect("instr_series present");
+        let salt = instr
+            .iter()
+            .find(|r| r.row_key == "salt_dynamic_gas/rex5_salt/sstore_100")
+            .expect("salt row in instr_series");
+        assert_eq!(salt.ratios.len(), 10, "aligned to the same commits as rows");
+        for (i, ratio) in salt.ratios.iter().enumerate() {
+            if i % 2 == 0 {
+                assert_eq!(*ratio, Some(2.5), "commit {i} has instructions data");
+            } else {
+                assert_eq!(*ratio, None, "commit {i} has no instructions data → null");
+            }
+        }
+        // The non-instrumented rex5 headline row is absent from instr_series.
+        assert!(instr.iter().all(|r| r.row_key != "empty_transaction/rex5"));
+    }
+
+    #[test]
+    fn test_build_digest_renders_instr_trend_only_with_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RepoStore::new(tmp.path(), "mega-evm");
+
+        // Lane off: trend.png only, no instr_trend.png, no instr_series key.
+        let off =
+            build_digest(&store, "mega-evm", "rex5, rex5_*", rex5_family, 10.0, 2.0, &window())
+                .unwrap();
+        assert!(off.dir.join("trend.png").is_file());
+        assert!(!off.dir.join("instr_trend.png").exists());
+        let summary: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(off.dir.join("summary.json")).unwrap())
+                .unwrap();
+        assert!(summary.get("instr_series").is_none());
+
+        // Lane on: both charts, and summary.json carries instr_series.
+        let on = build_digest(
+            &store,
+            "mega-evm",
+            "rex5, rex5_*",
+            rex5_family,
+            10.0,
+            2.0,
+            &window_with_instr(),
+        )
+        .unwrap();
+        assert!(on.dir.join("trend.png").is_file());
+        assert!(on.dir.join("instr_trend.png").is_file());
+        let summary: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(on.dir.join("summary.json")).unwrap())
+                .unwrap();
+        assert!(summary["instr_series"].is_array());
+    }
+
+    #[test]
+    fn test_build_adhoc_trend_metric_instructions_happy_and_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RepoStore::new(tmp.path(), "mega-evm");
+
+        // Happy path: instructions data present → instr_trend.png + a
+        // summary.json carrying instr_series; only the chosen lane's chart is
+        // drawn (no trend.png), and the returned rows are the instr series.
+        let ok = build_adhoc_trend(
+            &store,
+            "mega-evm",
+            "rex5, rex5_*",
+            rex5_family,
+            10.0,
+            2.0,
+            Lane::Instructions,
+            &window_with_instr(),
+            TrendRequest { row_patterns: &[], out: None },
+        )
+        .unwrap();
+        assert!(ok.dir.join("instr_trend.png").is_file());
+        assert!(!ok.dir.join("trend.png").exists());
+        assert!(ok.dir.join("summary.json").is_file());
+        assert_eq!(ok.rows, vec!["salt_dynamic_gas/rex5_salt/sstore_100".to_string()]);
+        let summary: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(ok.dir.join("summary.json")).unwrap())
+                .unwrap();
+        assert!(summary["instr_series"].is_array());
+
+        // Empty window: no instructions data anywhere → an actionable error,
+        // not an empty chart.
+        let err = build_adhoc_trend(
+            &store,
+            "mega-evm",
+            "rex5, rex5_*",
+            rex5_family,
+            10.0,
+            2.0,
+            Lane::Instructions,
+            &window(),
+            TrendRequest { row_patterns: &[], out: None },
+        );
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("instructions"));
     }
 
     #[test]
@@ -442,7 +692,8 @@ mod tests {
         let store = RepoStore::new(tmp.path(), "mega-evm");
         let records = window();
         let outcome =
-            build_digest(&store, "mega-evm", "rex5, rex5_*", rex5_family, 10.0, &records).unwrap();
+            build_digest(&store, "mega-evm", "rex5, rex5_*", rex5_family, 10.0, 2.0, &records)
+                .unwrap();
 
         // Directory named after the last commit's day + the sha range.
         assert_eq!(
@@ -468,6 +719,6 @@ mod tests {
             &[("g", "revm_pinned/w", 1.0, Some(1.0))],
             &[],
         )];
-        assert!(build_digest(&store, "r", "rex5", rex5_family, 10.0, &records).is_err());
+        assert!(build_digest(&store, "r", "rex5", rex5_family, 10.0, 2.0, &records).is_err());
     }
 }

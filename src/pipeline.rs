@@ -47,6 +47,11 @@ pub enum Event {
         pct_over: f64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metric: Option<String>,
+        /// The instructions lane's cross-check for this row (see
+        /// [`InstrAnnotation`]). Present on **walltime** events only; omitted
+        /// (not `null`) on instructions events, which annotate nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<InstrAnnotation>,
     },
     /// A previously-regressed headline row dropped back within the recovery
     /// threshold of its frozen pre-regression median.
@@ -56,9 +61,96 @@ pub enum Event {
         current: f64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metric: Option<String>,
+        /// The instructions lane's cross-check for this row — walltime events
+        /// only (see [`Event::Regression::instructions`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<InstrAnnotation>,
     },
     /// A digest window completed; its data is in `dir` (repo-relative).
     Digest { dir: String },
+}
+
+/// What the instructions lane saw for a row when its **walltime** alert fired:
+/// a stateless cross-check that corroborates (or contradicts) the walltime
+/// signal. Attached to walltime regression/recovery events only.
+///
+/// It reads the instructions lane's *pre-update* rolling median for the same
+/// row — the exact median the instructions lane's own check compares against
+/// this run — and its regression threshold, symmetric in both directions; the
+/// instructions latch and any hysteresis play no part.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct InstrAnnotation {
+    /// `(current_instr_ratio / instr_rolling_median - 1) * 100`, rounded to two
+    /// decimals. `null` when the row has no instructions data this run or no
+    /// instructions rolling median yet — paired with `verdict: "missing"`.
+    pub ratio_delta_pct: Option<f64>,
+    pub verdict: InstrVerdict,
+}
+
+/// The instructions cross-check outcome. `up`/`down` mean the instructions
+/// count moved at least the instructions regression threshold in that
+/// direction; `flat` is within it; `missing` is no comparable data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstrVerdict {
+    Flat,
+    Up,
+    Down,
+    Missing,
+}
+
+/// The pre-update instructions view the walltime lane annotates its events
+/// with: this run's instructions ratio per row (`current`), the instructions
+/// lane's rolling windows *before* this run folds in (`instr_rows`), and the
+/// instructions regression threshold. Borrowed, not owned — the walltime
+/// [`check_lane`] runs before the instructions one, so `instr_rows` is still
+/// the pre-update state at annotation time.
+struct InstrAnnotationCtx<'a> {
+    current: &'a BTreeMap<String, f64>,
+    instr_rows: &'a BTreeMap<String, RowHistory>,
+    regression_pct: f64,
+}
+
+impl InstrAnnotationCtx<'_> {
+    /// The annotation for one row key. `missing` when either the current
+    /// instructions ratio or a pre-update rolling median is absent.
+    fn annotation_for(&self, row_key: &str) -> InstrAnnotation {
+        let current = self.current.get(row_key).copied();
+        let median = self
+            .instr_rows
+            .get(row_key)
+            .and_then(|h| median_opt(&h.recent_ratios))
+            .filter(|m| *m > 0.0);
+        match (current, median) {
+            (Some(current), Some(median)) => {
+                let delta = (current / median - 1.0) * 100.0;
+                let verdict = if delta >= self.regression_pct {
+                    InstrVerdict::Up
+                } else if delta <= -self.regression_pct {
+                    InstrVerdict::Down
+                } else {
+                    InstrVerdict::Flat
+                };
+                // Two-decimal percent precision (the repo has no other percent
+                // rounding convention to inherit).
+                let ratio_delta_pct = (delta * 100.0).round() / 100.0;
+                InstrAnnotation { ratio_delta_pct: Some(ratio_delta_pct), verdict }
+            }
+            _ => InstrAnnotation { ratio_delta_pct: None, verdict: InstrVerdict::Missing },
+        }
+    }
+}
+
+/// Median of a rolling window (empty = `None`), for the instructions
+/// annotation's pre-update comparison.
+fn median_opt(values: &std::collections::VecDeque<f64>) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<f64> = values.iter().copied().collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("ratios are finite"));
+    let n = sorted.len();
+    Some(if n % 2 == 1 { sorted[n / 2] } else { (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0 })
 }
 
 /// The lane-agnostic view of one workload's ratio table — everything the
@@ -98,6 +190,7 @@ impl LaneWorkloadRatios for InstrWorkloadRatios {
 /// row with a ratio is folded into `lane_rows` (that lane's rolling windows
 /// and latches; history is cheap); only headline-family rows emit events,
 /// tagged with the lane's `metric` marker.
+#[allow(clippy::too_many_arguments)]
 fn check_lane(
     lane: Lane,
     ratios: &[impl LaneWorkloadRatios],
@@ -105,6 +198,7 @@ fn check_lane(
     lane_rows: &mut BTreeMap<String, RowHistory>,
     rolling_window: usize,
     is_headline: impl Fn(&str) -> bool,
+    annotate: Option<&InstrAnnotationCtx>,
     events: &mut Vec<Event>,
 ) {
     for wl in ratios {
@@ -117,6 +211,9 @@ fn check_lane(
                 continue;
             }
             let metric = lane.metric_field().map(str::to_string);
+            // Only the walltime lane annotates; the instructions lane passes
+            // `annotate: None`, so its events omit the field entirely.
+            let instructions = annotate.map(|ctx| ctx.annotation_for(&key));
             match verdict {
                 Verdict::NewRegression { median, current, pct_over } => {
                     events.push(Event::Regression {
@@ -125,6 +222,7 @@ fn check_lane(
                         current,
                         pct_over,
                         metric,
+                        instructions,
                     });
                 }
                 Verdict::Recovered { median, current } => {
@@ -133,6 +231,7 @@ fn check_lane(
                         baseline_median: median,
                         current,
                         metric,
+                        instructions,
                     });
                 }
                 Verdict::FirstRun | Verdict::Ok | Verdict::StillRegressed => {}
@@ -192,6 +291,40 @@ pub fn dist_file_name(group: &str, workload: &str) -> String {
     } else {
         format!("dist_{}_{}.png", sanitize(group), sanitize(workload))
     }
+}
+
+/// Relative-speed bar items for one lane's ratio table (walltime →
+/// `compare_bars.png`, instructions → `instr_bars.png`): per workload, the
+/// baseline at 100% plus each headline subject's `100 / ratio` (baseline =
+/// 100%, lower = more overhead). Workloads with no headline ratio are dropped.
+/// Shared across lanes via [`LaneWorkloadRatios`] so both charts are built the
+/// same way.
+fn speed_bar_items(
+    ratios: &[impl LaneWorkloadRatios],
+    baseline_subject: &str,
+    is_headline: impl Fn(&str) -> bool,
+) -> Vec<charts::SpeedBarItem> {
+    ratios
+        .iter()
+        .filter_map(|wl| {
+            let mut bars: Vec<(String, f64)> = wl
+                .subject_ratios()
+                .filter(|(subject, _)| is_headline(subject))
+                .filter_map(|(subject, ratio)| ratio.map(|r| (subject.to_string(), 100.0 / r)))
+                .collect();
+            if bars.is_empty() {
+                return None;
+            }
+            bars.sort_by(|a, b| a.0.cmp(&b.0));
+            bars.insert(0, (baseline_subject.to_string(), 100.0));
+            let item = if wl.workload().is_empty() {
+                wl.group().to_string()
+            } else {
+                format!("{}/{}", wl.group(), wl.workload())
+            };
+            Some(charts::SpeedBarItem { item, bars })
+        })
+        .collect()
 }
 
 /// The whole post-bench stage for one commit:
@@ -276,28 +409,7 @@ pub fn process_results(
         is_headline,
     );
 
-    let speed_items: Vec<charts::SpeedBarItem> = ratios
-        .iter()
-        .filter_map(|wl| {
-            let mut bars: Vec<(String, f64)> = wl
-                .rows
-                .iter()
-                .filter(|r| is_headline(&r.subject))
-                .filter_map(|r| r.ratio_vs_baseline.map(|ratio| (r.subject.clone(), 100.0 / ratio)))
-                .collect();
-            if bars.is_empty() {
-                return None;
-            }
-            bars.sort_by(|a, b| a.0.cmp(&b.0));
-            bars.insert(0, (repo.baseline_subject.clone(), 100.0));
-            let item = if wl.workload.is_empty() {
-                wl.group.clone()
-            } else {
-                format!("{}/{}", wl.group, wl.workload)
-            };
-            Some(charts::SpeedBarItem { item, bars })
-        })
-        .collect();
+    let speed_items = speed_bar_items(&ratios, &repo.baseline_subject, is_headline);
     if !speed_items.is_empty() {
         if let Err(e) = charts::render_speed_bars(
             &commit_dir.join("compare_bars.png"),
@@ -307,10 +419,37 @@ pub fn process_results(
                 record.short_sha(),
                 repo.baseline_subject
             ),
+            &format!("relative speed, {} = 100% (lower = more overhead)", repo.baseline_subject),
             &speed_items,
             &subject_colors,
         ) {
             eprintln!("speed bars chart failed (continuing): {e:#}");
+        }
+    }
+
+    // Instructions bars — the counts twin of compare_bars.png, rendered from
+    // the same run-wide subject colors so the two charts agree. Written only
+    // when the instructions lane produced headline rows for this commit.
+    if let Some(instr_ratios) = instr_ratios.as_deref() {
+        let instr_items = speed_bar_items(instr_ratios, &repo.baseline_subject, is_headline);
+        if !instr_items.is_empty() {
+            if let Err(e) = charts::render_speed_bars(
+                &commit_dir.join("instr_bars.png"),
+                &format!(
+                    "{} relative instructions @ {} ({} = 100%)",
+                    repo.name,
+                    record.short_sha(),
+                    repo.baseline_subject
+                ),
+                &format!(
+                    "relative instruction count, {} = 100% (lower = more overhead)",
+                    repo.baseline_subject
+                ),
+                &instr_items,
+                &subject_colors,
+            ) {
+                eprintln!("instr bars chart failed (continuing): {e:#}");
+            }
         }
     }
 
@@ -341,9 +480,32 @@ pub fn process_results(
     //    Skipped entirely on a re-run of the same sha (see guard above).
     let mut events: Vec<Event> = Vec::new();
     if !is_rerun {
+        // This run's instructions ratio per row_key: the walltime lane's
+        // annotation reads it against the instructions lane's *pre-update*
+        // rolling median. That median is still readable now because the
+        // walltime pass below runs first — it never touches `instr_rows`.
+        let mut instr_current: BTreeMap<String, f64> = BTreeMap::new();
+        for wl in instr_ratios.as_deref().unwrap_or_default() {
+            for row in &wl.rows {
+                if let Some(ratio) = row.ratio_vs_baseline {
+                    instr_current.insert(
+                        criterion_results::row_key(&wl.group, &row.subject, &wl.workload),
+                        ratio,
+                    );
+                }
+            }
+        }
+        let annotate = InstrAnnotationCtx {
+            current: &instr_current,
+            instr_rows: &state.instr_rows,
+            regression_pct: settings.thresholds(Lane::Instructions).regression_pct,
+        };
+
         // Both lanes run the same protocol ([`check_lane`]) against their own
         // state map and threshold pair. Event order in events.json is stable:
-        // all walltime events first, then the instructions lane's.
+        // all walltime events first, then the instructions lane's. Only the
+        // walltime pass is annotated (`Some(&annotate)`); the instructions
+        // pass passes `None`, so its events carry no `instructions` field.
         check_lane(
             Lane::Walltime,
             &ratios,
@@ -351,6 +513,7 @@ pub fn process_results(
             &mut state.rows,
             settings.rolling_window,
             is_headline,
+            Some(&annotate),
             &mut events,
         );
         check_lane(
@@ -360,6 +523,7 @@ pub fn process_results(
             &mut state.instr_rows,
             settings.rolling_window,
             is_headline,
+            None,
             &mut events,
         );
     }
@@ -380,6 +544,7 @@ pub fn process_results(
             &repo.headline_label(),
             is_headline,
             settings.regression_threshold_pct,
+            settings.instr_regression_threshold_pct,
             &records,
         ) {
             Ok(outcome) => {
@@ -549,6 +714,9 @@ mod tests {
     "dir": "digests/20260702-abc1234..def5678"
   }
 ]"#;
+        // With both the metric marker and the instructions annotation absent
+        // (`None`), a walltime event serializes byte-identically to the
+        // pre-lane shape — the additive fields are skipped, not emitted null.
         let events = vec![
             Event::Regression {
                 row_key: "salt_dynamic_gas/rex5_salt/sstore_100".into(),
@@ -556,12 +724,14 @@ mod tests {
                 current: 2.3,
                 pct_over: 15.0,
                 metric: None,
+                instructions: None,
             },
             Event::Recovery {
                 row_key: "salt_dynamic_gas/rex5_salt/sstore_100".into(),
                 baseline_median: 2.0,
                 current: 2.02,
                 metric: None,
+                instructions: None,
             },
             Event::Digest { dir: "digests/20260702-abc1234..def5678".into() },
         ];
@@ -569,16 +739,61 @@ mod tests {
     }
 
     #[test]
-    fn test_instructions_events_carry_the_metric_marker() {
+    fn test_walltime_event_serializes_instructions_annotation() {
+        // The pinned shape from skill/references/events.md: the annotation is
+        // a `{ ratio_delta_pct, verdict }` object, ratio_delta_pct first.
+        let event = Event::Regression {
+            row_key: "salt_dynamic_gas/rex5_salt/sstore_100".into(),
+            baseline_median: 2.0,
+            current: 2.3,
+            pct_over: 15.0,
+            metric: None,
+            instructions: Some(InstrAnnotation {
+                ratio_delta_pct: Some(-0.31),
+                verdict: InstrVerdict::Flat,
+            }),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains(r#""instructions":{"ratio_delta_pct":-0.31,"verdict":"flat"}"#),
+            "got {json}"
+        );
+
+        // A `missing` verdict keeps ratio_delta_pct present but null.
+        let missing = Event::Recovery {
+            row_key: "g/rex5/w".into(),
+            baseline_median: 2.0,
+            current: 2.0,
+            metric: None,
+            instructions: Some(InstrAnnotation {
+                ratio_delta_pct: None,
+                verdict: InstrVerdict::Missing,
+            }),
+        };
+        let json = serde_json::to_string(&missing).unwrap();
+        assert!(
+            json.contains(r#""instructions":{"ratio_delta_pct":null,"verdict":"missing"}"#),
+            "got {json}"
+        );
+    }
+
+    #[test]
+    fn test_instructions_events_carry_the_metric_marker_and_no_annotation() {
         let event = Event::Regression {
             row_key: "g/rex5/w".into(),
             baseline_median: 1.0,
             current: 1.05,
             pct_over: 5.0,
             metric: Lane::Instructions.metric_field().map(str::to_string),
+            // Instructions events annotate nothing — the field is omitted.
+            instructions: None,
         };
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains(r#""metric":"instructions""#), "got {json}");
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["metric"], "instructions");
+        assert!(
+            value.get("instructions").is_none(),
+            "instructions annotation must be omitted on instructions events: {value}"
+        );
     }
 
     #[test]

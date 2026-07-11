@@ -92,6 +92,7 @@ fn main() {
     render_speed_bars(
         &out.join("compare_bars.png"),
         "mega-evm relative speed (revm_pinned = 100%)",
+        "relative speed, revm_pinned = 100% (lower = more overhead)",
         &items,
         &colors,
     )
@@ -163,7 +164,7 @@ fn main() {
     render_trend(
         &out.join("trend.png"),
         "mega-evm headline (rex5, rex5_*) — last 5 commits",
-        "revm_pinned",
+        "time ratio vs revm_pinned — lower is better",
         &commits,
         &series,
     )

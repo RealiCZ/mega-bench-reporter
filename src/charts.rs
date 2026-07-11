@@ -158,9 +158,14 @@ pub struct SpeedBarItem {
 /// the mock's vertical layout). The subject legend sits in its own panel to
 /// the right of the plot, like the trend chart's, so it never competes with
 /// bars for space.
+///
+/// `x_desc` labels the value axis — the lane's noun differs (`relative speed`
+/// for walltime, `relative instruction count` for the instructions bars) even
+/// though the `baseline = 100%, lower = more overhead` framing is shared.
 pub fn render_speed_bars(
     path: &Path,
     title: &str,
+    x_desc: &str,
     items: &[SpeedBarItem],
     colors: &SubjectColors,
 ) -> anyhow::Result<()> {
@@ -168,7 +173,6 @@ pub fn render_speed_bars(
     if items.is_empty() {
         anyhow::bail!("no items to render speed bars for");
     }
-    let baseline_subject = colors.baseline();
     // Legend order = subject order of first appearance (baseline first, the
     // way the pipeline feeds bars); also fixes each band's bar slot count.
     let mut legend_subjects: Vec<String> = Vec::new();
@@ -223,9 +227,7 @@ pub fn render_speed_bars(
             }
             String::new()
         })
-        .x_desc(
-            format!("relative speed, {baseline_subject} = 100% (lower = more overhead)").as_str(),
-        )
+        .x_desc(x_desc)
         .label_style(("sans-serif", 14 * SS))
         .axis_desc_style(("sans-serif", 16 * SS))
         .draw()
@@ -422,11 +424,13 @@ pub struct TrendSeries {
 }
 
 /// Digest trend chart: headline-row ratios over the last N commits,
-/// x = commit (short sha), y = `× vs baseline`.
+/// x = commit (short sha), y = `× vs baseline`. `y_desc` names the value axis
+/// so the same renderer serves both lanes (`time ratio…` for walltime,
+/// `instruction ratio…` for the instructions trend).
 pub fn render_trend(
     path: &Path,
     title: &str,
-    baseline_subject: &str,
+    y_desc: &str,
     commit_labels: &[String],
     series: &[TrendSeries],
 ) -> anyhow::Result<()> {
@@ -504,7 +508,7 @@ pub fn render_trend(
         })
         .y_label_formatter(&|v: &f64| format!("{v:.2}×"))
         .x_desc("commit")
-        .y_desc(format!("time ratio vs {baseline_subject} — lower is better").as_str())
+        .y_desc(y_desc)
         .label_style(("sans-serif", 13 * SS))
         .axis_desc_style(("sans-serif", 15 * SS))
         .draw()
@@ -716,8 +720,14 @@ mod tests {
                 bars: vec![("revm_pinned".into(), 100.0), ("rex5_oracle".into(), 143.0)],
             },
         ];
-        render_speed_bars(&path, "relative speed (revm_pinned = 100%)", &items, &sample_colors())
-            .unwrap();
+        render_speed_bars(
+            &path,
+            "relative speed (revm_pinned = 100%)",
+            "relative speed, revm_pinned = 100% (lower = more overhead)",
+            &items,
+            &sample_colors(),
+        )
+        .unwrap();
         assert_png(&path);
     }
 
@@ -798,7 +808,14 @@ mod tests {
                 alerts: Vec::new(),
             },
         ];
-        render_trend(&path, "mega-evm 10-commit trend", "revm_pinned", &commits, &series).unwrap();
+        render_trend(
+            &path,
+            "mega-evm 10-commit trend",
+            "time ratio vs revm_pinned — lower is better",
+            &commits,
+            &series,
+        )
+        .unwrap();
         assert_png(&path);
     }
 }

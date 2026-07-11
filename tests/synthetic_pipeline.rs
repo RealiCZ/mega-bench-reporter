@@ -6,9 +6,9 @@
 use mega_bench_reporter::config::Config;
 use mega_bench_reporter::git::CommitMeta;
 use mega_bench_reporter::instructions::{InstrCollection, InstrRow};
-use mega_bench_reporter::pipeline::{process_results, Event};
+use mega_bench_reporter::pipeline::{process_results, Event, InstrVerdict};
 use mega_bench_reporter::state::State;
-use mega_bench_reporter::storage::RepoStore;
+use mega_bench_reporter::storage::{CommitRecord, RepoStore};
 use std::path::Path;
 
 const CONFIG: &str = r#"
@@ -118,6 +118,8 @@ fn test_synthetic_ten_commit_run_with_regression_and_recovery() {
     let first_dir = store.root().join("commits").join(format!("20260701-{}", &meta(0).sha[..7]));
     assert!(first_dir.join("raw.json").is_file());
     assert!(first_dir.join("compare_bars.png").is_file());
+    // No instructions lane this run → no instr_bars.png.
+    assert!(!first_dir.join("instr_bars.png").exists());
     let table: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(first_dir.join("compare_table.json")).unwrap(),
     )
@@ -151,13 +153,18 @@ fn test_synthetic_ten_commit_run_with_regression_and_recovery() {
     let outcome = run(5, 2.3);
     assert_eq!(outcome.events.len(), 1);
     match &outcome.events[0] {
-        Event::Regression { row_key, baseline_median, current, pct_over, metric } => {
+        Event::Regression { row_key, baseline_median, current, pct_over, metric, instructions } => {
             assert_eq!(row_key, "salt_dynamic_gas/rex5_salt/sstore_100");
             assert!((baseline_median - 2.0).abs() < 1e-9);
             assert!((current - 2.3).abs() < 1e-9);
             assert!((pct_over - 15.0).abs() < 0.1);
             // Walltime events carry no metric marker (absent in the JSON).
             assert_eq!(*metric, None);
+            // This run has no instructions lane, so the walltime alert is
+            // annotated `missing` (no comparable instructions data).
+            let ann = instructions.as_ref().expect("walltime events carry the annotation");
+            assert_eq!(ann.verdict, InstrVerdict::Missing);
+            assert_eq!(ann.ratio_delta_pct, None);
         }
         other => panic!("expected Regression, got {other:?}"),
     }
@@ -294,6 +301,9 @@ fn test_instructions_lane_regression_recovery_and_rebaseline() {
     assert_eq!(salt_row["instr"]["ratio_vs_baseline"], 2.0);
     // Lane on but all targets fine: no instr_failed_targets key.
     assert!(raw.get("instr_failed_targets").is_none());
+    // The instructions bars ride alongside compare_bars.png.
+    assert!(first_dir.join("compare_bars.png").is_file());
+    assert!(first_dir.join("instr_bars.png").is_file());
     let table: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(first_dir.join("compare_table.json")).unwrap(),
     )
@@ -449,6 +459,178 @@ fn test_rerunning_same_sha_with_instr_does_not_double_count() {
     assert_eq!(state_after_rerun.rows[key].recent_ratios.len(), 1);
     assert_eq!(state_after_rerun.instr_rows[key].recent_ratios.len(), 1);
     assert_eq!(state_after_rerun.commits_since_digest, 1);
+}
+
+#[test]
+fn test_walltime_regression_annotated_with_instructions_verdict() {
+    // A walltime regression fires at run 5 while the instructions lane sits at
+    // a chosen level. The event's `instructions` annotation is the
+    // instructions lane's *stateless* cross-check: its pre-update rolling
+    // median (built over runs 0–4), its regression threshold (2%), symmetric
+    // in both directions. Each verdict runs in its own fresh store.
+    let verdict_for = |run5_instr: Option<InstrCollection>| -> (InstrVerdict, Option<f64>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_root = tmp.path().join("data");
+        let cfg = Config::parse(CONFIG).unwrap();
+        let repo = cfg.repo("mega-evm").unwrap();
+        let settings = cfg.settings(repo).unwrap();
+        let store = RepoStore::new(&data_root, "mega-evm");
+        let scratch = tmp.path().join("criterion");
+
+        let run = |i: usize, salt_ratio: f64, instr: Option<InstrCollection>| {
+            if scratch.exists() {
+                std::fs::remove_dir_all(&scratch).unwrap();
+            }
+            write_criterion_tree(&scratch, salt_ratio);
+            process_results(repo, &settings, &store, &scratch, &meta(i), vec![], instr).unwrap()
+        };
+
+        // Runs 0–4: walltime and instructions both flat (instr salt ratio 2.0
+        // → the instructions rolling median settles at 2.0).
+        for i in 0..5 {
+            let out = run(i, 2.0, Some(instr_collection(20_000)));
+            assert!(out.events.is_empty(), "run {i} should be quiet");
+        }
+        // Run 5: walltime jumps 15% (fires the walltime regression); the
+        // instructions lane sits wherever `run5_instr` puts it.
+        let out = run(5, 2.3, run5_instr);
+        let ev = out
+            .events
+            .iter()
+            .find(|e| matches!(e, Event::Regression { metric: None, .. }))
+            .expect("a walltime regression event");
+        match ev {
+            Event::Regression { instructions, .. } => {
+                let ann = instructions.as_ref().expect("walltime events carry the annotation");
+                (ann.verdict, ann.ratio_delta_pct)
+            }
+            _ => unreachable!(),
+        }
+    };
+
+    // flat: instructions unchanged (ratio 2.0 vs median 2.0 → 0%).
+    assert_eq!(verdict_for(Some(instr_collection(20_000))), (InstrVerdict::Flat, Some(0.0)));
+    // up: +3% (ratio 2.06 vs 2.0), at/above the 2% instructions threshold —
+    // the walltime regression is corroborated by a real code-path change.
+    assert_eq!(verdict_for(Some(instr_collection(20_600))), (InstrVerdict::Up, Some(3.0)));
+    // down: −3% (ratio 1.94 vs 2.0), symmetric — an instructions improvement.
+    assert_eq!(verdict_for(Some(instr_collection(19_400))), (InstrVerdict::Down, Some(-3.0)));
+    // missing: no instructions data at all this run.
+    assert_eq!(verdict_for(None), (InstrVerdict::Missing, None));
+}
+
+#[test]
+fn test_digest_over_mixed_instr_commits_has_instr_series_and_chart() {
+    // 10 commits with instructions data on even runs only. The 10th commit's
+    // digest must null-pad `instr_series` at the no-instr commits and render
+    // `instr_trend.png`. Walltime stays flat, so the digest is the only event.
+    let tmp = tempfile::tempdir().unwrap();
+    let data_root = tmp.path().join("data");
+    let cfg = Config::parse(CONFIG).unwrap();
+    let repo = cfg.repo("mega-evm").unwrap();
+    let settings = cfg.settings(repo).unwrap();
+    let store = RepoStore::new(&data_root, "mega-evm");
+    let scratch = tmp.path().join("criterion");
+
+    let mut digest_rel_dir = None;
+    for i in 0..10 {
+        if scratch.exists() {
+            std::fs::remove_dir_all(&scratch).unwrap();
+        }
+        write_criterion_tree(&scratch, 2.0);
+        let instr = (i % 2 == 0).then(|| instr_collection(20_000));
+        let out =
+            process_results(repo, &settings, &store, &scratch, &meta(i), vec![], instr).unwrap();
+        for ev in &out.events {
+            if let Event::Digest { dir } = ev {
+                digest_rel_dir = Some(dir.clone());
+            }
+        }
+    }
+
+    let digest_dir = store.root().join(digest_rel_dir.expect("digest fired at the 10th commit"));
+    assert!(digest_dir.join("trend.png").is_file());
+    assert!(digest_dir.join("instr_trend.png").is_file());
+
+    let summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(digest_dir.join("summary.json")).unwrap())
+            .unwrap();
+    let instr_series = summary["instr_series"].as_array().expect("instr_series present");
+    let salt = instr_series
+        .iter()
+        .find(|r| r["row_key"] == "salt_dynamic_gas/rex5_salt/sstore_100")
+        .expect("salt headline row in instr_series");
+    let ratios = salt["ratios"].as_array().unwrap();
+    assert_eq!(ratios.len(), 10, "aligned to the same 10 commits as the walltime series");
+    for (i, ratio) in ratios.iter().enumerate() {
+        if i % 2 == 0 {
+            assert!(ratio.is_number(), "commit {i} has instructions data");
+        } else {
+            assert!(ratio.is_null(), "commit {i} has no instructions data → null");
+        }
+    }
+}
+
+#[test]
+fn test_trend_metric_instructions_happy_and_empty() {
+    use mega_bench_reporter::digest::{self, TrendRequest};
+    use mega_bench_reporter::lane::Lane;
+
+    let cfg = Config::parse(CONFIG).unwrap();
+    let repo = cfg.repo("mega-evm").unwrap();
+    let settings = cfg.settings(repo).unwrap();
+
+    // Runs `n` commits into a fresh store, `with_instr` toggling the lane, and
+    // returns (store, window) ready to hand to build_adhoc_trend.
+    let stored = |with_instr: bool| {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RepoStore::new(&tmp.path().join("data"), "mega-evm");
+        let scratch = tmp.path().join("criterion");
+        for i in 0..3 {
+            if scratch.exists() {
+                std::fs::remove_dir_all(&scratch).unwrap();
+            }
+            write_criterion_tree(&scratch, 2.0);
+            let instr = with_instr.then(|| instr_collection(20_000));
+            process_results(repo, &settings, &store, &scratch, &meta(i), vec![], instr).unwrap();
+        }
+        let records: Vec<_> =
+            store.load_commit_records().unwrap().into_iter().map(|(_, r)| r).collect();
+        let window = digest::select_window(records, 20, None, None).unwrap();
+        // The tempdir must outlive the trend build that reads/writes under it.
+        (tmp, store, window)
+    };
+
+    let trend = |store: &RepoStore, window: &[CommitRecord], metric: Lane| {
+        digest::build_adhoc_trend(
+            store,
+            "mega-evm",
+            &repo.headline_label(),
+            |s| repo.is_headline(s),
+            settings.regression_threshold_pct,
+            settings.instr_regression_threshold_pct,
+            metric,
+            window,
+            TrendRequest { row_patterns: &[], out: None },
+        )
+    };
+
+    // Happy path: instructions data present → instr_trend.png plus a
+    // summary.json carrying instr_series; only the chosen lane's chart lands.
+    let (_tmp, store, window) = stored(true);
+    let ok = trend(&store, &window, Lane::Instructions).unwrap();
+    assert!(ok.dir.join("instr_trend.png").is_file());
+    assert!(!ok.dir.join("trend.png").exists());
+    let summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(ok.dir.join("summary.json")).unwrap())
+            .unwrap();
+    assert!(summary["instr_series"].is_array());
+
+    // Empty window: commits with no instructions data → an actionable error.
+    let (_tmp, store, window) = stored(false);
+    let err = trend(&store, &window, Lane::Instructions);
+    assert!(err.is_err());
+    assert!(err.unwrap_err().to_string().contains("instructions"));
 }
 
 #[test]
