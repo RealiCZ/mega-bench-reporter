@@ -55,8 +55,9 @@ Gate: `forge --version` (ensure `~/.foundry/bin` is on PATH for the reporter's u
 curl -fsSL https://codspeed.io/install.sh | bash
 ```
 
-Gate: `codspeed --version` → 4.x. Record the exact version next to this box's notes;
-if a future upgrade changes profile output, the reporter's creator tripwire will warn
+Gate: `codspeed --version` → 4.x (the script installs into `~/.cargo/bin`, already
+on PATH for cargo users). Record the exact version next to this box's notes; if a
+future upgrade changes profile output, the reporter's creator tripwire will warn
 — re-pin to the recorded version rather than chasing the format.
 
 ### 4. cargo-codspeed (pinned)
@@ -65,17 +66,27 @@ if a future upgrade changes profile output, the reporter's creator tripwire will
 cargo install --locked cargo-codspeed --version 5.0.1
 ```
 
-Gate: `cargo codspeed --version` → 5.0.1. Major 5 is required — the reporter warns
-(`differs from supported 5`) on any other major.
+Gate: `(cargo codspeed --version 2>&1 || true) | head -1` → 5.0.1. The `|| true`
+matters: cargo-codspeed prints its version banner but **exits 1** (clap quirk,
+verified on 5.0.1) — a bare `cargo codspeed --version` in a `set -e` script would
+abort a healthy provisioning. The reporter's preflight tolerates the same quirk.
+Major 5 is required — the reporter warns (`differs from supported 5`) on any other
+major.
 
 ### 5. Valgrind fork
 
 ```bash
-codspeed setup
+codspeed setup || true
+codspeed setup status
 ```
 
 Downloads CodSpeed's patched valgrind (needed for `--combine-dumps` and the
-instrumentation client requests). Gate: `valgrind --version` succeeds; a later
+instrumentation client requests). `codspeed setup` can exit 1 with no output in
+non-interactive shells (its logger swallows non-TTY output; set
+`CODSPEED_LOG=debug` to see why) — that is why it is best-effort here:
+`codspeed run` performs the same setup itself, so step 7's smoke run is the real
+gate. Gate for THIS step: `codspeed setup status` lists the executors, and
+`valgrind --version` succeeds once setup has run (here or during step 7); a later
 profile's `creator:` line will read `callgrind-*.codspeed*`.
 
 ### 6. Deploy the reporter
@@ -133,6 +144,7 @@ real runs, recalibrate `instr_regression_threshold_pct` from `state.json`'s
 |---|---|
 | `skipped — codspeed CLI not usable` / `cargo-codspeed not usable` | PATH: the reporter's user/service must see `~/.cargo/bin` and the codspeed install dir; re-run gates 3-4 as that user |
 | `skipped — … codspeed-criterion-compat` | Tracked repo's Cargo.lock lacks the dep — PR #337 not merged yet; expected, not a host problem |
+| `cargo codspeed --version` exits 1 while printing `cargo-codspeed 5.0.1` | Upstream clap quirk (version request travels the error path) — NOT a broken install; use step 4's tolerant gate; the lane's preflight accepts it |
 | `cargo-codspeed vX major differs from supported 5` | Wrong pin — reinstall step 4 exactly |
 | `skipping profile … creator '…'` | Runner upgrade changed the profile format — reinstall the recorded 4.x version from step 3 |
 | Run exits nonzero with `instructions lane required` | That's `require_instructions = true` doing its job — fix the underlying skip/failure above; data on disk is still valid |

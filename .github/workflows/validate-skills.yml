@@ -10,12 +10,20 @@ on:
     paths:
       - "skills/**"
       - "scripts/validate_skills.py"
+      - "README.md"
+      - "TODO.md"
       - ".github/workflows/validate-skills.yml"
   pull_request:
     paths:
       - "skills/**"
       - "scripts/validate_skills.py"
+      - "README.md"
+      - "TODO.md"
       - ".github/workflows/validate-skills.yml"
+
+concurrency:
+  group: validate-skills-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   validate:
