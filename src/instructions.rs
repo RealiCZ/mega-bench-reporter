@@ -452,12 +452,6 @@ fn find_version_token(output: &str) -> Option<&str> {
         .find(|tok| tok.trim_start_matches('v').starts_with(|c: char| c.is_ascii_digit()))
 }
 
-/// [`find_version_token`] with a fallback to the whole trimmed string, so the
-/// visibility line still says something useful for versionless output.
-fn version_token(output: &str) -> &str {
-    find_version_token(output).unwrap_or_else(|| output.trim())
-}
-
 /// The integer major version of a version token (`5` from `5.0.1`, `6` from
 /// `v6.2.0`), or `None` if it does not lead with an integer.
 fn major_version(token: &str) -> Option<u64> {
@@ -982,12 +976,13 @@ version = \"2.10.1\"
 
     #[test]
     fn test_version_token_and_major_version() {
-        assert_eq!(version_token("cargo-codspeed 5.0.1"), "5.0.1");
-        assert_eq!(version_token("codspeed 4.18.0"), "4.18.0");
+        assert_eq!(find_version_token("cargo-codspeed 5.0.1"), Some("5.0.1"));
+        assert_eq!(find_version_token("codspeed 4.18.0"), Some("4.18.0"));
         // A leading `v` is kept in the display token but ignored for the major.
-        assert_eq!(version_token("v6.2.0"), "v6.2.0");
-        // Nothing version-shaped → the whole trimmed string.
-        assert_eq!(version_token("  nightly build  "), "nightly build");
+        assert_eq!(find_version_token("v6.2.0"), Some("v6.2.0"));
+        // Nothing version-shaped → None (the preflight then falls back to the
+        // whole trimmed output for the visibility line on a successful exit).
+        assert_eq!(find_version_token("  nightly build  "), None);
 
         assert_eq!(major_version("5.0.1"), Some(5));
         assert_eq!(major_version("v6.2.0"), Some(6));
