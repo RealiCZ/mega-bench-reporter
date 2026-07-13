@@ -13,6 +13,7 @@ pub mod flamegraph;
 pub mod git;
 pub mod instructions;
 pub mod lane;
+pub mod measure;
 pub mod pipeline;
 pub mod state;
 pub mod storage;

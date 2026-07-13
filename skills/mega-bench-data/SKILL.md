@@ -21,6 +21,7 @@ consuming agent's job, following these docs.
 | `trend` | manual trend chart over any stored-commit window into `trends/` — either lane, read-only, independent of the automatic digest |
 | `rebaseline` | accept a latched regression as the new normal: clear the rows' history + latch from `state.json`; next run re-baselines them (no alert). Only on an explicit human decision |
 | `flamegraph` | nightly flame-graph archive into `flame/<day>/` — no events, nothing to relay |
+| `measure` | one-shot metric collection on an arbitrary checkout (walltime and/or instructions); single JSON on stdout; primary consumer is the ARO optimization loop's terminal gate — see [`references/cli.md`](references/cli.md#measure-one-shot-metrics-on-an-existing-checkout) |
 
 ```bash
 mega-bench-reporter run --repo <name> --sha <sha> --config repos.toml --data-root <dir>
@@ -36,7 +37,8 @@ locking, and safety rules: [`references/cli.md`](references/cli.md).
 
 | you are… | read |
 |---|---|
-| invoking any subcommand — run / trend / rebaseline / flamegraph (flags, env, stdout, locking, failure modes) | [`references/cli.md`](references/cli.md) |
+| invoking any subcommand — run / trend / rebaseline / flamegraph / measure (flags, env, stdout, locking, failure modes) | [`references/cli.md`](references/cli.md) |
+| one-shot metrics on a caller-owned checkout (ARO terminal gate, walltime / instructions lanes) | [`references/cli.md`](references/cli.md#measure-one-shot-metrics-on-an-existing-checkout) |
 | finding new results, deduping ("did I already post this sha?"), recovering after a crash | [`references/discovery.md`](references/discovery.md) |
 | interpreting events (when a regression fires, latch semantics, tuning knobs) | [`references/events.md`](references/events.md) |
 | locating and decoding files (raw.json / compare_table.json / summary.json / state.json / charts) | [`references/data-layout.md`](references/data-layout.md) |

@@ -102,7 +102,7 @@ cargo build --release
 ```
 
 Gate: `./target/release/mega-bench-reporter --help` prints the subcommands
-(`run`, `trend`, `rebaseline`, `flamegraph`).
+(`run`, `trend`, `rebaseline`, `flamegraph`, `measure`).
 
 ### 7. Smoke run (dual lane)
 
@@ -137,6 +137,35 @@ Wire the poll loop / cron per the repo's `skills/mega-bench-data/references/disc
 `cli.md` (BB9 polls `latest.json`; flamegraph is plain nightly cron). After ~20
 real runs, recalibrate `instr_regression_threshold_pct` from `state.json`'s
 `instr_rows.*.recent_ratios` (see repo TODO item 20).
+
+## Also serves: `measure --instructions` (ARO terminal gate)
+
+The same provisioned toolchain (codspeed CLI, cargo-codspeed, Valgrind fork)
+also powers the reporter's one-shot `measure` subcommand with `--instructions`.
+ARO's optimization loop uses it as a terminal gate: it does not need the
+continuous `run` pipeline or a data root — only a working instructions-lane
+host and a `mega-bench-reporter` binary on PATH (or pointed at explicitly).
+
+**Binary on the host.** Same as step 6: prefer a release artifact when one
+exists; otherwise `git clone` + `cargo build --release` and put
+`./target/release/mega-bench-reporter` (or a copy under e.g. `~/bin`) where
+the gate can find it.
+
+**How ARO finds it.** The gate resolves the binary via, in order:
+- the `ARO_MEASURE_BIN` environment variable, or
+- the target spec's `measure_bin` field.
+
+**Smoke / gate verification** (after steps 1–6; replace `<dir>` with a
+checkout that has the instructions-lane deps built):
+
+```bash
+mega-bench-reporter measure --checkout <dir> --package mega-evm --bench-target mega_bench --instructions
+```
+
+Gate: exit 0 and a single JSON object on stdout with instruction counts (no
+`instructions lane: skipped` on stderr). On non-Linux hosts or a missing
+toolchain this exits nonzero — unlike the `run` pipeline's graceful skip,
+`measure` treats a missing lane as a hard failure.
 
 ## Troubleshooting
 
