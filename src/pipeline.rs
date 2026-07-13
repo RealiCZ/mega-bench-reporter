@@ -257,6 +257,32 @@ pub struct RunOutcome {
 // Bench runner
 // ---------------------------------------------------------------------------
 
+/// Builds the `cargo` argv for one walltime bench target (everything after
+/// the program name). With no profile and no filter this is
+/// `bench -p <pkg> --bench <target> -- --output-format bencher` — the
+/// invocation the scheduled walltime layer standardized on.
+///
+/// `bench_filter`, when set, is appended after the criterion args so criterion
+/// runs only matching benchmarks (same free-arg filter semantics as
+/// `cargo bench -- <filter>`). The `run` pipeline always passes `None`.
+pub fn bench_target_args<'a>(
+    package: &'a str,
+    target: &'a str,
+    bench_profile: Option<&'a str>,
+    bench_filter: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut args = vec!["bench", "-p", package, "--bench", target];
+    if let Some(profile) = bench_profile {
+        args.push("--profile");
+        args.push(profile);
+    }
+    args.extend(["--", "--output-format", "bencher"]);
+    if let Some(filter) = bench_filter {
+        args.push(filter);
+    }
+    args
+}
+
 /// Runs one bench target. With no configured `bench_profile` this is
 /// `cargo bench -p <pkg> --bench <target> -- --output-format bencher` — the
 /// invocation the scheduled walltime layer standardized on, so the numbers
@@ -276,15 +302,8 @@ pub fn bench_target(
     bench_filter: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(checkout).args(["bench", "-p", package, "--bench", target]);
-    if let Some(profile) = bench_profile {
-        cmd.args(["--profile", profile]);
-    }
     // run_streaming pipes the bencher lines to stderr instead of inheriting.
-    cmd.arg("--").arg("--output-format").arg("bencher");
-    if let Some(filter) = bench_filter {
-        cmd.arg(filter);
-    }
+    cmd.current_dir(checkout).args(bench_target_args(package, target, bench_profile, bench_filter));
     run_streaming(cmd, &format!("cargo bench --bench {target}"))
 }
 
@@ -869,5 +888,43 @@ mod tests {
             "dist_salt_dynamic_gas_sstore_100_x8.png"
         );
         assert_eq!(dist_file_name("empty_transaction", ""), "dist_empty_transaction.png");
+    }
+
+    /// Pins the exact `cargo` argv the `run` pipeline builds at its
+    /// `bench_target(..., bench_filter = None)` call site — package + target +
+    /// optional profile + the fixed criterion bencher suffix. Future edits
+    /// that change the invocation must update this test deliberately.
+    #[test]
+    fn test_run_pipeline_bench_argv_with_filter_none() {
+        // Default: no bench_profile configured (cargo's default bench profile).
+        assert_eq!(
+            bench_target_args("mega-evm", "mega_bench", None, None),
+            [
+                "bench",
+                "-p",
+                "mega-evm",
+                "--bench",
+                "mega_bench",
+                "--",
+                "--output-format",
+                "bencher",
+            ]
+        );
+        // Optional profile: `settings.bench_profile = Some("profiling")`.
+        assert_eq!(
+            bench_target_args("mega-evm", "mega_bench", Some("profiling"), None),
+            [
+                "bench",
+                "-p",
+                "mega-evm",
+                "--bench",
+                "mega_bench",
+                "--profile",
+                "profiling",
+                "--",
+                "--output-format",
+                "bencher",
+            ]
+        );
     }
 }

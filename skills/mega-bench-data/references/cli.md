@@ -141,6 +141,12 @@ Parameterized exposure of the same walltime / instructions collection the
 caller owns the worktree and passes an already-checked-out directory. At least
 one of `--instructions` / `--walltime` is required.
 
+**Checkout side effects:** before benching, `measure` deletes and recreates
+checkout-local working dirs under the worktree's `target/` — specifically
+`target/criterion` (walltime) and `target/_measure_instr_profiles`
+(instructions). Callers own the worktree and must not keep data they need in
+those paths; anything left there is wiped on the next `measure` run.
+
 - `--walltime`: runs `cargo bench -p <pkg> --bench <t> -- --output-format
   bencher` per target and parses the criterion tree into mean ns per row.
 - `--instructions`: runs the CodSpeed offline simulation path
