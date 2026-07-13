@@ -285,6 +285,21 @@ pub fn compute_instr_ratios(rows: &[InstrRow], baseline_subject: &str) -> Vec<In
 // Collection (subprocess side)
 // ---------------------------------------------------------------------------
 
+/// Explicit inputs for an instructions-lane collection against a known
+/// checkout. Parameterized exposure of the same build/run/parse path the
+/// pipeline uses — callers supply package, targets, and optional filter
+/// directly (no `RepoConfig` required).
+#[derive(Debug, Clone, Copy)]
+pub struct CollectRequest<'a> {
+    pub checkout: &'a Path,
+    pub package: &'a str,
+    pub bench_targets: &'a [String],
+    pub bench_filter: Option<&'a str>,
+    pub profile_root: &'a Path,
+    /// Host OS string; production callers pass `std::env::consts::OS`.
+    pub os: &'a str,
+}
+
 /// Runs the whole instructions lane for one checkout: per bench target, an
 /// instrumented build (`cargo codspeed build`), a fresh profile folder, and
 /// an offline runner invocation, then parses every profile written.
@@ -296,6 +311,10 @@ pub fn compute_instr_ratios(rows: &[InstrRow], baseline_subject: &str) -> Vec<In
 /// stderr note. `os` is a parameter for testability; callers pass
 /// `std::env::consts::OS`. Never fails the surrounding run: per-target
 /// failures land in [`InstrCollection::failed_targets`].
+///
+/// Thin wrapper around [`collect_with`] that pulls package / targets / filter
+/// from the pipeline's `RepoConfig` + `InstructionsConfig` — call-site
+/// behavior is identical to the pre-parameterized form.
 pub fn collect(
     checkout: &Path,
     repo: &RepoConfig,
@@ -303,29 +322,38 @@ pub fn collect(
     profile_root: &Path,
     os: &str,
 ) -> CollectOutcome {
-    collect_inner(checkout, repo, cfg, profile_root, os, None)
+    collect_with(
+        &CollectRequest {
+            checkout,
+            package: repo.package(),
+            bench_targets: &repo.bench_targets,
+            bench_filter: cfg.bench_filter.as_deref(),
+            profile_root,
+            os,
+        },
+        None,
+    )
 }
 
-/// [`collect`] with the preflight probes' `PATH` injectable — a test seam:
-/// overriding it with a bogus path forces the tools-missing skip hermetically,
-/// without depending on what the host has installed. Production callers go
-/// through [`collect`], which inherits the process environment (`None`).
-fn collect_inner(
-    checkout: &Path,
-    repo: &RepoConfig,
-    cfg: &InstructionsConfig,
-    profile_root: &Path,
-    os: &str,
-    preflight_path: Option<&str>,
-) -> CollectOutcome {
-    if os != "linux" {
-        let reason = format!("skipped on {os} (CodSpeed simulation mode needs Linux/valgrind)");
+/// Parameterized instructions-lane collection. Same skip/collect semantics
+/// as [`collect`]; `preflight_path` overrides `PATH` for the tool probes —
+/// a test seam. Production callers pass `None` (inherit process env).
+pub fn collect_with(req: &CollectRequest<'_>, preflight_path: Option<&str>) -> CollectOutcome {
+    collect_inner(req, preflight_path)
+}
+
+/// Core of [`collect_with`] — kept private so the preflight PATH seam is not
+/// part of the public surface beyond `collect_with`.
+fn collect_inner(req: &CollectRequest<'_>, preflight_path: Option<&str>) -> CollectOutcome {
+    if req.os != "linux" {
+        let reason =
+            format!("skipped on {} (CodSpeed simulation mode needs Linux/valgrind)", req.os);
         eprintln!("instructions lane: {reason}");
         return CollectOutcome::Skipped(reason);
     }
     // Compat-dep probe (before the tool probes): the instrumented build has
     // nothing to trace unless the checkout resolves `codspeed-criterion-compat`.
-    if let Err(reason) = compat_dep_check(checkout) {
+    if let Err(reason) = compat_dep_check(req.checkout) {
         eprintln!("instructions lane: skipped — {reason}");
         return CollectOutcome::Skipped(reason);
     }
@@ -338,8 +366,14 @@ fn collect_inner(
 
     let mut collection = InstrCollection::default();
     let mut rows = Vec::new();
-    for target in &repo.bench_targets {
-        match collect_target(checkout, repo, cfg, &profile_root.join(target), target) {
+    for target in req.bench_targets {
+        match collect_target(
+            req.checkout,
+            req.package,
+            req.bench_filter,
+            &req.profile_root.join(target),
+            target,
+        ) {
             Ok(target_rows) => rows.extend(target_rows),
             Err(e) => {
                 eprintln!("instructions lane: target '{target}' failed: {e:#}");
@@ -463,20 +497,13 @@ fn major_version(token: &str) -> Option<u64> {
 /// stale files from a previous run would mix in.
 fn collect_target(
     checkout: &Path,
-    repo: &RepoConfig,
-    cfg: &InstructionsConfig,
+    package: &str,
+    bench_filter: Option<&str>,
     profile_dir: &Path,
     target: &str,
 ) -> anyhow::Result<Vec<InstrRow>> {
     let mut build = Command::new("cargo");
-    build.current_dir(checkout).args([
-        "codspeed",
-        "build",
-        "-p",
-        repo.package(),
-        "--bench",
-        target,
-    ]);
+    build.current_dir(checkout).args(["codspeed", "build", "-p", package, "--bench", target]);
     run_streaming(build, &format!("cargo codspeed build --bench {target}"))?;
 
     if profile_dir.exists() {
@@ -493,7 +520,7 @@ fn collect_target(
         .args(["run", "--skip-upload", "--mode", "simulation", "--profile-folder"])
         .arg(&profile_dir)
         .args(["--", "cargo", "codspeed", "run"]);
-    if let Some(filter) = &cfg.bench_filter {
+    if let Some(filter) = bench_filter {
         run.arg(filter);
     }
     run_streaming(run, &format!("codspeed run (target {target})"))?;
@@ -860,6 +887,30 @@ headline_subjects = ["rex5", "rex5_*"]
         );
     }
 
+    #[test]
+    fn test_collect_with_matches_collect_on_non_linux() {
+        // The parameterized entry point must produce the same skip outcome
+        // as the RepoConfig wrapper — measure and the pipeline share one path.
+        let targets = vec!["mega_bench".to_string()];
+        let out = collect_with(
+            &CollectRequest {
+                checkout: Path::new("/nonexistent-checkout"),
+                package: "mega-evm",
+                bench_targets: &targets,
+                bench_filter: None,
+                profile_root: Path::new("/nonexistent-profiles"),
+                os: "macos",
+            },
+            None,
+        );
+        assert_eq!(
+            out,
+            CollectOutcome::Skipped(
+                "skipped on macos (CodSpeed simulation mode needs Linux/valgrind)".to_string()
+            )
+        );
+    }
+
     /// A checkout whose `Cargo.lock` DOES resolve the compat dep, so the lane
     /// clears the compat-dep gate and reaches the tool preflight.
     fn checkout_with_compat_dep() -> tempfile::TempDir {
@@ -885,12 +936,16 @@ headline_subjects = ["rex5", "rex5_*"]
         // the pipeline maps the skip to a walltime-only run, whose unaffected
         // artifacts the synthetic pipeline tests pin.
         let checkout = checkout_with_compat_dep();
-        let out = collect_inner(
-            checkout.path(),
-            &test_repo_config(),
-            &InstructionsConfig::default(),
-            Path::new("/nonexistent-profiles"),
-            "linux",
+        let targets = vec!["mega_bench".to_string()];
+        let out = collect_with(
+            &CollectRequest {
+                checkout: checkout.path(),
+                package: "mega-evm",
+                bench_targets: &targets,
+                bench_filter: None,
+                profile_root: Path::new("/nonexistent-profiles"),
+                os: "linux",
+            },
             Some("/nonexistent-bin"),
         );
         match out {
@@ -958,12 +1013,16 @@ version = \"2.10.1\"
             "[[package]]\nname = \"criterion\"\nversion = \"0.5.1\"\n",
         )
         .unwrap();
-        let out = collect_inner(
-            checkout.path(),
-            &test_repo_config(),
-            &InstructionsConfig::default(),
-            Path::new("/nonexistent-profiles"),
-            "linux",
+        let targets = vec!["mega_bench".to_string()];
+        let out = collect_with(
+            &CollectRequest {
+                checkout: checkout.path(),
+                package: "mega-evm",
+                bench_targets: &targets,
+                bench_filter: None,
+                profile_root: Path::new("/nonexistent-profiles"),
+                os: "linux",
+            },
             None,
         );
         match out {

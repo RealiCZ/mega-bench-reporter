@@ -7,6 +7,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use mega_bench_reporter::config::Config;
 use mega_bench_reporter::lane::Lane;
+use mega_bench_reporter::measure::{self, MeasureRequest};
 use mega_bench_reporter::pipeline::Event;
 use mega_bench_reporter::state::State;
 use mega_bench_reporter::storage::RepoStore;
@@ -133,6 +134,32 @@ enum Command {
         /// `salt_dynamic_gas/rex5_salt/*`).
         #[arg(long = "row", required = true)]
         rows: Vec<String>,
+    },
+    /// Measure an existing checkout: run walltime and/or instructions
+    /// collection and print one JSON document to stdout. No git ops, no
+    /// storage writes — the caller owns the worktree. At least one of
+    /// `--instructions` / `--walltime` is required.
+    Measure {
+        /// Existing checkout directory (must already be at the desired commit).
+        #[arg(long)]
+        checkout: PathBuf,
+        /// Cargo package the bench targets live in.
+        #[arg(long)]
+        package: String,
+        /// Bench target name (`--bench <this>`), repeatable.
+        #[arg(long = "bench-target", required = true)]
+        bench_targets: Vec<String>,
+        /// Collect instruction counts (Linux + codspeed/valgrind required;
+        /// hard error on non-Linux or missing tools).
+        #[arg(long)]
+        instructions: bool,
+        /// Collect criterion walltime means (`cargo bench`).
+        #[arg(long)]
+        walltime: bool,
+        /// Optional filter applied to the instructions lane (`cargo codspeed
+        /// run <filter>`) and, for walltime, as a criterion free-arg filter.
+        #[arg(long)]
+        bench_filter: Option<String>,
     },
 }
 
@@ -264,6 +291,26 @@ fn run() -> anyhow::Result<()> {
                     "cleared": cleared,
                 }))?
             );
+            return Ok(());
+        }
+        Command::Measure {
+            checkout,
+            package,
+            bench_targets,
+            instructions,
+            walltime,
+            bench_filter,
+        } => {
+            let outcome = measure::measure(&MeasureRequest {
+                checkout,
+                package,
+                bench_targets,
+                instructions,
+                walltime,
+                bench_filter,
+                os: std::env::consts::OS.to_string(),
+            })?;
+            println!("{}", serde_json::to_string_pretty(&outcome)?);
             return Ok(());
         }
     };

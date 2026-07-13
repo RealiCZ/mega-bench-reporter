@@ -129,6 +129,60 @@ against `--list`, profiles each unique id (Linux: `perf`; macOS: the built-in
 workload plus one differential SVG per pair, prunes days past retention. No events,
 nothing to relay — plain cron is enough; view `flame/<day>/*.svg` in a browser.
 
+## Measure (one-shot metrics on an existing checkout)
+
+```bash
+mega-bench-reporter measure --checkout <dir> --package <pkg> \
+  --bench-target <t>... [--instructions] [--walltime] [--bench-filter <f>]
+```
+
+Parameterized exposure of the same walltime / instructions collection the
+`run` pipeline uses — no git operations, no storage writes, no charts. The
+caller owns the worktree and passes an already-checked-out directory. At least
+one of `--instructions` / `--walltime` is required.
+
+- `--walltime`: runs `cargo bench -p <pkg> --bench <t> -- --output-format
+  bencher` per target and parses the criterion tree into mean ns per row.
+- `--instructions`: runs the CodSpeed offline simulation path
+  (`cargo codspeed build` + `codspeed run --skip-upload --mode simulation`)
+  and parses callgrind profiles into instruction counts. **Linux-only**
+  (valgrind); on non-Linux hosts or when the `codspeed` CLI / `cargo-codspeed`
+  are missing, the command exits nonzero with a clear stderr message (unlike
+  the run pipeline's graceful skip — measure is an explicit request).
+- `--bench-filter`: applied to the instructions lane (same semantics as
+  `[repos.instructions].bench_filter`) and, for walltime, as a criterion
+  free-arg filter after `--output-format bencher`.
+- Row keys are exactly the pipeline's (`criterion_results::row_key` /
+  instructions-lane URI mapping), so numbers are joinable with reporter data.
+- Exit codes: `0` = success with one JSON document on stdout; nonzero = error
+  on stderr and empty stdout (missing lane flags, bad checkout, bench failure,
+  instructions skip/failure).
+
+### stdout schema
+
+Exactly one JSON document (logs go to stderr):
+
+```json
+{
+  "rows": {
+    "<row_key>": { "ns": 14000.0, "instr_count": 56 }
+  },
+  "meta": {
+    "rustc": "rustc 1.89.0 (...)",
+    "profile_fingerprint": "rustc 1.89.0 (...)|<16-hex-fnv1a>"
+  }
+}
+```
+
+- `ns` / `instr_count` are omitted per row when that lane did not run (or
+  produced no value for the row) — never serialized as `null`.
+- `meta.rustc` is `rustc -V` stdout (trimmed).
+- `meta.profile_fingerprint` is `"{rustc}|{hash:016x}"` where `hash` is the
+  FNV-1a 64-bit hash of the checkout root `Cargo.toml`'s `[profile.release]`
+  body, a `0x00` separator byte, and the `[profile.bench]` body (empty string
+  for a missing section). See the code comment on
+  `measure::profile_fingerprint` for the exact recipe.
+
 ## Environment and safety
 
 - Exit 0 = success. Runs take as long as the benches take (tens of minutes) — no

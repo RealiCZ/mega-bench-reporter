@@ -264,19 +264,27 @@ pub struct RunOutcome {
 /// superseded by CodSpeed instruction-count CI). Output streams to stderr
 /// for the invoker's process logs; the data we parse is criterion's
 /// `target/criterion` tree, written as a side effect of any run.
+///
+/// `bench_filter`, when set, is appended after the criterion args so criterion
+/// runs only matching benchmarks (same free-arg filter semantics as
+/// `cargo bench -- <filter>`). The `run` pipeline always passes `None`.
 pub fn bench_target(
     checkout: &Path,
-    repo: &RepoConfig,
+    package: &str,
     target: &str,
     bench_profile: Option<&str>,
+    bench_filter: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(checkout).args(["bench", "-p", repo.package(), "--bench", target]);
+    cmd.current_dir(checkout).args(["bench", "-p", package, "--bench", target]);
     if let Some(profile) = bench_profile {
         cmd.args(["--profile", profile]);
     }
     // run_streaming pipes the bencher lines to stderr instead of inheriting.
     cmd.arg("--").arg("--output-format").arg("bencher");
+    if let Some(filter) = bench_filter {
+        cmd.arg(filter);
+    }
     run_streaming(cmd, &format!("cargo bench --bench {target}"))
 }
 
@@ -696,8 +704,13 @@ pub fn run_commit_pipeline(
             std::fs::remove_dir_all(&criterion_dir)?;
         }
         for target in &repo.bench_targets {
-            if let Err(e) = bench_target(&checkout, repo, target, settings.bench_profile.as_deref())
-            {
+            if let Err(e) = bench_target(
+                &checkout,
+                repo.package(),
+                target,
+                settings.bench_profile.as_deref(),
+                None,
+            ) {
                 eprintln!("bench target '{target}' failed: {e:#}");
                 failed_targets.push(target.clone());
             }
